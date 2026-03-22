@@ -236,6 +236,8 @@ typedef struct {
     id<MTLComputePipelineState> matvec_4bit_2row;
     id<MTLComputePipelineState> batch_expert_down_dyn_2row;
     id<MTLComputePipelineState> argmax;
+    id<MTLComputePipelineState> deinterleave_qgate;
+    id<MTLComputePipelineState> copy_tmp_to_buf;
 
     // Shared buffers (allocated based on ModelConfig)
     id<MTLBuffer> buf_input;

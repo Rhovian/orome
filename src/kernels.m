@@ -221,7 +221,7 @@ void apply_rotary_emb(float *q, float *k, int pos, int num_heads,
             float cos_a = cosf(angle);
             float sin_a = sinf(angle);
 
-            // MLX-style pairing: (i, i + half_dim)
+            // Half-split pairing: (i, i+half) — MLX traditional=False
             float q0 = qh[i], q1 = qh[i + half_rot];
             qh[i]            = q0 * cos_a - q1 * sin_a;
             qh[i + half_rot] = q0 * sin_a + q1 * cos_a;

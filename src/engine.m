@@ -500,6 +500,19 @@ int engine_step(Engine *eng, int token_id) {
     memset(eng->hidden, 0, H * sizeof(float));
     embed_lookup(eng->wf, cfg, token_id, eng->hidden);
 
+    // Debug: dump embedding
+    if (moe_get_profile_experts() && pos < 3) {
+        float hmin = 1e30f, hmax = -1e30f, hsum = 0;
+        for (int i = 0; i < H; i++) {
+            if (eng->hidden[i] < hmin) hmin = eng->hidden[i];
+            if (eng->hidden[i] > hmax) hmax = eng->hidden[i];
+            hsum += eng->hidden[i];
+        }
+        fprintf(stderr, "EMBED pos=%d token=%d h[0..3]=[%.4f,%.4f,%.4f,%.4f] min=%.4f max=%.4f mean=%.6f\n",
+                pos, token_id, eng->hidden[0], eng->hidden[1], eng->hidden[2], eng->hidden[3],
+                hmin, hmax, hsum / H);
+    }
+
     // 2. Layer loop — fused O-proj + post-norm + MoE routing in one GPU commit
     int full_idx = 0, linear_idx = 0;
     double t0, t1;
@@ -781,6 +794,7 @@ int engine_step(Engine *eng, int token_id) {
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
 
+
             // --- Phase K: MoE routing + shared expert projections ---
             size_t sgg_off = n_experts * sizeof(float);
             GpuMatvecJob routing_jobs[4] = {
@@ -822,6 +836,7 @@ int engine_step(Engine *eng, int token_id) {
                     [enc endEncoding];
                     [cmd commit];
                 }
+
             } else {
                 [enc endEncoding];
                 if (cmd) [cmd commit];
@@ -1033,7 +1048,7 @@ int engine_step(Engine *eng, int token_id) {
             }
 
             // --- Phase B: Q/K/V projections ---
-            // Q → buf_attn_output (n_heads*hd = 4096 floats, big enough)
+            // Q → buf_attn_output (n_heads*hd floats)
             // K → buf_conv_output (reuse, kv_dim = 512 floats)
             // V → buf_conv_input (reuse, kv_dim = 512 floats)
             GpuMatvecJob qkv_jobs[3] = {
@@ -1041,7 +1056,7 @@ int engine_step(Engine *eng, int token_id) {
                   .s_buf = ctx->buf_weights, .s_off = lw->full.q_s,
                   .b_buf = ctx->buf_weights, .b_off = lw->full.q_b,
                   .out_buf = ctx->buf_attn_output, .out_off = 0,
-                  .out_ptr = NULL, .out_dim = n_heads * hd, .in_dim = H,
+                  .out_ptr = NULL, .out_dim = n_heads * hd * 2, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
                 { .w_buf = ctx->buf_weights, .w_off = lw->full.k_w,
                   .s_buf = ctx->buf_weights, .s_off = lw->full.k_s,
@@ -1058,6 +1073,30 @@ int engine_step(Engine *eng, int token_id) {
             };
             for (int j = 0; j < 3; j++)
                 gpu_encode_matvec_job(enc, ctx, &qkv_jobs[j]);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            // --- Phase B2: De-interleave Q+gate ---
+            // Q projection output layout: [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]
+            // Rearrange to: [Q_h0, Q_h1, ..., Q_h15, gate_h0, gate_h1, ..., gate_h15]
+            // Use buf_output as scratch (large enough: vocab_size floats)
+            [enc setComputePipelineState:ctx->deinterleave_qgate];
+            [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_output offset:0 atIndex:1];
+            { uint hd_val = (uint)hd, nh = (uint)n_heads;
+              [enc setBytes:&hd_val length:sizeof(uint) atIndex:2];
+              [enc setBytes:&nh length:sizeof(uint) atIndex:3]; }
+            [enc dispatchThreadgroups:MTLSizeMake(((uint)(n_heads * hd) + 255) / 256, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            // Copy de-interleaved data back from scratch to buf_attn_output
+            [enc setComputePipelineState:ctx->copy_tmp_to_buf];
+            [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_output offset:0 atIndex:1];
+            { uint cnt = (uint)(n_heads * hd * 2);
+              [enc setBytes:&cnt length:sizeof(uint) atIndex:2]; }
+            [enc dispatchThreadgroups:MTLSizeMake(((uint)(n_heads * hd * 2) + 255) / 256, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase C: Weighted QK RMS norm ---
@@ -1158,6 +1197,16 @@ int engine_step(Engine *eng, int token_id) {
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
+            // --- Phase I-pre: Attention output gate (sigmoid) ---
+            [enc setComputePipelineState:ctx->sigmoid_gate];
+            [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_attn_output offset:n_heads * hd * sizeof(float) atIndex:1];
+            { uint gd = (uint)(n_heads * hd);
+              [enc setBytes:&gd length:sizeof(uint) atIndex:2]; }
+            [enc dispatchThreadgroups:MTLSizeMake(((uint)(n_heads * hd) + 255) / 256, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
             // --- Phase I: O-proj (buf_attn_output → buf_h_mid) ---
             { GpuMatvecJob o_job = {
                 .w_buf = ctx->buf_weights, .w_off = lw->full.o_w,
@@ -1197,6 +1246,7 @@ int engine_step(Engine *eng, int token_id) {
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
+
 
             // --- Phase L: MoE routing + shared expert projections ---
             size_t sgg_off = n_experts * sizeof(float);
@@ -1239,6 +1289,7 @@ int engine_step(Engine *eng, int token_id) {
                     [enc endEncoding];
                     [cmd commit];
                 }
+
             } else {
                 [enc endEncoding];
                 if (cmd) [cmd commit];
@@ -1258,17 +1309,6 @@ int engine_step(Engine *eng, int token_id) {
                         if (s_fused_gate_scores[j] != s_fused_gate_scores[j]) nans++;
                     if (nans > 0)
                         fprintf(stderr, "NAN_GATE pos=%d layer=%d nans=%d/%d\n", pos, layer, nans, n_experts);
-                    float *h = (float *)[ctx->buf_moe_hidden contents];
-                    int hnans = 0;
-                    for (int j = 0; j < H; j++)
-                        if (h[j] != h[j]) hnans++;
-                    float *hp = (float *)[ctx->buf_input contents];
-                    int hpnans = 0;
-                    for (int j = 0; j < H; j++)
-                        if (hp[j] != hp[j]) hpnans++;
-                    if (hnans > 0 || hpnans > 0)
-                        fprintf(stderr, "NAN_HIDDEN pos=%d layer=%d moe_hidden=%d/%d h_post=%d/%d\n",
-                                layer, hnans, H, hpnans, H);
                 }
 
                 if (!gpu_resident) {
@@ -1449,6 +1489,7 @@ int engine_step(Engine *eng, int token_id) {
     if (gpu_resident && ctx->argmax && ctx->buf_argmax_result) {
         // GPU argmax already computed — just read the 4-byte result
         next_token = (int)(*(uint32_t *)[ctx->buf_argmax_result contents]);
+
     } else {
         next_token = cpu_argmax(eng->logits, cfg->vocab_size);
     }

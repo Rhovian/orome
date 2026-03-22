@@ -1117,6 +1117,9 @@ kernel void rope_apply(
     float cos_a = cos(angle);
     float sin_a = sin(angle);
 
+    // Half-split RoPE pairing: (tid, tid+half_rot)
+    // MLX traditional=False = half-split pairing
+
     // Rotate Q head
     if (head < num_q_heads) {
         uint base = head * head_dim;
@@ -1781,4 +1784,43 @@ kernel void batch_expert_down_dyn_2row(
         out[expert_k * out_dim + row0] = sum0;
         if (valid1) out[expert_k * out_dim + row1] = sum1;
     }
+}
+
+// ============================================================================
+// De-interleave Q+gate from per-head [Q_h, gate_h] to [all_Q, all_gate]
+// ============================================================================
+// Input:  [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]  = n_heads * hd * 2
+// Output: [Q_h0(hd), Q_h1(hd), ..., gate_h0(hd), gate_h1(hd), ...] = n_heads * hd * 2
+// Dispatch: n_heads * hd threads
+
+kernel void deinterleave_qgate(
+    device float* buf           [[buffer(0)]],   // in-place
+    device float* tmp           [[buffer(1)]],   // scratch [n_heads * hd * 2]
+    constant uint& head_dim     [[buffer(2)]],   // 256
+    constant uint& num_heads    [[buffer(3)]],   // 16
+    uint tid [[thread_position_in_grid]]
+) {
+    uint total = num_heads * head_dim;
+    if (tid >= total) return;
+
+    uint head = tid / head_dim;
+    uint d = tid % head_dim;
+
+    // Read Q and gate from interleaved layout
+    float q_val = buf[head * head_dim * 2 + d];
+    float g_val = buf[head * head_dim * 2 + head_dim + d];
+
+    // Write to de-interleaved layout via scratch
+    tmp[head * head_dim + d] = q_val;           // Q part
+    tmp[total + head * head_dim + d] = g_val;   // Gate part
+}
+
+kernel void copy_tmp_to_buf(
+    device float* buf           [[buffer(0)]],
+    device const float* tmp     [[buffer(1)]],
+    constant uint& count        [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= count) return;
+    buf[tid] = tmp[tid];
 }

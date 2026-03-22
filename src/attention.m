@@ -39,16 +39,18 @@ void full_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cf
     // Scratch buffers (allocated once, reused)
     static float *s_normed = NULL, *s_q = NULL, *s_k = NULL, *s_v = NULL;
     static float *s_attn_out = NULL, *s_o_proj = NULL;
+    static float *s_gate = NULL;  // attention output gate
     static int s_alloc_H = 0;
     if (s_alloc_H < H) {
         free(s_normed); free(s_q); free(s_k); free(s_v);
-        free(s_attn_out); free(s_o_proj);
+        free(s_attn_out); free(s_o_proj); free(s_gate);
         s_normed   = calloc(H, sizeof(float));
-        s_q        = calloc(n_heads * hd, sizeof(float));
+        s_q        = calloc(n_heads * hd * 2, sizeof(float));  // Q + gate
         s_k        = calloc(n_kv * hd, sizeof(float));
         s_v        = calloc(n_kv * hd, sizeof(float));
         s_attn_out = calloc(n_heads * hd, sizeof(float));
         s_o_proj   = calloc(H, sizeof(float));
+        s_gate     = calloc(n_heads * hd, sizeof(float));
         s_alloc_H = H;
     }
 
@@ -75,7 +77,7 @@ void full_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cf
               .s_buf = ctx->buf_weights, .s_off = (uint8_t *)q_s - base,
               .b_buf = ctx->buf_weights, .b_off = (uint8_t *)q_b - base,
               .out_buf = ctx->buf_output, .out_off = 0,
-              .out_ptr = s_q, .out_dim = n_heads * hd, .in_dim = H,
+              .out_ptr = s_q, .out_dim = n_heads * hd * 2, .in_dim = H,
               .group_size = cfg->group_size, .is_2bit = false },
             { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)k_w - base,
               .s_buf = ctx->buf_weights, .s_off = (uint8_t *)k_s - base,
@@ -92,9 +94,28 @@ void full_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cf
         };
         gpu_run_matvec_batch(ctx, jobs, 3);
     } else {
-        cpu_dequant_matvec((void *)q_w, q_s, q_b, s_normed, s_q, n_heads * hd, H, cfg->group_size);
+        cpu_dequant_matvec((void *)q_w, q_s, q_b, s_normed, s_q, n_heads * hd * 2, H, cfg->group_size);
         cpu_dequant_matvec((void *)k_w, k_s, k_b, s_normed, s_k, n_kv * hd, H, cfg->group_size);
         cpu_dequant_matvec((void *)v_w, v_s, v_b, s_normed, s_v, n_kv * hd, H, cfg->group_size);
+    }
+
+    // 2b. De-interleave Q+gate from per-head layout
+    // Q projection output: [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]
+    // De-interleave into separate Q and gate buffers
+    {
+        static float *s_q_tmp = NULL;
+        static int s_q_tmp_alloc = 0;
+        if (s_q_tmp_alloc < n_heads * hd) {
+            free(s_q_tmp);
+            s_q_tmp = calloc(n_heads * hd * 2, sizeof(float));
+            s_q_tmp_alloc = n_heads * hd;
+        }
+        // Copy s_q to temp, then de-interleave back
+        memcpy(s_q_tmp, s_q, n_heads * hd * 2 * sizeof(float));
+        for (int h = 0; h < n_heads; h++) {
+            memcpy(s_q + h * hd, s_q_tmp + h * hd * 2, hd * sizeof(float));
+            memcpy(s_gate + h * hd, s_q_tmp + h * hd * 2 + hd, hd * sizeof(float));
+        }
     }
 
     // 3. Per-head Q/K RMS norm + scale
@@ -109,8 +130,33 @@ void full_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cf
         cpu_rms_norm(s_k + h * hd, knorm_w, s_k + h * hd, hd, 1e-6f);
     }
 
-    // 4. RoPE
-    apply_rotary_emb(s_q, s_k, pos, n_kv, hd, cfg->rotary_dim, cfg->rope_theta);
+    // 4. RoPE — half-split pairing (i, i+half) — MLX traditional=False
+    for (int h = 0; h < n_heads; h++) {
+        float *qh = s_q + h * hd;
+        int half_rot = cfg->rotary_dim / 2;
+        for (int i = 0; i < half_rot; i++) {
+            float freq = 1.0f / powf(cfg->rope_theta, (float)(2 * i) / cfg->rotary_dim);
+            float angle = pos * freq;
+            float cos_a = cosf(angle);
+            float sin_a = sinf(angle);
+            float q0 = qh[i], q1 = qh[i + half_rot];
+            qh[i]            = q0 * cos_a - q1 * sin_a;
+            qh[i + half_rot] = q0 * sin_a + q1 * cos_a;
+        }
+    }
+    for (int h = 0; h < n_kv; h++) {
+        float *kh = s_k + h * hd;
+        int half_rot = cfg->rotary_dim / 2;
+        for (int i = 0; i < half_rot; i++) {
+            float freq = 1.0f / powf(cfg->rope_theta, (float)(2 * i) / cfg->rotary_dim);
+            float angle = pos * freq;
+            float cos_a = cosf(angle);
+            float sin_a = sinf(angle);
+            float k0 = kh[i], k1 = kh[i + half_rot];
+            kh[i]            = k0 * cos_a - k1 * sin_a;
+            kh[i + half_rot] = k0 * sin_a + k1 * cos_a;
+        }
+    }
 
     // 5. Store K/V in cache
     memcpy(kv->k_cache + pos * kv_dim, s_k, kv_dim * sizeof(float));
@@ -144,7 +190,13 @@ void full_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cf
                     kv->v_cache + kv_h * hd, kv_dim, s_scores, 1, 0.0f, out_h, 1);
     }
 
-    // 7. Export pre-O-proj output (caller handles O proj + residual)
+    // 7. Apply attention output gate: attn_out *= sigmoid(gate)
+    for (int i = 0; i < n_heads * hd; i++) {
+        float g = 1.0f / (1.0f + expf(-s_gate[i]));
+        s_attn_out[i] *= g;
+    }
+
+    // 8. Export pre-O-proj output (caller handles O proj + residual)
     *attn_out = s_attn_out;
     *attn_out_dim = n_heads * hd;
 }

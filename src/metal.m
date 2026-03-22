@@ -129,6 +129,8 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->matvec_4bit_2row = make_pipeline(ctx, @"dequant_matvec_4bit_2row");
     ctx->batch_expert_down_dyn_2row = make_pipeline(ctx, @"batch_expert_down_dyn_2row");
     ctx->argmax = make_pipeline(ctx, @"argmax_kernel");
+    ctx->deinterleave_qgate = make_pipeline(ctx, @"deinterleave_qgate");
+    ctx->copy_tmp_to_buf = make_pipeline(ctx, @"copy_tmp_to_buf");
 
     if (!ctx->matvec_4bit || !ctx->norm_sum_sq || !ctx->norm_apply) {
         fprintf(stderr, "ERROR: Required Metal pipelines missing\n");
@@ -176,8 +178,9 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->buf_attn_scores = [ctx->device newBufferWithLength:
         (size_t)cfg->num_attn_heads * OROME_GPU_KV_SEQ * sizeof(float)
         options:MTLResourceStorageModeShared];
+    // 2× for attn_output_gate: Q projection stores [Q, gate] concatenated
     ctx->buf_attn_output = [ctx->device newBufferWithLength:
-        (size_t)cfg->num_attn_heads * cfg->head_dim * sizeof(float)
+        (size_t)cfg->num_attn_heads * cfg->head_dim * 2 * sizeof(float)
         options:MTLResourceStorageModeShared];
 
     // Linear attention GPU state
