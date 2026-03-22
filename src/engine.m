@@ -365,6 +365,15 @@ int engine_step(Engine *eng, int token_id) {
         memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
     }
 
+    // Single command buffer for entire forward pass (GPU-resident path).
+    // Eliminates 40 command buffer creations + 40 blit-to-compute transitions.
+    id<MTLCommandBuffer> fwd_cmd = nil;
+    id<MTLComputeCommandEncoder> fwd_enc = nil;
+    if (gpu_resident) {
+        fwd_cmd = [ctx->queue commandBuffer];
+        fwd_enc = [fwd_cmd computeCommandEncoder];
+    }
+
     for (int layer = 0; layer < cfg->num_layers; layer++) {
         int n_experts = cfg->num_experts;
         int S = cfg->shared_intermediate;
@@ -423,23 +432,34 @@ int engine_step(Engine *eng, int token_id) {
             uint16_t *sgg_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.scales");
             uint16_t *sgg_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.biases");
 
-            // GPU-resident: hidden already in buf_moe_hidden; blit → buf_residual
+            // GPU-resident: copy buf_moe_hidden → buf_residual
             if (!gpu_resident) {
                 memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
                 memcpy([ctx->buf_residual contents], eng->residual, H * sizeof(float));
             }
 
-            id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
-
-            if (gpu_resident) {
-                id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-                [blit copyFromBuffer:ctx->buf_moe_hidden sourceOffset:0
-                            toBuffer:ctx->buf_residual destinationOffset:0
-                                size:H * sizeof(float)];
-                [blit endEncoding];
+            id<MTLCommandBuffer> cmd = nil;
+            id<MTLComputeCommandEncoder> enc = nil;
+            if (gpu_resident && fwd_enc) {
+                enc = fwd_enc;
+                [enc setComputePipelineState:ctx->copy_buffer];
+                [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
+                [enc setBuffer:ctx->buf_residual offset:0 atIndex:1];
+                { uint c = (uint)H; [enc setBytes:&c length:sizeof(uint) atIndex:2]; }
+                [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            } else {
+                cmd = [ctx->queue commandBuffer];
+                if (gpu_resident) {
+                    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+                    [blit copyFromBuffer:ctx->buf_moe_hidden sourceOffset:0
+                                toBuffer:ctx->buf_residual destinationOffset:0
+                                    size:H * sizeof(float)];
+                    [blit endEncoding];
+                }
+                enc = [cmd computeCommandEncoder];
             }
-
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
             // --- Phase A: Input norm → buf_input ---
             [enc setComputePipelineState:ctx->norm_sum_sq];
@@ -644,13 +664,16 @@ int engine_step(Engine *eng, int token_id) {
                 && ctx->buf_expert_layers && ctx->buf_expert_layers[layer]) {
                 encode_fused_experts(enc, ctx, cfg, eng->wf, layer,
                                      eng->active_experts, eng->quant, base);
-                [enc endEncoding];
-                [cmd commit];
-                // No wait — next layer executes after via queue ordering
+                if (!fwd_enc) {
+                    // Per-layer CB fallback: end and commit
+                    [enc endEncoding];
+                    [cmd commit];
+                }
+                // With fwd_enc: continue encoding next layer in same CB
             } else {
                 [enc endEncoding];
-                [cmd commit];
-                [cmd waitUntilCompleted];
+                if (cmd) [cmd commit];
+                if (cmd) [cmd waitUntilCompleted];
 
                 memcpy(s_fused_gate_scores, [ctx->buf_output contents],
                        n_experts * sizeof(float));
@@ -721,23 +744,34 @@ int engine_step(Engine *eng, int token_id) {
             uint16_t *sgg_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.scales");
             uint16_t *sgg_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.biases");
 
-            // GPU-resident: hidden already in buf_moe_hidden; blit → buf_residual
+            // GPU-resident: copy buf_moe_hidden → buf_residual
             if (!gpu_resident) {
                 memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
                 memcpy([ctx->buf_residual contents], eng->residual, H * sizeof(float));
             }
 
-            id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
-
-            if (gpu_resident) {
-                id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-                [blit copyFromBuffer:ctx->buf_moe_hidden sourceOffset:0
-                            toBuffer:ctx->buf_residual destinationOffset:0
-                                size:H * sizeof(float)];
-                [blit endEncoding];
+            id<MTLCommandBuffer> cmd = nil;
+            id<MTLComputeCommandEncoder> enc = nil;
+            if (gpu_resident && fwd_enc) {
+                enc = fwd_enc;
+                [enc setComputePipelineState:ctx->copy_buffer];
+                [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
+                [enc setBuffer:ctx->buf_residual offset:0 atIndex:1];
+                { uint c = (uint)H; [enc setBytes:&c length:sizeof(uint) atIndex:2]; }
+                [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            } else {
+                cmd = [ctx->queue commandBuffer];
+                if (gpu_resident) {
+                    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+                    [blit copyFromBuffer:ctx->buf_moe_hidden sourceOffset:0
+                                toBuffer:ctx->buf_residual destinationOffset:0
+                                    size:H * sizeof(float)];
+                    [blit endEncoding];
+                }
+                enc = [cmd computeCommandEncoder];
             }
-
-            id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
             // --- Phase A: Input norm → buf_input ---
             [enc setComputePipelineState:ctx->norm_sum_sq];
@@ -966,13 +1000,14 @@ int engine_step(Engine *eng, int token_id) {
                 && ctx->buf_expert_layers && ctx->buf_expert_layers[layer]) {
                 encode_fused_experts(enc, ctx, cfg, eng->wf, layer,
                                      eng->active_experts, eng->quant, base);
-                [enc endEncoding];
-                [cmd commit];
-                // No wait — next layer executes after via queue ordering
+                if (!fwd_enc) {
+                    [enc endEncoding];
+                    [cmd commit];
+                }
             } else {
                 [enc endEncoding];
-                [cmd commit];
-                [cmd waitUntilCompleted];
+                if (cmd) [cmd commit];
+                if (cmd) [cmd waitUntilCompleted];
 
                 memcpy(s_fused_gate_scores, [ctx->buf_output contents],
                        n_experts * sizeof(float));
@@ -1047,7 +1082,7 @@ int engine_step(Engine *eng, int token_id) {
         t_moe_total += t1 - t0;
     }
 
-    // Sync GPU + final norm + LM head — fused into one GPU command buffer
+    // Sync GPU + final norm + LM head
     t0 = now_ms();
     if (gpu_resident) {
         uint8_t *base = (uint8_t *)[ctx->buf_weights contents];
@@ -1056,8 +1091,15 @@ int engine_step(Engine *eng, int token_id) {
         uint16_t *lm_s = weights_tensor_ptr(eng->wf, "lm_head.scales");
         uint16_t *lm_b = weights_tensor_ptr(eng->wf, "lm_head.biases");
 
-        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        // Use shared forward-pass encoder if available
+        id<MTLCommandBuffer> cmd = nil;
+        id<MTLComputeCommandEncoder> enc = nil;
+        if (fwd_enc) {
+            enc = fwd_enc;
+        } else {
+            cmd = [ctx->queue commandBuffer];
+            enc = [cmd computeCommandEncoder];
+        }
 
         // RMS norm: buf_moe_hidden → buf_input
         [enc setComputePipelineState:ctx->norm_sum_sq];
@@ -1093,8 +1135,9 @@ int engine_step(Engine *eng, int token_id) {
         gpu_encode_matvec_job(enc, ctx, &lm_job);
 
         [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        id<MTLCommandBuffer> wait_cmd = fwd_cmd ? fwd_cmd : cmd;
+        [wait_cmd commit];
+        [wait_cmd waitUntilCompleted];
 
         memcpy(eng->logits, [ctx->buf_output contents],
                cfg->vocab_size * sizeof(float));

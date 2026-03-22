@@ -229,6 +229,7 @@ typedef struct {
     id<MTLComputePipelineState> batch_expert_mv_dyn;
     id<MTLComputePipelineState> batch_expert_down_dyn;
     id<MTLComputePipelineState> expert_gate_up_swiglu;
+    id<MTLComputePipelineState> copy_buffer;
 
     // Shared buffers (allocated based on ModelConfig)
     id<MTLBuffer> buf_input;

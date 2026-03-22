@@ -723,46 +723,38 @@ kernel void rms_norm_qk(
     constant uint &key_dim,       // = 128
     constant float &inv_scale,    // = 1/sqrt(key_dim)
     uint head [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
     uint base = head * key_dim;
 
-    // RMS norm for q
-    threadgroup float q_sum_sq;
-    if (tid == 0) q_sum_sq = 0;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
+    // RMS norm for q — simd reduction instead of serial
     float qval = (tid < key_dim) ? q[base + tid] : 0;
-    // Use threadgroup atomic add for sum of squares
-    float q_sq_local = qval * qval;
-    // Simple reduction: thread 0 accumulates (key_dim=128, fits in one pass)
-    threadgroup float q_partial[128];
-    q_partial[tid] = q_sq_local;
+    float q_sq = qval * qval;
+    float q_simd = simd_sum(q_sq);
+    threadgroup float q_shared[4];
+    if (simd_lane == 0) q_shared[simd_group] = q_simd;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float s = 0;
-        for (uint i = 0; i < key_dim; i++) s += q_partial[i];
-        q_sum_sq = s;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float q_inv_rms = rsqrt(q_sum_sq / float(key_dim) + 1e-6f);
+    float q_total = 0;
+    if (tid < 4) q_total = q_shared[tid];
+    q_total = simd_sum(q_total);
+    float q_inv_rms = rsqrt(q_total / float(key_dim) + 1e-6f);
     if (tid < key_dim) {
-        q[base + tid] = qval * q_inv_rms * inv_scale * inv_scale;  // q gets extra scale
+        q[base + tid] = qval * q_inv_rms * inv_scale * inv_scale;
     }
 
-    // RMS norm for k
-    threadgroup float k_sum_sq;
+    // RMS norm for k — simd reduction
     float kval = (tid < key_dim) ? k[base + tid] : 0;
-    threadgroup float k_partial[128];
-    k_partial[tid] = kval * kval;
+    float k_sq = kval * kval;
+    float k_simd = simd_sum(k_sq);
+    threadgroup float k_shared[4];
+    if (simd_lane == 0) k_shared[simd_group] = k_simd;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float s = 0;
-        for (uint i = 0; i < key_dim; i++) s += k_partial[i];
-        k_sum_sq = s;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float k_inv_rms = rsqrt(k_sum_sq / float(key_dim) + 1e-6f);
+    float k_total = 0;
+    if (tid < 4) k_total = k_shared[tid];
+    k_total = simd_sum(k_total);
+    float k_inv_rms = rsqrt(k_total / float(key_dim) + 1e-6f);
     if (tid < key_dim) {
         k[base + tid] = kval * k_inv_rms * inv_scale;
     }
@@ -807,23 +799,24 @@ kernel void gated_rms_norm(
     constant uint &value_dim,         // = 128
     constant float &eps,              // = 1e-6
     uint head [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
     uint base = head * value_dim;
 
     float val = (tid < value_dim) ? values[base + tid] : 0;
 
-    // RMS norm reduction
-    threadgroup float partial[128];
-    partial[tid] = val * val;
+    // RMS norm reduction using simd_sum (128 threads = 4 simdgroups)
+    float sq = val * val;
+    float simd_val = simd_sum(sq);
+    threadgroup float shared_sums[4];
+    if (simd_lane == 0) shared_sums[simd_group] = simd_val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float s = 0;
-        for (uint i = 0; i < value_dim; i++) s += partial[i];
-        partial[0] = s;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv_rms = rsqrt(partial[0] / float(value_dim) + eps);
+    float total = 0;
+    if (tid < 4) total = shared_sums[tid];
+    total = simd_sum(total);  // first simdgroup reduces
+    float inv_rms = rsqrt(total / float(value_dim) + eps);
 
     if (tid < value_dim) {
         float normed = val * inv_rms;
@@ -852,27 +845,25 @@ kernel void rms_norm_qk_weighted(
     constant uint &num_kv_heads,      // = 2
     constant float &inv_scale,        // = 1/sqrt(head_dim)
     uint head [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
     // Process Q head if in range
     if (head < num_q_heads && tid < head_dim) {
         uint base = head * head_dim;
         float qval = q[base + tid];
 
-        threadgroup float partial[256];
-        partial[tid] = qval * qval;
+        // simd reduction for sum of squares (256 threads = 8 simdgroups)
+        float q_sq = qval * qval;
+        float q_simd = simd_sum(q_sq);
+        threadgroup float q_shared[8];
+        if (simd_lane == 0) q_shared[simd_group] = q_simd;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        float q_total = (tid < 8) ? q_shared[tid] : 0;
+        q_total = simd_sum(q_total);
 
-        // Reduce sum of squares
-        threadgroup float sum_sq;
-        if (tid == 0) {
-            float s = 0;
-            for (uint i = 0; i < head_dim; i++) s += partial[i];
-            sum_sq = s;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float inv_rms = rsqrt(sum_sq / float(head_dim) + 1e-6f);
+        float inv_rms = rsqrt(q_total / float(head_dim) + 1e-6f);
         float w = bf16_to_f32(q_weight[tid]);
         q[base + tid] = qval * inv_rms * w * inv_scale;
     }
@@ -882,19 +873,15 @@ kernel void rms_norm_qk_weighted(
         uint base = head * head_dim;
         float kval = k[base + tid];
 
-        threadgroup float k_partial[256];
-        k_partial[tid] = kval * kval;
+        float k_sq = kval * kval;
+        float k_simd = simd_sum(k_sq);
+        threadgroup float k_shared[8];
+        if (simd_lane == 0) k_shared[simd_group] = k_simd;
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        float k_total = (tid < 8) ? k_shared[tid] : 0;
+        k_total = simd_sum(k_total);
 
-        threadgroup float k_sum_sq;
-        if (tid == 0) {
-            float s = 0;
-            for (uint i = 0; i < head_dim; i++) s += k_partial[i];
-            k_sum_sq = s;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float inv_rms = rsqrt(k_sum_sq / float(head_dim) + 1e-6f);
+        float inv_rms = rsqrt(k_total / float(head_dim) + 1e-6f);
         float w = bf16_to_f32(k_weight[tid]);
         k[base + tid] = kval * inv_rms * w;
     }
@@ -1299,6 +1286,20 @@ kernel void batch_expert_mv_dyn(
     if (simd_lane == 0) {
         out[expert_k * out_dim + row] = sum;
     }
+}
+
+// ============================================================================
+// Simple buffer copy kernel (replaces blit encoder to stay in compute encoder)
+// ============================================================================
+
+kernel void copy_buffer(
+    device const float* src [[buffer(0)]],
+    device float*       dst [[buffer(1)]],
+    constant uint&      count [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= count) return;
+    dst[tid] = src[tid];
 }
 
 // Dynamic batch expert down matvec — per-expert packed input, GPU-driven indices
