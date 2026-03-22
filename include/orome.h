@@ -218,6 +218,8 @@ typedef struct {
     id<MTLComputePipelineState> rms_norm_qk;
     id<MTLComputePipelineState> decay_beta;
     id<MTLComputePipelineState> gated_rms_norm;
+    id<MTLComputePipelineState> batch_expert_mv;
+    id<MTLComputePipelineState> batch_swiglu;
 
     // Shared buffers (allocated based on ModelConfig)
     id<MTLBuffer> buf_input;
@@ -236,6 +238,13 @@ typedef struct {
     id<MTLBuffer> buf_multi_expert_up[OROME_MAX_ACTIVE];
     id<MTLBuffer> buf_multi_expert_act[OROME_MAX_ACTIVE];
     id<MTLBuffer> buf_multi_expert_out[OROME_MAX_ACTIVE];
+
+    // Packed batch expert buffers (K × dim)
+    id<MTLBuffer> buf_batch_expert_gate;
+    id<MTLBuffer> buf_batch_expert_up;
+    id<MTLBuffer> buf_batch_expert_act;
+    id<MTLBuffer> buf_batch_expert_out;
+    id<MTLBuffer> buf_expert_offsets;
 
     // Shared expert buffers
     id<MTLBuffer> buf_shared_gate;

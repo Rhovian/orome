@@ -96,6 +96,8 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->rms_norm_qk      = make_pipeline(ctx, @"rms_norm_qk");
     ctx->decay_beta       = make_pipeline(ctx, @"compute_decay_beta");
     ctx->gated_rms_norm   = make_pipeline(ctx, @"gated_rms_norm");
+    ctx->batch_expert_mv  = make_pipeline(ctx, @"batch_expert_matvec_4bit");
+    ctx->batch_swiglu     = make_pipeline(ctx, @"batch_swiglu");
 
     if (!ctx->matvec_4bit || !ctx->norm_sum_sq || !ctx->norm_apply) {
         fprintf(stderr, "ERROR: Required Metal pipelines missing\n");
@@ -194,6 +196,21 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
         ctx->buf_multi_expert_out[k] = [ctx->device newBufferWithLength:H * sizeof(float)
                                                                 options:MTLResourceStorageModeShared];
     }
+
+    // Packed batch expert buffers (K × intermediate_dim)
+    int K_max = cfg->num_experts_per_tok < OROME_MAX_ACTIVE ? cfg->num_experts_per_tok : OROME_MAX_ACTIVE;
+    size_t batch_gate_size = (size_t)K_max * cfg->moe_intermediate * sizeof(float);
+    size_t batch_out_size = (size_t)K_max * H * sizeof(float);
+    ctx->buf_batch_expert_gate = [ctx->device newBufferWithLength:batch_gate_size
+                                                          options:MTLResourceStorageModeShared];
+    ctx->buf_batch_expert_up = [ctx->device newBufferWithLength:batch_gate_size
+                                                        options:MTLResourceStorageModeShared];
+    ctx->buf_batch_expert_act = [ctx->device newBufferWithLength:batch_gate_size
+                                                         options:MTLResourceStorageModeShared];
+    ctx->buf_batch_expert_out = [ctx->device newBufferWithLength:batch_out_size
+                                                         options:MTLResourceStorageModeShared];
+    ctx->buf_expert_offsets = [ctx->device newBufferWithLength:K_max * 3 * sizeof(uint32_t)
+                                                       options:MTLResourceStorageModeShared];
 
     ctx->buf_shared_gate = [ctx->device newBufferWithLength:cfg->shared_intermediate * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
