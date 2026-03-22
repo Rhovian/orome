@@ -225,6 +225,9 @@ typedef struct {
     id<MTLComputePipelineState> rms_norm_qk_w;
     id<MTLComputePipelineState> rope_apply;
     id<MTLComputePipelineState> kv_cache_write;
+    id<MTLComputePipelineState> softmax_topk;
+    id<MTLComputePipelineState> batch_expert_mv_dyn;
+    id<MTLComputePipelineState> batch_expert_down_dyn;
 
     // Shared buffers (allocated based on ModelConfig)
     id<MTLBuffer> buf_input;
@@ -250,6 +253,7 @@ typedef struct {
     id<MTLBuffer> buf_batch_expert_act;
     id<MTLBuffer> buf_batch_expert_out;
     id<MTLBuffer> buf_expert_offsets;
+    id<MTLBuffer> buf_topk_indices;  // [K] uint32_t expert indices from GPU routing
 
     // Shared expert buffers
     id<MTLBuffer> buf_shared_gate;

@@ -1038,3 +1038,239 @@ kernel void moe_combine_residual_packed(
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
 }
+
+// ============================================================================
+// GPU softmax + top-K routing — eliminates CPU readback sync point
+// ============================================================================
+
+kernel void softmax_topk_route(
+    device const float* logits       [[buffer(0)]],
+    device uint32_t*    out_indices  [[buffer(1)]],
+    device float*       out_params   [[buffer(2)]],
+    constant uint&      n_experts    [[buffer(3)]],
+    constant uint&      K            [[buffer(4)]],
+    constant uint&      sgg_off_f    [[buffer(5)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float vals[256];
+    if (lid < n_experts) vals[lid] = logits[lid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float reduce[32];
+    float local_max = (lid < n_experts) ? vals[lid] : -1e30f;
+    float sm = simd_max(local_max);
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+    if (simd_lane == 0) reduce[simd_group] = sm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_max = -1e30f;
+    if (simd_group == 0 && simd_lane < (tg_size + 31) / 32) {
+        global_max = simd_max(reduce[simd_lane]);
+    }
+    threadgroup float bcast;
+    if (lid == 0) bcast = global_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    global_max = bcast;
+
+    float exp_val = (lid < n_experts) ? exp(vals[lid] - global_max) : 0.0f;
+    if (lid < n_experts) vals[lid] = exp_val;
+    float ss = simd_sum(exp_val);
+    if (simd_lane == 0) reduce[simd_group] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float global_sum = 0.0f;
+    if (simd_group == 0 && simd_lane < (tg_size + 31) / 32) {
+        global_sum = simd_sum(reduce[simd_lane]);
+    }
+    if (lid == 0) bcast = global_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    global_sum = bcast;
+
+    if (lid < n_experts) vals[lid] = exp_val / global_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+        for (uint k = 0; k < K && k < 8; k++) {
+            float best_val = -1.0f;
+            uint best_idx = 0;
+            for (uint i = 0; i < n_experts; i++) {
+                if (vals[i] > best_val) {
+                    best_val = vals[i];
+                    best_idx = i;
+                }
+            }
+            out_indices[k] = best_idx;
+            out_params[k] = best_val;
+            vals[best_idx] = -1.0f;
+        }
+        float wsum = 0.0f;
+        for (uint k = 0; k < K && k < 8; k++) wsum += out_params[k];
+        float inv_wsum = 1.0f / wsum;
+        for (uint k = 0; k < K && k < 8; k++) out_params[k] *= inv_wsum;
+        out_params[8] = logits[sgg_off_f];
+    }
+}
+
+// ============================================================================
+// Dynamic batch expert matvec — reads expert indices from GPU buffer
+// ============================================================================
+
+kernel void batch_expert_mv_dyn(
+    device const uint8_t*  layer_data    [[buffer(0)]],
+    device const float*    x             [[buffer(1)]],
+    device float*          out           [[buffer(2)]],
+    device const uint32_t* expert_indices [[buffer(3)]],
+    constant uint&         expert_size   [[buffer(4)]],
+    constant uint&         proj_w_off    [[buffer(5)]],
+    constant uint&         proj_s_off    [[buffer(6)]],
+    constant uint&         proj_b_off    [[buffer(7)]],
+    constant uint&         out_dim       [[buffer(8)]],
+    constant uint&         in_dim        [[buffer(9)]],
+    constant uint&         group_size    [[buffer(10)]],
+    constant uint&         num_row_tgs   [[buffer(11)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint expert_k = tgid / num_row_tgs;
+    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
+
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    uint expert_id = expert_indices[expert_k];
+    uint base = expert_id * expert_size;
+
+    device const uint32_t* W = (device const uint32_t*)(layer_data + base + proj_w_off);
+    device const uint16_t* S = (device const uint16_t*)(layer_data + base + proj_s_off);
+    device const uint16_t* B = (device const uint16_t*)(layer_data + base + proj_b_off);
+
+    device const uint32_t* w_row = W + row * packed_cols;
+    device const uint16_t* s_row = S + row * num_groups;
+    device const uint16_t* b_row = B + row * num_groups;
+
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;
+
+        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
+        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
+        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
+        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+
+        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
+        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
+        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
+        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
+        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
+        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
+        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
+        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[expert_k * out_dim + row] = sum;
+    }
+}
+
+// Dynamic batch expert down matvec — per-expert packed input, GPU-driven indices
+kernel void batch_expert_down_dyn(
+    device const uint8_t*  layer_data    [[buffer(0)]],
+    device const float*    x             [[buffer(1)]],
+    device float*          out           [[buffer(2)]],
+    device const uint32_t* expert_indices [[buffer(3)]],
+    constant uint&         expert_size   [[buffer(4)]],
+    constant uint&         proj_w_off    [[buffer(5)]],
+    constant uint&         proj_s_off    [[buffer(6)]],
+    constant uint&         proj_b_off    [[buffer(7)]],
+    constant uint&         out_dim       [[buffer(8)]],
+    constant uint&         in_dim        [[buffer(9)]],
+    constant uint&         group_size    [[buffer(10)]],
+    constant uint&         num_row_tgs   [[buffer(11)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint expert_k = tgid / num_row_tgs;
+    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
+
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup float x_shared[4096];
+    device const float* x_expert = x + expert_k * in_dim;
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = x_expert[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    uint expert_id = expert_indices[expert_k];
+    uint base = expert_id * expert_size;
+
+    device const uint32_t* W = (device const uint32_t*)(layer_data + base + proj_w_off);
+    device const uint16_t* S = (device const uint16_t*)(layer_data + base + proj_s_off);
+    device const uint16_t* B = (device const uint16_t*)(layer_data + base + proj_b_off);
+
+    device const uint32_t* w_row = W + row * packed_cols;
+    device const uint16_t* s_row = S + row * num_groups;
+    device const uint16_t* b_row = B + row * num_groups;
+
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint32_t packed = w_row[col];
+        uint x_base = col * 8;
+
+        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
+        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
+        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
+        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
+        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
+        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
+        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
+        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
+
+        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
+        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
+        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
+        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
+        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
+        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
+        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
+        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[expert_k * out_dim + row] = sum;
+    }
+}

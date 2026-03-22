@@ -103,6 +103,9 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->rms_norm_qk_w    = make_pipeline(ctx, @"rms_norm_qk_weighted");
     ctx->rope_apply       = make_pipeline(ctx, @"rope_apply");
     ctx->kv_cache_write   = make_pipeline(ctx, @"kv_cache_write");
+    ctx->softmax_topk     = make_pipeline(ctx, @"softmax_topk_route");
+    ctx->batch_expert_mv_dyn  = make_pipeline(ctx, @"batch_expert_mv_dyn");
+    ctx->batch_expert_down_dyn = make_pipeline(ctx, @"batch_expert_down_dyn");
 
     if (!ctx->matvec_4bit || !ctx->norm_sum_sq || !ctx->norm_apply) {
         fprintf(stderr, "ERROR: Required Metal pipelines missing\n");
@@ -216,6 +219,8 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
                                                          options:MTLResourceStorageModeShared];
     ctx->buf_expert_offsets = [ctx->device newBufferWithLength:K_max * 3 * sizeof(uint32_t)
                                                        options:MTLResourceStorageModeShared];
+    ctx->buf_topk_indices = [ctx->device newBufferWithLength:K_max * sizeof(uint32_t)
+                                                     options:MTLResourceStorageModeShared];
 
     ctx->buf_shared_gate = [ctx->device newBufferWithLength:cfg->shared_intermediate * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
