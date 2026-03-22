@@ -1,0 +1,336 @@
+/*
+ * metal.m — Metal GPU context, pipeline setup, buffer management, GPU dispatch.
+ *
+ * All buffer sizes are derived from ModelConfig — no hardcoded model dimensions.
+ */
+
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "orome.h"
+
+// ============================================================================
+// Pipeline creation
+// ============================================================================
+
+static id<MTLComputePipelineState> make_pipeline(MetalCtx *ctx, NSString *name) {
+    id<MTLFunction> fn = [ctx->library newFunctionWithName:name];
+    if (!fn) {
+        fprintf(stderr, "WARNING: shader '%s' not found\n", [name UTF8String]);
+        return nil;
+    }
+    NSError *error = nil;
+    id<MTLComputePipelineState> ps =
+        [ctx->device newComputePipelineStateWithFunction:fn error:&error];
+    if (!ps) {
+        fprintf(stderr, "ERROR: pipeline '%s': %s\n",
+                [name UTF8String], [[error localizedDescription] UTF8String]);
+    }
+    return ps;
+}
+
+// ============================================================================
+// Setup
+// ============================================================================
+
+MetalCtx *metal_setup(const ModelConfig *cfg) {
+    MetalCtx *ctx = calloc(1, sizeof(MetalCtx));
+    ctx->device = MTLCreateSystemDefaultDevice();
+    if (!ctx->device) {
+        fprintf(stderr, "ERROR: No Metal device\n");
+        free(ctx);
+        return NULL;
+    }
+    printf("[metal] Device: %s\n", [[ctx->device name] UTF8String]);
+
+    ctx->queue = [ctx->device newCommandQueue];
+    if (!ctx->queue) {
+        fprintf(stderr, "ERROR: No command queue\n");
+        free(ctx);
+        return NULL;
+    }
+
+    // Load and compile shaders
+    NSError *error = nil;
+    NSString *src = [NSString stringWithContentsOfFile:@"src/shaders.metal"
+                                             encoding:NSUTF8StringEncoding
+                                                error:&error];
+    if (!src) {
+        fprintf(stderr, "ERROR: Cannot find shaders.metal\n");
+        free(ctx);
+        return NULL;
+    }
+
+    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+    opts.mathMode = MTLMathModeFast;
+    opts.languageVersion = MTLLanguageVersion3_1;
+
+    double t0 = now_ms();
+    ctx->library = [ctx->device newLibraryWithSource:src options:opts error:&error];
+    if (!ctx->library) {
+        fprintf(stderr, "ERROR: Shader compile failed: %s\n",
+                [[error localizedDescription] UTF8String]);
+        free(ctx);
+        return NULL;
+    }
+    printf("[metal] Shader compile: %.0f ms\n", now_ms() - t0);
+
+    // Create pipelines
+    ctx->matvec_4bit      = make_pipeline(ctx, @"dequant_matvec_4bit_v3");
+    ctx->matvec_2bit      = make_pipeline(ctx, @"dequant_matvec_2bit");
+    ctx->norm_sum_sq      = make_pipeline(ctx, @"rms_norm_sum_sq");
+    ctx->norm_apply       = make_pipeline(ctx, @"rms_norm_apply_bf16");
+    ctx->residual_add     = make_pipeline(ctx, @"residual_add");
+    ctx->attn_scores      = make_pipeline(ctx, @"attn_scores_batched");
+    ctx->attn_softmax     = make_pipeline(ctx, @"attn_softmax_batched");
+    ctx->attn_values      = make_pipeline(ctx, @"attn_values_batched");
+    ctx->sigmoid_gate     = make_pipeline(ctx, @"sigmoid_gate");
+    ctx->swiglu           = make_pipeline(ctx, @"swiglu_fused");
+    ctx->moe_combine      = make_pipeline(ctx, @"moe_combine_residual");
+    ctx->delta_net        = make_pipeline(ctx, @"gated_delta_net_step");
+    ctx->conv1d           = make_pipeline(ctx, @"conv1d_step");
+    ctx->rms_norm_qk      = make_pipeline(ctx, @"rms_norm_qk");
+    ctx->decay_beta       = make_pipeline(ctx, @"compute_decay_beta");
+    ctx->gated_rms_norm   = make_pipeline(ctx, @"gated_rms_norm");
+
+    if (!ctx->matvec_4bit || !ctx->norm_sum_sq || !ctx->norm_apply) {
+        fprintf(stderr, "ERROR: Required Metal pipelines missing\n");
+        metal_free(ctx);
+        return NULL;
+    }
+
+    // ---- Allocate buffers based on model config ----
+
+    int H = cfg->hidden_dim;
+    int V = cfg->vocab_size;
+    int max_dim = (V > H) ? V : H;  // output buffer must fit vocab logits
+
+    ctx->buf_input = [ctx->device newBufferWithLength:H * sizeof(float)
+                                              options:MTLResourceStorageModeShared];
+    ctx->buf_output = [ctx->device newBufferWithLength:max_dim * sizeof(float)
+                                               options:MTLResourceStorageModeShared];
+    ctx->buf_sum_sq = [ctx->device newBufferWithLength:sizeof(float)
+                                               options:MTLResourceStorageModeShared];
+    ctx->buf_residual = [ctx->device newBufferWithLength:H * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+    ctx->buf_h_mid = [ctx->device newBufferWithLength:H * sizeof(float)
+                                              options:MTLResourceStorageModeShared];
+    ctx->buf_moe_hidden = [ctx->device newBufferWithLength:H * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+    ctx->buf_combine_params = [ctx->device newBufferWithLength:(OROME_MAX_ACTIVE + 2) * sizeof(float)
+                                                       options:MTLResourceStorageModeShared];
+
+    // KV cache GPU buffers (full attention layers only)
+    int n_full = cfg->num_full_attn_layers;
+    ctx->buf_kv_k = (__strong id<MTLBuffer> *)calloc(n_full, sizeof(id<MTLBuffer>));
+    ctx->buf_kv_v = (__strong id<MTLBuffer> *)calloc(n_full, sizeof(id<MTLBuffer>));
+    size_t kv_size = (size_t)OROME_GPU_KV_SEQ * cfg->kv_dim * sizeof(float);
+    for (int i = 0; i < n_full; i++) {
+        ctx->buf_kv_k[i] = [ctx->device newBufferWithLength:kv_size
+                                                    options:MTLResourceStorageModeShared];
+        ctx->buf_kv_v[i] = [ctx->device newBufferWithLength:kv_size
+                                                    options:MTLResourceStorageModeShared];
+        if (ctx->buf_kv_k[i]) memset([ctx->buf_kv_k[i] contents], 0, kv_size);
+        if (ctx->buf_kv_v[i]) memset([ctx->buf_kv_v[i] contents], 0, kv_size);
+    }
+
+    ctx->buf_attn_scores = [ctx->device newBufferWithLength:
+        (size_t)cfg->num_attn_heads * OROME_GPU_KV_SEQ * sizeof(float)
+        options:MTLResourceStorageModeShared];
+    ctx->buf_attn_output = [ctx->device newBufferWithLength:
+        (size_t)cfg->num_attn_heads * cfg->head_dim * sizeof(float)
+        options:MTLResourceStorageModeShared];
+
+    // Linear attention GPU state
+    int n_lin = cfg->num_linear_layers;
+    ctx->buf_linear_state = (__strong id<MTLBuffer> *)calloc(n_lin, sizeof(id<MTLBuffer>));
+    ctx->buf_conv_state = (__strong id<MTLBuffer> *)calloc(n_lin, sizeof(id<MTLBuffer>));
+    size_t delta_size = (size_t)cfg->linear_num_v_heads * cfg->linear_value_dim
+                        * cfg->linear_key_dim * sizeof(float);
+    size_t conv_size = (size_t)(cfg->conv_kernel_size - 1) * cfg->linear_conv_dim * sizeof(float);
+    for (int i = 0; i < n_lin; i++) {
+        ctx->buf_linear_state[i] = [ctx->device newBufferWithLength:delta_size
+                                                            options:MTLResourceStorageModeShared];
+        ctx->buf_conv_state[i] = [ctx->device newBufferWithLength:conv_size
+                                                          options:MTLResourceStorageModeShared];
+        if (ctx->buf_linear_state[i]) memset([ctx->buf_linear_state[i] contents], 0, delta_size);
+        if (ctx->buf_conv_state[i]) memset([ctx->buf_conv_state[i] contents], 0, conv_size);
+    }
+
+    ctx->buf_linear_q = [ctx->device newBufferWithLength:cfg->linear_total_key * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+    ctx->buf_linear_k = [ctx->device newBufferWithLength:cfg->linear_total_key * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+    ctx->buf_linear_v = [ctx->device newBufferWithLength:cfg->linear_total_value * sizeof(float)
+                                                 options:MTLResourceStorageModeShared];
+    ctx->buf_linear_decay = [ctx->device newBufferWithLength:cfg->linear_num_v_heads * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+    ctx->buf_linear_beta = [ctx->device newBufferWithLength:cfg->linear_num_v_heads * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+    ctx->buf_linear_output = [ctx->device newBufferWithLength:cfg->linear_total_value * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+    ctx->buf_conv_input = [ctx->device newBufferWithLength:cfg->linear_conv_dim * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+    ctx->buf_conv_output = [ctx->device newBufferWithLength:cfg->linear_conv_dim * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+
+    // Expert buffers
+    size_t expert_alloc = (cfg->expert_4bit.expert_size + 16383) & ~((size_t)16383);
+    ctx->buf_multi_expert_input = [ctx->device newBufferWithLength:H * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+    for (int k = 0; k < cfg->num_experts_per_tok && k < OROME_MAX_ACTIVE; k++) {
+        ctx->buf_multi_expert_data[k] = [ctx->device newBufferWithLength:expert_alloc
+                                                                 options:MTLResourceStorageModeShared];
+        ctx->buf_multi_expert_gate[k] = [ctx->device newBufferWithLength:cfg->moe_intermediate * sizeof(float)
+                                                                 options:MTLResourceStorageModeShared];
+        ctx->buf_multi_expert_up[k] = [ctx->device newBufferWithLength:cfg->moe_intermediate * sizeof(float)
+                                                               options:MTLResourceStorageModeShared];
+        ctx->buf_multi_expert_act[k] = [ctx->device newBufferWithLength:cfg->moe_intermediate * sizeof(float)
+                                                                options:MTLResourceStorageModeShared];
+        ctx->buf_multi_expert_out[k] = [ctx->device newBufferWithLength:H * sizeof(float)
+                                                                options:MTLResourceStorageModeShared];
+    }
+
+    ctx->buf_shared_gate = [ctx->device newBufferWithLength:cfg->shared_intermediate * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+    ctx->buf_shared_up = [ctx->device newBufferWithLength:cfg->shared_intermediate * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+    ctx->buf_shared_act = [ctx->device newBufferWithLength:cfg->shared_intermediate * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+    ctx->buf_shared_out = [ctx->device newBufferWithLength:H * sizeof(float)
+                                                   options:MTLResourceStorageModeShared];
+
+    printf("[metal] Buffers allocated for %s (%d layers, %d hidden)\n",
+           cfg->name, cfg->num_layers, cfg->hidden_dim);
+    return ctx;
+}
+
+void metal_set_weights(MetalCtx *ctx, WeightFile *wf) {
+    size_t page_size = 16384;
+    size_t aligned = (wf->size + page_size - 1) & ~(page_size - 1);
+
+    ctx->buf_weights = [ctx->device newBufferWithBytesNoCopy:wf->data
+                                                      length:aligned
+                                                     options:MTLResourceStorageModeShared
+                                                 deallocator:nil];
+    if (!ctx->buf_weights) {
+        fprintf(stderr, "WARNING: Cannot wrap weights as Metal buffer (%.2f GB) — GPU will use copies\n",
+                wf->size / 1e9);
+    } else {
+        printf("[metal] Weights wrapped as Metal buffer (%.2f GB)\n", aligned / 1e9);
+    }
+}
+
+void metal_free(MetalCtx *ctx) {
+    if (!ctx) return;
+    free(ctx->buf_kv_k);
+    free(ctx->buf_kv_v);
+    free(ctx->buf_linear_state);
+    free(ctx->buf_conv_state);
+    free(ctx);
+}
+
+// ============================================================================
+// GPU matvec dispatch
+// ============================================================================
+
+#define ROWS_PER_TG 16  // tuning parameter for autoresearch
+
+static void gpu_encode_matvec(id<MTLComputeCommandEncoder> enc,
+                              MetalCtx *ctx,
+                              GpuMatvecJob *job) {
+    id<MTLComputePipelineState> pipe = job->is_2bit ? ctx->matvec_2bit : ctx->matvec_4bit;
+    if (!pipe) return;
+
+    [enc setComputePipelineState:pipe];
+    [enc setBuffer:job->w_buf offset:job->w_off atIndex:0];
+    [enc setBuffer:job->s_buf offset:job->s_off atIndex:1];
+    [enc setBuffer:job->b_buf offset:job->b_off atIndex:2];
+    [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
+    [enc setBuffer:job->out_buf offset:job->out_off atIndex:4];
+
+    uint out_dim = (uint)job->out_dim;
+    uint in_dim = (uint)job->in_dim;
+    uint gs = (uint)job->group_size;
+    [enc setBytes:&out_dim length:sizeof(uint) atIndex:5];
+    [enc setBytes:&in_dim  length:sizeof(uint) atIndex:6];
+    [enc setBytes:&gs      length:sizeof(uint) atIndex:7];
+
+    NSUInteger tg_size = ROWS_PER_TG * 32;
+    NSUInteger num_tgs = ((uint)job->out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+}
+
+void gpu_run_matvec_batch(MetalCtx *ctx, GpuMatvecJob *jobs, int count) {
+    if (!ctx || count <= 0) return;
+
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+    for (int i = 0; i < count; i++) {
+        gpu_encode_matvec(enc, ctx, &jobs[i]);
+    }
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    // Copy results to CPU pointers if requested
+    for (int i = 0; i < count; i++) {
+        if (jobs[i].out_ptr) {
+            memcpy(jobs[i].out_ptr,
+                   (uint8_t *)[jobs[i].out_buf contents] + jobs[i].out_off,
+                   jobs[i].out_dim * sizeof(float));
+        }
+    }
+}
+
+void gpu_dequant_matvec(MetalCtx *ctx, const ModelConfig *cfg,
+                        uint32_t *W, uint16_t *scales, uint16_t *biases,
+                        float *x, float *out, int out_dim, int in_dim,
+                        QuantType quant) {
+    if (!ctx || !ctx->buf_weights) return;
+
+    // Copy input to GPU buffer
+    memcpy([ctx->buf_input contents], x, in_dim * sizeof(float));
+
+    // Compute offsets into mmap'd weight buffer
+    uint8_t *base = (uint8_t *)[ctx->buf_weights contents];
+    size_t w_off = (uint8_t *)W - base;
+    size_t s_off = (uint8_t *)scales - base;
+    size_t b_off = (uint8_t *)biases - base;
+
+    GpuMatvecJob job = {
+        .w_buf = ctx->buf_weights, .w_off = w_off,
+        .s_buf = ctx->buf_weights, .s_off = s_off,
+        .b_buf = ctx->buf_weights, .b_off = b_off,
+        .out_buf = ctx->buf_output, .out_off = 0,
+        .out_ptr = out,
+        .out_dim = out_dim, .in_dim = in_dim,
+        .group_size = cfg->group_size,
+        .is_2bit = (quant == QUANT_2BIT),
+    };
+
+    gpu_run_matvec_batch(ctx, &job, 1);
+}
+
+void fast_dequant_matvec(MetalCtx *ctx, const ModelConfig *cfg,
+                         uint32_t *W, uint16_t *scales, uint16_t *biases,
+                         float *x, float *out, int out_dim, int in_dim,
+                         QuantType quant) {
+    if (ctx && ctx->buf_weights) {
+        gpu_dequant_matvec(ctx, cfg, W, scales, biases, x, out,
+                           out_dim, in_dim, quant);
+    } else if (quant == QUANT_2BIT) {
+        cpu_dequant_matvec_2bit(W, scales, biases, x, out,
+                                out_dim, in_dim, cfg->group_size);
+    } else {
+        cpu_dequant_matvec(W, scales, biases, x, out,
+                           out_dim, in_dim, cfg->group_size);
+    }
+}
