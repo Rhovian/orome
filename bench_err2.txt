@@ -1,2 +1,0 @@
----
-tok_sec_median: 60.82

@@ -208,7 +208,6 @@ typedef struct {
     id<MTLComputePipelineState> norm_apply;
     id<MTLComputePipelineState> residual_add;
     id<MTLComputePipelineState> attn_scores;
-    id<MTLComputePipelineState> attn_scores_ph;  // per-head: 1 TG per head
     id<MTLComputePipelineState> attn_softmax;
     id<MTLComputePipelineState> attn_values;
     id<MTLComputePipelineState> sigmoid_gate;

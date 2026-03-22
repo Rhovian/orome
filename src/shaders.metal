@@ -644,59 +644,6 @@ kernel void attn_scores_batched(
 
 
 // ============================================================================
-// Kernel 6b: Per-head attention scores — 1 TG per head, loops over positions
-// ============================================================================
-// Much more efficient than attn_scores_batched at longer seq_len.
-// Q is loaded into shared memory once, then reused for all positions.
-// Each simdgroup handles one position at a time, cycling through all positions.
-
-kernel void attn_scores_per_head(
-    device const float* Q          [[buffer(0)]],  // [num_heads, head_dim]
-    device const float* K_cache    [[buffer(1)]],  // [max_seq, kv_dim]
-    device float*       scores     [[buffer(2)]],  // [num_heads, seq_stride]
-    constant uint&      head_dim   [[buffer(3)]],  // 256
-    constant uint&      kv_dim     [[buffer(4)]],  // 512
-    constant uint&      seq_len    [[buffer(5)]],
-    constant uint&      seq_stride [[buffer(6)]],
-    constant float&     scale      [[buffer(7)]],
-    constant uint&      heads_per_kv [[buffer(8)]],
-    uint tgid  [[threadgroup_position_in_grid]],    // head index
-    uint lid   [[thread_position_in_threadgroup]],
-    uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
-) {
-    uint h = tgid;
-    uint kv_h = h / heads_per_kv;
-
-    // Load Q[h] into shared memory (256 floats = 1KB)
-    threadgroup float q_shared[256];
-    for (uint d = lid; d < head_dim; d += 256) {
-        q_shared[d] = Q[h * head_dim + d];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // 8 simdgroups of 32 threads = 256 threads
-    // Each simdgroup processes positions independently
-    // simdgroup 0: positions 0, 8, 16, ...
-    // simdgroup 1: positions 1, 9, 17, ...
-    for (uint pos = simd_group; pos < seq_len; pos += 8) {
-        device const float* kp = K_cache + pos * kv_dim + kv_h * head_dim;
-
-        // Each thread handles head_dim/32 = 8 elements
-        float acc = 0.0f;
-        for (uint d = simd_lane; d < head_dim; d += 32) {
-            acc += q_shared[d] * kp[d];
-        }
-        float dot = simd_sum(acc);
-
-        if (simd_lane == 0) {
-            scores[h * seq_stride + pos] = dot * scale;
-        }
-    }
-}
-
-
-// ============================================================================
 // Kernel 7: Batched softmax — one threadgroup per head
 // ============================================================================
 
