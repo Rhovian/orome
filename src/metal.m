@@ -260,9 +260,9 @@ void metal_free(MetalCtx *ctx) {
 
 #define ROWS_PER_TG 16  // tuning parameter for autoresearch
 
-static void gpu_encode_matvec(id<MTLComputeCommandEncoder> enc,
-                              MetalCtx *ctx,
-                              GpuMatvecJob *job) {
+void gpu_encode_matvec_job(id<MTLComputeCommandEncoder> enc,
+                           MetalCtx *ctx,
+                           GpuMatvecJob *job) {
     id<MTLComputePipelineState> pipe = job->is_2bit ? ctx->matvec_2bit : ctx->matvec_4bit;
     if (!pipe) return;
 
@@ -270,7 +270,8 @@ static void gpu_encode_matvec(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:job->w_buf offset:job->w_off atIndex:0];
     [enc setBuffer:job->s_buf offset:job->s_off atIndex:1];
     [enc setBuffer:job->b_buf offset:job->b_off atIndex:2];
-    [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
+    id<MTLBuffer> in_buf = job->in_buf ? job->in_buf : ctx->buf_input;
+    [enc setBuffer:in_buf offset:job->in_off atIndex:3];
     [enc setBuffer:job->out_buf offset:job->out_off atIndex:4];
 
     uint out_dim = (uint)job->out_dim;
@@ -293,7 +294,7 @@ void gpu_run_matvec_batch(MetalCtx *ctx, GpuMatvecJob *jobs, int count) {
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
     for (int i = 0; i < count; i++) {
-        gpu_encode_matvec(enc, ctx, &jobs[i]);
+        gpu_encode_matvec_job(enc, ctx, &jobs[i]);
     }
 
     [enc endEncoding];

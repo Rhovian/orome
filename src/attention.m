@@ -26,7 +26,8 @@
 
 void full_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                             int layer_idx, int pos, float *hidden, float *residual,
-                            float *h_post, KVCache *kv) {
+                            float *h_post, KVCache *kv,
+                            float **attn_out, int *attn_out_dim) {
     (void)residual; (void)h_post;
     int H = cfg->hidden_dim;
     int n_heads = cfg->num_attn_heads;
@@ -142,16 +143,9 @@ void full_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cf
         free(scores);
     }
 
-    // 7. O projection + residual
-    uint32_t *o_w = weights_layer_ptr(wf, layer_idx, "self_attn.o_proj.weight");
-    uint16_t *o_s = weights_layer_ptr(wf, layer_idx, "self_attn.o_proj.scales");
-    uint16_t *o_b = weights_layer_ptr(wf, layer_idx, "self_attn.o_proj.biases");
-    fast_dequant_matvec(ctx, cfg, o_w, o_s, o_b, s_attn_out, s_o_proj,
-                        H, n_heads * hd, QUANT_4BIT);
-
-    for (int i = 0; i < H; i++) {
-        hidden[i] += s_o_proj[i];
-    }
+    // 7. Export pre-O-proj output (caller handles O proj + residual)
+    *attn_out = s_attn_out;
+    *attn_out_dim = n_heads * hd;
 }
 
 // ============================================================================
@@ -165,7 +159,8 @@ void full_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cf
 
 void linear_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                               int layer_idx, int pos, float *hidden, float *residual,
-                              float *h_post, LinearAttnState *state) {
+                              float *h_post, LinearAttnState *state,
+                              float **attn_out, int *attn_out_dim) {
     (void)pos; (void)residual; (void)h_post;
     int H = cfg->hidden_dim;
     int n_v_heads = cfg->linear_num_v_heads;
@@ -325,14 +320,7 @@ void linear_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *
     cpu_rms_norm_gated(s_values_out, s_z, o_norm_w, s_gated_out,
                        n_v_heads, val_dim, eps);
 
-    // 8. O projection + residual (linear_attn.out_proj)
-    uint32_t *o_w = weights_layer_ptr(wf, layer_idx, "linear_attn.out_proj.weight");
-    uint16_t *o_s = weights_layer_ptr(wf, layer_idx, "linear_attn.out_proj.scales");
-    uint16_t *o_b = weights_layer_ptr(wf, layer_idx, "linear_attn.out_proj.biases");
-    fast_dequant_matvec(ctx, cfg, o_w, o_s, o_b, s_gated_out, s_o_proj,
-                        H, total_value, QUANT_4BIT);
-
-    for (int i = 0; i < H; i++) {
-        hidden[i] += s_o_proj[i];
-    }
+    // 8. Export pre-O-proj output (caller handles O proj + residual)
+    *attn_out = s_gated_out;
+    *attn_out_dim = total_value;
 }

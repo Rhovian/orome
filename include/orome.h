@@ -287,6 +287,7 @@ typedef struct {
     id<MTLBuffer> w_buf;    size_t w_off;
     id<MTLBuffer> s_buf;    size_t s_off;
     id<MTLBuffer> b_buf;    size_t b_off;
+    id<MTLBuffer> in_buf;   size_t in_off;  // input buffer (NULL → ctx->buf_input)
     id<MTLBuffer> out_buf;  size_t out_off;
     float *out_ptr;         // CPU pointer for readback (or NULL)
     int out_dim;
@@ -297,6 +298,10 @@ typedef struct {
 
 // Batch multiple matvecs in one command buffer. Returns after GPU completion.
 void gpu_run_matvec_batch(MetalCtx *ctx, GpuMatvecJob *jobs, int count);
+
+// Encode a single matvec into an existing command encoder (no commit).
+void gpu_encode_matvec_job(id<MTLComputeCommandEncoder> enc, MetalCtx *ctx,
+                           GpuMatvecJob *job);
 
 // Single matvec (copies input to buf_input, runs, copies result out).
 void gpu_dequant_matvec(MetalCtx *ctx, const ModelConfig *cfg,
@@ -372,13 +377,17 @@ double now_ms(void);
 // Attention layers
 // ============================================================================
 
+// Attention forward — returns pre-O-proj output via attn_out/attn_out_dim.
+// Does NOT perform O projection or residual add (caller handles these).
 void full_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                             int layer_idx, int pos, float *hidden, float *residual,
-                            float *h_post, KVCache *kv);
+                            float *h_post, KVCache *kv,
+                            float **attn_out, int *attn_out_dim);
 
 void linear_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                               int layer_idx, int pos, float *hidden, float *residual,
-                              float *h_post, LinearAttnState *state);
+                              float *h_post, LinearAttnState *state,
+                              float **attn_out, int *attn_out_dim);
 
 // ============================================================================
 // MoE (Mixture of Experts)
@@ -405,6 +414,13 @@ void metal_set_expert_weights(MetalCtx *ctx, ExpertFiles *ef, const ModelConfig 
 void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                  int layer_idx, float *hidden, float *h_post,
                  ExpertFiles *ef, int K, QuantType quant);
+
+// MoE forward with pre-computed routing (skips routing GPU batch).
+// gate_scores and shared_gate_score must already be computed.
+void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
+                        int layer_idx, float *hidden, float *h_post,
+                        float *gate_scores, float shared_gate_score,
+                        ExpertFiles *ef, int K, QuantType quant);
 
 // ============================================================================
 // Engine — full forward pass
