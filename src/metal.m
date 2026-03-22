@@ -98,6 +98,8 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->gated_rms_norm   = make_pipeline(ctx, @"gated_rms_norm");
     ctx->batch_expert_mv  = make_pipeline(ctx, @"batch_expert_matvec_4bit");
     ctx->batch_swiglu     = make_pipeline(ctx, @"batch_swiglu");
+    ctx->batch_expert_down = make_pipeline(ctx, @"batch_expert_down_4bit");
+    ctx->moe_combine_packed = make_pipeline(ctx, @"moe_combine_residual_packed");
     ctx->rms_norm_qk_w    = make_pipeline(ctx, @"rms_norm_qk_weighted");
     ctx->rope_apply       = make_pipeline(ctx, @"rope_apply");
     ctx->kv_cache_write   = make_pipeline(ctx, @"kv_cache_write");

@@ -220,6 +220,8 @@ typedef struct {
     id<MTLComputePipelineState> gated_rms_norm;
     id<MTLComputePipelineState> batch_expert_mv;
     id<MTLComputePipelineState> batch_swiglu;
+    id<MTLComputePipelineState> batch_expert_down;
+    id<MTLComputePipelineState> moe_combine_packed;
     id<MTLComputePipelineState> rms_norm_qk_w;
     id<MTLComputePipelineState> rope_apply;
     id<MTLComputePipelineState> kv_cache_write;
