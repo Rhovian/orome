@@ -447,7 +447,7 @@ int engine_step(Engine *eng, int token_id) {
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             } else {
                 cmd = [ctx->queue commandBuffer];
-                enc = [cmd computeCommandEncoder];
+                enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
                 if (gpu_resident) {
                     // Copy residual via compute kernel (no blit transition)
                     [enc setComputePipelineState:ctx->copy_buffer];
@@ -762,7 +762,7 @@ int engine_step(Engine *eng, int token_id) {
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             } else {
                 cmd = [ctx->queue commandBuffer];
-                enc = [cmd computeCommandEncoder];
+                enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
                 if (gpu_resident) {
                     [enc setComputePipelineState:ctx->copy_buffer];
                     [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
@@ -1099,7 +1099,7 @@ int engine_step(Engine *eng, int token_id) {
             enc = fwd_enc;
         } else {
             cmd = [ctx->queue commandBuffer];
-            enc = [cmd computeCommandEncoder];
+            enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
         }
 
         // RMS norm: buf_moe_hidden → buf_input

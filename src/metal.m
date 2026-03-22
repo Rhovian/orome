@@ -320,7 +320,7 @@ void gpu_run_matvec_batch(MetalCtx *ctx, GpuMatvecJob *jobs, int count) {
     if (!ctx || count <= 0) return;
 
     id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
 
     for (int i = 0; i < count; i++) {
         gpu_encode_matvec_job(enc, ctx, &jobs[i]);
