@@ -225,12 +225,32 @@ void metal_set_weights(MetalCtx *ctx, WeightFile *wf) {
     }
 }
 
+void metal_set_expert_weights(MetalCtx *ctx, ExpertFiles *ef, const ModelConfig *cfg) {
+    if (!ctx || !ef) return;
+    int n = cfg->num_layers;
+    ctx->buf_expert_layers = (__strong id<MTLBuffer> *)calloc(n, sizeof(id<MTLBuffer>));
+    ctx->num_expert_layers = n;
+    int wrapped = 0;
+    for (int i = 0; i < n; i++) {
+        if (!ef->layer_data[i] || ef->layer_size[i] == 0) continue;
+        size_t page_size = 16384;
+        size_t aligned = (ef->layer_size[i] + page_size - 1) & ~(page_size - 1);
+        ctx->buf_expert_layers[i] = [ctx->device newBufferWithBytesNoCopy:ef->layer_data[i]
+                                                                    length:aligned
+                                                                   options:MTLResourceStorageModeShared
+                                                               deallocator:nil];
+        if (ctx->buf_expert_layers[i]) wrapped++;
+    }
+    printf("[metal] Expert layers wrapped as Metal buffers: %d/%d\n", wrapped, n);
+}
+
 void metal_free(MetalCtx *ctx) {
     if (!ctx) return;
     free(ctx->buf_kv_k);
     free(ctx->buf_kv_v);
     free(ctx->buf_linear_state);
     free(ctx->buf_conv_state);
+    free(ctx->buf_expert_layers);
     free(ctx);
 }
 

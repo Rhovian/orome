@@ -122,6 +122,9 @@ int main(int argc, char **argv) {
         // ---- Open expert files ----
         ExpertFiles *ef = expert_files_open(&cfg, model_dir ? model_dir : ".", NULL);
 
+        // ---- Wrap expert layer data as Metal buffers ----
+        if (ctx) metal_set_expert_weights(ctx, ef, &cfg);
+
         // ---- Create engine ----
         QuantType quant = use_2bit ? QUANT_2BIT : QUANT_4BIT;
         Engine *eng = engine_create(&cfg, wf, ctx, ef, quant,

@@ -7,6 +7,7 @@
  */
 
 #import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +18,8 @@
 #include <sys/stat.h>
 
 #include "orome.h"
+
+#define ROWS_PER_TG 16  // must match metal.m and shaders.metal
 
 // ============================================================================
 // Expert file management — mmap all layers at startup
@@ -268,13 +271,103 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     float sw = cpu_sigmoid(s_shared_gate_score);
     for (int i = 0; i < H; i++) s_shared_out[i] *= sw;
 
-    // 3. Routed experts — zero-copy from mmap'd data
-    for (int k = 0; k < K; k++) {
-        const void *expert_base = (const uint8_t *)layer_data +
-            (size_t)expert_indices[k] * layout->expert_size;
-        expert_forward_direct(cfg, layout, expert_base, h_post,
-                              s_expert_out[k], s_expert_gate[k],
-                              s_expert_up[k], s_expert_act[k]);
+    // 3. Routed experts — GPU if expert Metal buffers available, else CPU
+    id<MTLBuffer> expert_layer_buf = (ctx && ctx->buf_expert_layers)
+                                      ? ctx->buf_expert_layers[layer_idx] : nil;
+
+    if (expert_layer_buf && ctx->buf_weights) {
+        // GPU expert forward: batch gate+up for all K experts, then SwiGLU, then batch down
+        memcpy([ctx->buf_multi_expert_input contents], h_post, H * sizeof(float));
+
+        // Phase 1: gate + up projections (2*K matvecs in one command buffer)
+        GpuMatvecJob gate_up_jobs[2 * OROME_MAX_ACTIVE];
+        for (int k = 0; k < K; k++) {
+            size_t expert_off = (size_t)expert_indices[k] * layout->expert_size;
+
+            gate_up_jobs[k * 2] = (GpuMatvecJob){
+                .w_buf = expert_layer_buf, .w_off = expert_off + layout->gate_w_off,
+                .s_buf = expert_layer_buf, .s_off = expert_off + layout->gate_s_off,
+                .b_buf = expert_layer_buf, .b_off = expert_off + layout->gate_b_off,
+                .out_buf = ctx->buf_multi_expert_gate[k], .out_off = 0,
+                .out_ptr = s_expert_gate[k],
+                .out_dim = cfg->moe_intermediate, .in_dim = H,
+                .group_size = cfg->group_size, .is_2bit = (quant == QUANT_2BIT),
+            };
+            gate_up_jobs[k * 2 + 1] = (GpuMatvecJob){
+                .w_buf = expert_layer_buf, .w_off = expert_off + layout->up_w_off,
+                .s_buf = expert_layer_buf, .s_off = expert_off + layout->up_s_off,
+                .b_buf = expert_layer_buf, .b_off = expert_off + layout->up_b_off,
+                .out_buf = ctx->buf_multi_expert_up[k], .out_off = 0,
+                .out_ptr = s_expert_up[k],
+                .out_dim = cfg->moe_intermediate, .in_dim = H,
+                .group_size = cfg->group_size, .is_2bit = (quant == QUANT_2BIT),
+            };
+        }
+
+        // Need to set buf_input to h_post for the expert matvecs
+        // (buf_input was set to h_post earlier for routing, but may have been overwritten)
+        memcpy([ctx->buf_input contents], h_post, H * sizeof(float));
+        gpu_run_matvec_batch(ctx, gate_up_jobs, K * 2);
+
+        // SwiGLU on CPU (small vectors, fast)
+        for (int k = 0; k < K; k++) {
+            cpu_swiglu(s_expert_gate[k], s_expert_up[k], s_expert_act[k],
+                       cfg->moe_intermediate);
+        }
+
+        // Phase 2: down projections (K matvecs in one command buffer)
+        // Each down proj has a DIFFERENT input (s_expert_act[k]), so we need to copy
+        // each into a separate input buffer. Use buf_multi_expert_act[k] as input.
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        for (int k = 0; k < K; k++) {
+            size_t expert_off = (size_t)expert_indices[k] * layout->expert_size;
+            int M = cfg->moe_intermediate;
+
+            // Copy activation to GPU buffer for this expert
+            memcpy([ctx->buf_multi_expert_act[k] contents], s_expert_act[k],
+                   M * sizeof(float));
+
+            id<MTLComputePipelineState> pipe = (quant == QUANT_2BIT)
+                                               ? ctx->matvec_2bit : ctx->matvec_4bit;
+            [enc setComputePipelineState:pipe];
+            [enc setBuffer:expert_layer_buf offset:expert_off + layout->down_w_off atIndex:0];
+            [enc setBuffer:expert_layer_buf offset:expert_off + layout->down_s_off atIndex:1];
+            [enc setBuffer:expert_layer_buf offset:expert_off + layout->down_b_off atIndex:2];
+            [enc setBuffer:ctx->buf_multi_expert_act[k] offset:0 atIndex:3];
+            [enc setBuffer:ctx->buf_multi_expert_out[k] offset:0 atIndex:4];
+
+            uint out_dim = (uint)H;
+            uint in_dim = (uint)M;
+            uint gs = (uint)cfg->group_size;
+            [enc setBytes:&out_dim length:sizeof(uint) atIndex:5];
+            [enc setBytes:&in_dim  length:sizeof(uint) atIndex:6];
+            [enc setBytes:&gs      length:sizeof(uint) atIndex:7];
+
+            NSUInteger tg_size = ROWS_PER_TG * 32;
+            NSUInteger num_tgs = ((uint)H + ROWS_PER_TG - 1) / ROWS_PER_TG;
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        }
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        // Read back results
+        for (int k = 0; k < K; k++) {
+            memcpy(s_expert_out[k], [ctx->buf_multi_expert_out[k] contents],
+                   H * sizeof(float));
+        }
+    } else {
+        // CPU fallback
+        for (int k = 0; k < K; k++) {
+            const void *expert_base = (const uint8_t *)layer_data +
+                (size_t)expert_indices[k] * layout->expert_size;
+            expert_forward_direct(cfg, layout, expert_base, h_post,
+                                  s_expert_out[k], s_expert_gate[k],
+                                  s_expert_up[k], s_expert_act[k]);
+        }
     }
 
     // 4. Combine: hidden += sum(weight[k] * expert_out[k]) + shared_out

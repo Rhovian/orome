@@ -251,6 +251,10 @@ typedef struct {
     id<MTLBuffer> buf_attn_scores;
     id<MTLBuffer> buf_attn_output;
 
+    // Expert layer data wrapped as Metal buffers (per layer)
+    id<MTLBuffer> __strong *buf_expert_layers;  // [num_layers] - mmap'd expert data
+    int num_expert_layers;
+
     // Linear attention GPU state (per layer)
     id<MTLBuffer> __strong *buf_linear_state;   // [num_linear_layers]
     id<MTLBuffer> __strong *buf_conv_state;     // [num_linear_layers]
@@ -270,6 +274,8 @@ MetalCtx *metal_setup(const ModelConfig *cfg);
 
 // Wrap mmap'd weights as a Metal buffer for zero-copy GPU access.
 void metal_set_weights(MetalCtx *ctx, WeightFile *wf);
+
+// metal_set_expert_weights declared after ExpertFiles typedef below
 
 void metal_free(MetalCtx *ctx);
 
@@ -392,6 +398,9 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
                                const char *hot_mask_path);
 void         expert_files_close(ExpertFiles *ef, const ModelConfig *cfg);
 bool         expert_is_hot(const ExpertFiles *ef, int layer, int expert_id);
+
+// Wrap mmap'd expert layer data as Metal buffers for GPU expert forward.
+void metal_set_expert_weights(MetalCtx *ctx, ExpertFiles *ef, const ModelConfig *cfg);
 
 void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                  int layer_idx, float *hidden, float *h_post,
