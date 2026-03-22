@@ -970,24 +970,41 @@ int engine_step(Engine *eng, int token_id) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase F: Attention scores (Q @ K^T) ---
-            [enc setComputePipelineState:ctx->attn_scores];
-            [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];   // Q
-            [enc setBuffer:ctx->buf_kv_k[full_idx] offset:0 atIndex:1];
-            [enc setBuffer:ctx->buf_attn_scores offset:0 atIndex:2];
+            // Adaptive: per-head kernel (1 TG/head) for seq_len > 24,
+            // batched kernel (1 TG per head×pos) for short sequences
             { uint hd_val = (uint)hd, kvd = (uint)kv_dim;
               uint sl = (uint)seq_len, ss = (uint)OROME_GPU_KV_SEQ;
               float scale = 1.0f;  // already scaled in QK norm
               uint hpk = (uint)(n_heads / n_kv);
-              uint nst = (uint)seq_len;
+            if (seq_len > 24 && ctx->attn_scores_ph) {
+              [enc setComputePipelineState:ctx->attn_scores_ph];
+              [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];
+              [enc setBuffer:ctx->buf_kv_k[full_idx] offset:0 atIndex:1];
+              [enc setBuffer:ctx->buf_attn_scores offset:0 atIndex:2];
               [enc setBytes:&hd_val length:sizeof(uint) atIndex:3];
               [enc setBytes:&kvd length:sizeof(uint) atIndex:4];
               [enc setBytes:&sl length:sizeof(uint) atIndex:5];
               [enc setBytes:&ss length:sizeof(uint) atIndex:6];
               [enc setBytes:&scale length:sizeof(float) atIndex:7];
               [enc setBytes:&hpk length:sizeof(uint) atIndex:8];
-              [enc setBytes:&nst length:sizeof(uint) atIndex:9]; }
-            [enc dispatchThreadgroups:MTLSizeMake(n_heads * seq_len, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+              [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+              [enc setComputePipelineState:ctx->attn_scores];
+              [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];
+              [enc setBuffer:ctx->buf_kv_k[full_idx] offset:0 atIndex:1];
+              [enc setBuffer:ctx->buf_attn_scores offset:0 atIndex:2];
+              [enc setBytes:&hd_val length:sizeof(uint) atIndex:3];
+              [enc setBytes:&kvd length:sizeof(uint) atIndex:4];
+              [enc setBytes:&sl length:sizeof(uint) atIndex:5];
+              [enc setBytes:&ss length:sizeof(uint) atIndex:6];
+              [enc setBytes:&scale length:sizeof(float) atIndex:7];
+              [enc setBytes:&hpk length:sizeof(uint) atIndex:8];
+              uint nst = sl;
+              [enc setBytes:&nst length:sizeof(uint) atIndex:9];
+              [enc dispatchThreadgroups:MTLSizeMake(n_heads * seq_len, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase G: Softmax ---

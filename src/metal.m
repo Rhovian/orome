@@ -101,6 +101,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->norm_apply       = make_pipeline(ctx, @"rms_norm_apply_bf16");
     ctx->residual_add     = make_pipeline(ctx, @"residual_add");
     ctx->attn_scores      = make_pipeline(ctx, @"attn_scores_batched");
+    ctx->attn_scores_ph   = make_pipeline(ctx, @"attn_scores_per_head");
     ctx->attn_softmax     = make_pipeline(ctx, @"attn_softmax_batched");
     ctx->attn_values      = make_pipeline(ctx, @"attn_values_batched");
     ctx->sigmoid_gate     = make_pipeline(ctx, @"sigmoid_gate");
