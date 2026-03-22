@@ -393,19 +393,22 @@ static void encode_fused_experts(id<MTLComputeCommandEncoder> enc,
     [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_H * K, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
 
-    // --- Shared expert down ---
-    [enc setComputePipelineState:ctx->matvec_4bit];
-    [enc setBuffer:ctx->buf_weights offset:lw->sd_w atIndex:0];
-    [enc setBuffer:ctx->buf_weights offset:lw->sd_s atIndex:1];
-    [enc setBuffer:ctx->buf_weights offset:lw->sd_b atIndex:2];
-    [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:3];
-    [enc setBuffer:ctx->buf_shared_out offset:0 atIndex:4];
-    { uint od = (uint)H, id_ = (uint)S, gs = (uint)cfg->group_size;
-      [enc setBytes:&od length:sizeof(uint) atIndex:5];
-      [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
-      [enc setBytes:&gs length:sizeof(uint) atIndex:7]; }
-    [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_H, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    // --- Shared expert down (use 2-row kernel if available) ---
+    { id<MTLComputePipelineState> sd_pipe = ctx->matvec_4bit_2row ? ctx->matvec_4bit_2row : ctx->matvec_4bit;
+      uint sd_rows_per_tg = ctx->matvec_4bit_2row ? ENGINE_ROWS_PER_TG * 2 : ENGINE_ROWS_PER_TG;
+      uint sd_num_tgs = ((uint)H + sd_rows_per_tg - 1) / sd_rows_per_tg;
+      [enc setComputePipelineState:sd_pipe];
+      [enc setBuffer:ctx->buf_weights offset:lw->sd_w atIndex:0];
+      [enc setBuffer:ctx->buf_weights offset:lw->sd_s atIndex:1];
+      [enc setBuffer:ctx->buf_weights offset:lw->sd_b atIndex:2];
+      [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:3];
+      [enc setBuffer:ctx->buf_shared_out offset:0 atIndex:4];
+      { uint od = (uint)H, id_ = (uint)S, gs = (uint)cfg->group_size;
+        [enc setBytes:&od length:sizeof(uint) atIndex:5];
+        [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+        [enc setBytes:&gs length:sizeof(uint) atIndex:7]; }
+      [enc dispatchThreadgroups:MTLSizeMake(sd_num_tgs, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
 
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
