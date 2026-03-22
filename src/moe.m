@@ -132,6 +132,7 @@ static void expert_forward_direct(const ModelConfig *cfg, const ExpertLayout *la
 static float *s_gate_scores = NULL;
 static float *s_shared_gate = NULL, *s_shared_up = NULL, *s_shared_act = NULL;
 static float *s_shared_out = NULL;
+static float s_shared_gate_score = 0.0f;
 static float *s_expert_out[OROME_MAX_ACTIVE];
 static float *s_expert_gate[OROME_MAX_ACTIVE];
 static float *s_expert_up[OROME_MAX_ACTIVE];
@@ -183,7 +184,7 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     const ExpertLayout *layout = (quant == QUANT_2BIT) ? &cfg->expert_2bit : &cfg->expert_4bit;
     ensure_scratch(cfg);
 
-    // 1. Routing: gate scores → softmax → topK
+    // 1. Routing + shared expert projections — batch all h_post-input matvecs
     int expert_indices[OROME_MAX_ACTIVE];
     float expert_weights[OROME_MAX_ACTIVE];
 
@@ -192,44 +193,79 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     uint16_t *gate_b = weights_layer_ptr(wf, layer_idx, "mlp.gate.biases");
     if (!gate_w || !gate_s || !gate_b) return;
 
-    fast_dequant_matvec(ctx, cfg, gate_w, gate_s, gate_b, h_post, s_gate_scores,
-                        n_experts, H, QUANT_4BIT);
+    uint32_t *sg_w = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.gate_proj.weight");
+    uint16_t *sg_s = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.gate_proj.scales");
+    uint16_t *sg_b = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.gate_proj.biases");
+    uint32_t *su_w = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.up_proj.weight");
+    uint16_t *su_s = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.up_proj.scales");
+    uint16_t *su_b = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.up_proj.biases");
+    uint32_t *sd_w = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.down_proj.weight");
+    uint16_t *sd_s = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.down_proj.scales");
+    uint16_t *sd_b = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.down_proj.biases");
+    uint32_t *sgg_w = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert_gate.weight");
+    uint16_t *sgg_s = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert_gate.scales");
+    uint16_t *sgg_b = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert_gate.biases");
+
+    int S = cfg->shared_intermediate;
+    memset(s_shared_out, 0, H * sizeof(float));
+
+    // Batch: routing gate + shared gate_proj + shared up_proj + shared_expert_gate
+    // All use h_post as input. 4 dispatches → 1 GPU command buffer.
+    if (ctx && ctx->buf_weights && sg_w && su_w && sgg_w) {
+        memcpy([ctx->buf_input contents], h_post, H * sizeof(float));
+        uint8_t *base = (uint8_t *)[ctx->buf_weights contents];
+        // Pack outputs into buf_output at different offsets
+        size_t sg_off = n_experts * sizeof(float);
+        size_t su_off = sg_off + S * sizeof(float);
+        size_t sgg_off = su_off + S * sizeof(float);
+        GpuMatvecJob jobs[4] = {
+            { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)gate_w - base,
+              .s_buf = ctx->buf_weights, .s_off = (uint8_t *)gate_s - base,
+              .b_buf = ctx->buf_weights, .b_off = (uint8_t *)gate_b - base,
+              .out_buf = ctx->buf_output, .out_off = 0,
+              .out_ptr = s_gate_scores, .out_dim = n_experts, .in_dim = H,
+              .group_size = cfg->group_size, .is_2bit = false },
+            { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)sg_w - base,
+              .s_buf = ctx->buf_weights, .s_off = (uint8_t *)sg_s - base,
+              .b_buf = ctx->buf_weights, .b_off = (uint8_t *)sg_b - base,
+              .out_buf = ctx->buf_output, .out_off = sg_off,
+              .out_ptr = s_shared_gate, .out_dim = S, .in_dim = H,
+              .group_size = cfg->group_size, .is_2bit = false },
+            { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)su_w - base,
+              .s_buf = ctx->buf_weights, .s_off = (uint8_t *)su_s - base,
+              .b_buf = ctx->buf_weights, .b_off = (uint8_t *)su_b - base,
+              .out_buf = ctx->buf_output, .out_off = su_off,
+              .out_ptr = s_shared_up, .out_dim = S, .in_dim = H,
+              .group_size = cfg->group_size, .is_2bit = false },
+            { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)sgg_w - base,
+              .s_buf = ctx->buf_weights, .s_off = (uint8_t *)sgg_s - base,
+              .b_buf = ctx->buf_weights, .b_off = (uint8_t *)sgg_b - base,
+              .out_buf = ctx->buf_output, .out_off = sgg_off,
+              .out_ptr = &s_shared_gate_score, .out_dim = 1, .in_dim = H,
+              .group_size = cfg->group_size, .is_2bit = false },
+        };
+        gpu_run_matvec_batch(ctx, jobs, 4);
+    } else {
+        fast_dequant_matvec(ctx, cfg, gate_w, gate_s, gate_b, h_post, s_gate_scores,
+                            n_experts, H, QUANT_4BIT);
+        if (sg_w) fast_dequant_matvec(ctx, cfg, sg_w, sg_s, sg_b, h_post, s_shared_gate,
+                                       S, H, QUANT_4BIT);
+        if (su_w) fast_dequant_matvec(ctx, cfg, su_w, su_s, su_b, h_post, s_shared_up,
+                                       S, H, QUANT_4BIT);
+        if (sgg_w) fast_dequant_matvec(ctx, cfg, sgg_w, sgg_s, sgg_b, h_post,
+                                        &s_shared_gate_score, 1, H, QUANT_4BIT);
+    }
+
     cpu_softmax(s_gate_scores, n_experts);
     cpu_topk(s_gate_scores, n_experts, K, expert_indices, expert_weights);
     cpu_normalize_weights(expert_weights, K);
 
-    // 2. Shared expert (uses pre-allocated scratch)
-    memset(s_shared_out, 0, H * sizeof(float));
-    {
-        uint32_t *sg_w = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.gate_proj.weight");
-        uint16_t *sg_s = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.gate_proj.scales");
-        uint16_t *sg_b = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.gate_proj.biases");
-        uint32_t *su_w = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.up_proj.weight");
-        uint16_t *su_s = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.up_proj.scales");
-        uint16_t *su_b = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.up_proj.biases");
-        uint32_t *sd_w = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.down_proj.weight");
-        uint16_t *sd_s = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.down_proj.scales");
-        uint16_t *sd_b = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.down_proj.biases");
+    // 2. Shared expert SwiGLU + down projection
+    cpu_swiglu(s_shared_gate, s_shared_up, s_shared_act, S);
+    if (sd_w) fast_dequant_matvec(ctx, cfg, sd_w, sd_s, sd_b, s_shared_act, s_shared_out,
+                                   H, S, QUANT_4BIT);
 
-        if (sg_w) fast_dequant_matvec(ctx, cfg, sg_w, sg_s, sg_b, h_post, s_shared_gate,
-                                       cfg->shared_intermediate, H, QUANT_4BIT);
-        if (su_w) fast_dequant_matvec(ctx, cfg, su_w, su_s, su_b, h_post, s_shared_up,
-                                       cfg->shared_intermediate, H, QUANT_4BIT);
-        cpu_swiglu(s_shared_gate, s_shared_up, s_shared_act, cfg->shared_intermediate);
-        if (sd_w) fast_dequant_matvec(ctx, cfg, sd_w, sd_s, sd_b, s_shared_act, s_shared_out,
-                                       H, cfg->shared_intermediate, QUANT_4BIT);
-    }
-
-    // Shared expert gate
-    float shared_gate_score = 0.0f;
-    uint32_t *sgg_w = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert_gate.weight");
-    uint16_t *sgg_s = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert_gate.scales");
-    uint16_t *sgg_b = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert_gate.biases");
-    if (sgg_w) {
-        fast_dequant_matvec(ctx, cfg, sgg_w, sgg_s, sgg_b, h_post,
-                            &shared_gate_score, 1, H, QUANT_4BIT);
-    }
-    float sw = cpu_sigmoid(shared_gate_score);
+    float sw = cpu_sigmoid(s_shared_gate_score);
     for (int i = 0; i < H; i++) s_shared_out[i] *= sw;
 
     // 3. Routed experts — zero-copy from mmap'd data
