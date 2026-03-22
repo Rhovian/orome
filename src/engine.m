@@ -189,58 +189,82 @@ static void encode_fused_experts(id<MTLComputeCommandEncoder> enc,
 
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-    // --- Expert gate projections (dynamic indices from GPU) ---
+    // --- Fused expert gate+up+SwiGLU (1 dispatch instead of 3) ---
     uint expert_sz = (uint)layout->expert_size;
 
-    [enc setComputePipelineState:ctx->batch_expert_mv_dyn];
-    [enc setBuffer:expert_layer_buf offset:0 atIndex:0];
-    [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
-    [enc setBuffer:ctx->buf_batch_expert_gate offset:0 atIndex:2];
-    [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
-    { uint es = expert_sz;
-      uint pw = (uint)layout->gate_w_off, ps = (uint)layout->gate_s_off, pb = (uint)layout->gate_b_off;
-      uint od = (uint)M, id_ = (uint)H, gs = (uint)cfg->group_size, nrt = num_row_tgs_M;
-      [enc setBytes:&es length:sizeof(uint) atIndex:4];
-      [enc setBytes:&pw length:sizeof(uint) atIndex:5];
-      [enc setBytes:&ps length:sizeof(uint) atIndex:6];
-      [enc setBytes:&pb length:sizeof(uint) atIndex:7];
-      [enc setBytes:&od length:sizeof(uint) atIndex:8];
-      [enc setBytes:&id_ length:sizeof(uint) atIndex:9];
-      [enc setBytes:&gs length:sizeof(uint) atIndex:10];
-      [enc setBytes:&nrt length:sizeof(uint) atIndex:11]; }
-    [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    if (ctx->expert_gate_up_swiglu) {
+        [enc setComputePipelineState:ctx->expert_gate_up_swiglu];
+        [enc setBuffer:expert_layer_buf offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_batch_expert_act offset:0 atIndex:2];
+        [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
+        { uint es = expert_sz;
+          uint gw = (uint)layout->gate_w_off, gs_ = (uint)layout->gate_s_off, gb = (uint)layout->gate_b_off;
+          uint uw = (uint)layout->up_w_off, us = (uint)layout->up_s_off, ub = (uint)layout->up_b_off;
+          uint od = (uint)M, id_ = (uint)H, gsize = (uint)cfg->group_size, nrt = num_row_tgs_M;
+          [enc setBytes:&es length:sizeof(uint) atIndex:4];
+          [enc setBytes:&gw length:sizeof(uint) atIndex:5];
+          [enc setBytes:&gs_ length:sizeof(uint) atIndex:6];
+          [enc setBytes:&gb length:sizeof(uint) atIndex:7];
+          [enc setBytes:&uw length:sizeof(uint) atIndex:8];
+          [enc setBytes:&us length:sizeof(uint) atIndex:9];
+          [enc setBytes:&ub length:sizeof(uint) atIndex:10];
+          [enc setBytes:&od length:sizeof(uint) atIndex:11];
+          [enc setBytes:&id_ length:sizeof(uint) atIndex:12];
+          [enc setBytes:&gsize length:sizeof(uint) atIndex:13];
+          [enc setBytes:&nrt length:sizeof(uint) atIndex:14]; }
+        [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    } else {
+        // Fallback: separate gate + up + swiglu
+        [enc setComputePipelineState:ctx->batch_expert_mv_dyn];
+        [enc setBuffer:expert_layer_buf offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_batch_expert_gate offset:0 atIndex:2];
+        [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
+        { uint es = expert_sz;
+          uint pw = (uint)layout->gate_w_off, ps = (uint)layout->gate_s_off, pb = (uint)layout->gate_b_off;
+          uint od = (uint)M, id_ = (uint)H, gs = (uint)cfg->group_size, nrt = num_row_tgs_M;
+          [enc setBytes:&es length:sizeof(uint) atIndex:4];
+          [enc setBytes:&pw length:sizeof(uint) atIndex:5];
+          [enc setBytes:&ps length:sizeof(uint) atIndex:6];
+          [enc setBytes:&pb length:sizeof(uint) atIndex:7];
+          [enc setBytes:&od length:sizeof(uint) atIndex:8];
+          [enc setBytes:&id_ length:sizeof(uint) atIndex:9];
+          [enc setBytes:&gs length:sizeof(uint) atIndex:10];
+          [enc setBytes:&nrt length:sizeof(uint) atIndex:11]; }
+        [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
 
-    // --- Expert up projections ---
-    [enc setComputePipelineState:ctx->batch_expert_mv_dyn];
-    [enc setBuffer:expert_layer_buf offset:0 atIndex:0];
-    [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
-    [enc setBuffer:ctx->buf_batch_expert_up offset:0 atIndex:2];
-    [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
-    { uint es = expert_sz;
-      uint pw = (uint)layout->up_w_off, ps = (uint)layout->up_s_off, pb = (uint)layout->up_b_off;
-      uint od = (uint)M, id_ = (uint)H, gs = (uint)cfg->group_size, nrt = num_row_tgs_M;
-      [enc setBytes:&es length:sizeof(uint) atIndex:4];
-      [enc setBytes:&pw length:sizeof(uint) atIndex:5];
-      [enc setBytes:&ps length:sizeof(uint) atIndex:6];
-      [enc setBytes:&pb length:sizeof(uint) atIndex:7];
-      [enc setBytes:&od length:sizeof(uint) atIndex:8];
-      [enc setBytes:&id_ length:sizeof(uint) atIndex:9];
-      [enc setBytes:&gs length:sizeof(uint) atIndex:10];
-      [enc setBytes:&nrt length:sizeof(uint) atIndex:11]; }
-    [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        [enc setComputePipelineState:ctx->batch_expert_mv_dyn];
+        [enc setBuffer:expert_layer_buf offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_batch_expert_up offset:0 atIndex:2];
+        [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
+        { uint es = expert_sz;
+          uint pw = (uint)layout->up_w_off, ps = (uint)layout->up_s_off, pb = (uint)layout->up_b_off;
+          uint od = (uint)M, id_ = (uint)H, gs = (uint)cfg->group_size, nrt = num_row_tgs_M;
+          [enc setBytes:&es length:sizeof(uint) atIndex:4];
+          [enc setBytes:&pw length:sizeof(uint) atIndex:5];
+          [enc setBytes:&ps length:sizeof(uint) atIndex:6];
+          [enc setBytes:&pb length:sizeof(uint) atIndex:7];
+          [enc setBytes:&od length:sizeof(uint) atIndex:8];
+          [enc setBytes:&id_ length:sizeof(uint) atIndex:9];
+          [enc setBytes:&gs length:sizeof(uint) atIndex:10];
+          [enc setBytes:&nrt length:sizeof(uint) atIndex:11]; }
+        [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
 
-    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-    // --- Batched SwiGLU for K experts ---
-    [enc setComputePipelineState:ctx->batch_swiglu];
-    [enc setBuffer:ctx->buf_batch_expert_gate offset:0 atIndex:0];
-    [enc setBuffer:ctx->buf_batch_expert_up offset:0 atIndex:1];
-    [enc setBuffer:ctx->buf_batch_expert_act offset:0 atIndex:2];
-    { uint td = (uint)(K * M); [enc setBytes:&td length:sizeof(uint) atIndex:3]; }
-    [enc dispatchThreadgroups:MTLSizeMake(((uint)(K * M) + 255) / 256, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc setComputePipelineState:ctx->batch_swiglu];
+        [enc setBuffer:ctx->buf_batch_expert_gate offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_batch_expert_up offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_batch_expert_act offset:0 atIndex:2];
+        { uint td = (uint)(K * M); [enc setBytes:&td length:sizeof(uint) atIndex:3]; }
+        [enc dispatchThreadgroups:MTLSizeMake(((uint)(K * M) + 255) / 256, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
 
     // --- Shared expert SwiGLU ---
     [enc setComputePipelineState:ctx->swiglu];

@@ -228,6 +228,7 @@ typedef struct {
     id<MTLComputePipelineState> softmax_topk;
     id<MTLComputePipelineState> batch_expert_mv_dyn;
     id<MTLComputePipelineState> batch_expert_down_dyn;
+    id<MTLComputePipelineState> expert_gate_up_swiglu;
 
     // Shared buffers (allocated based on ModelConfig)
     id<MTLBuffer> buf_input;

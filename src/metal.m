@@ -106,6 +106,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->softmax_topk     = make_pipeline(ctx, @"softmax_topk_route");
     ctx->batch_expert_mv_dyn  = make_pipeline(ctx, @"batch_expert_mv_dyn");
     ctx->batch_expert_down_dyn = make_pipeline(ctx, @"batch_expert_down_dyn");
+    ctx->expert_gate_up_swiglu = make_pipeline(ctx, @"expert_gate_up_swiglu_dyn");
 
     if (!ctx->matvec_4bit || !ctx->norm_sum_sq || !ctx->norm_apply) {
         fprintf(stderr, "ERROR: Required Metal pipelines missing\n");

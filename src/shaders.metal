@@ -1114,6 +1114,103 @@ kernel void softmax_topk_route(
 }
 
 // ============================================================================
+// Fused expert gate+up+SwiGLU — compute both projections and activation in one dispatch
+// ============================================================================
+// Eliminates separate up projection and SwiGLU dispatches + 1 barrier.
+// Each simdgroup computes both gate and up dot products for one output row,
+// then applies SwiGLU inline. x_shared is loaded once instead of twice.
+
+kernel void expert_gate_up_swiglu_dyn(
+    device const uint8_t*  layer_data     [[buffer(0)]],
+    device const float*    x              [[buffer(1)]],
+    device float*          act_out        [[buffer(2)]],   // [K * out_dim]
+    device const uint32_t* expert_indices [[buffer(3)]],
+    constant uint&         expert_size    [[buffer(4)]],
+    constant uint&         gate_w_off     [[buffer(5)]],
+    constant uint&         gate_s_off     [[buffer(6)]],
+    constant uint&         gate_b_off     [[buffer(7)]],
+    constant uint&         up_w_off       [[buffer(8)]],
+    constant uint&         up_s_off       [[buffer(9)]],
+    constant uint&         up_b_off       [[buffer(10)]],
+    constant uint&         out_dim        [[buffer(11)]],
+    constant uint&         in_dim         [[buffer(12)]],
+    constant uint&         group_size     [[buffer(13)]],
+    constant uint&         num_row_tgs    [[buffer(14)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint expert_k = tgid / num_row_tgs;
+    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
+
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    uint expert_id = expert_indices[expert_k];
+    uint ebase = expert_id * expert_size;
+
+    device const uint32_t* gW = (device const uint32_t*)(layer_data + ebase + gate_w_off);
+    device const uint16_t* gS = (device const uint16_t*)(layer_data + ebase + gate_s_off);
+    device const uint16_t* gB = (device const uint16_t*)(layer_data + ebase + gate_b_off);
+
+    device const uint32_t* uW = (device const uint32_t*)(layer_data + ebase + up_w_off);
+    device const uint16_t* uS = (device const uint16_t*)(layer_data + ebase + up_s_off);
+    device const uint16_t* uB = (device const uint16_t*)(layer_data + ebase + up_b_off);
+
+    device const uint32_t* g_row = gW + row * packed_cols;
+    device const uint16_t* gs_row = gS + row * num_groups;
+    device const uint16_t* gb_row = gB + row * num_groups;
+
+    device const uint32_t* u_row = uW + row * packed_cols;
+    device const uint16_t* us_row = uS + row * num_groups;
+    device const uint16_t* ub_row = uB + row * num_groups;
+
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        uint x_base = col * 8;
+
+        float g_scale = bf16_to_f32(gs_row[g]);
+        float g_bias  = bf16_to_f32(gb_row[g]);
+        uint32_t g_packed = g_row[col];
+
+        float u_scale = bf16_to_f32(us_row[g]);
+        float u_bias  = bf16_to_f32(ub_row[g]);
+        uint32_t u_packed = u_row[col];
+
+        for (uint b = 0; b < 8; b++) {
+            float xv = x_shared[x_base + b];
+            float gsx = g_scale * xv;
+            float gbx = g_bias * xv;
+            float usx = u_scale * xv;
+            float ubx = u_bias * xv;
+            gate_acc += fma(float((g_packed >> (b * 4)) & 0xF), gsx, gbx);
+            up_acc   += fma(float((u_packed >> (b * 4)) & 0xF), usx, ubx);
+        }
+    }
+
+    float gate_sum = simd_sum(gate_acc);
+    float up_sum   = simd_sum(up_acc);
+
+    if (simd_lane == 0) {
+        float silu_gate = gate_sum / (1.0f + exp(-gate_sum));
+        act_out[expert_k * out_dim + row] = silu_gate * up_sum;
+    }
+}
+
+// ============================================================================
 // Dynamic batch expert matvec — reads expert indices from GPU buffer
 // ============================================================================
 
