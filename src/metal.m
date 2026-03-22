@@ -320,7 +320,7 @@ void gpu_encode_matvec_job(id<MTLComputeCommandEncoder> enc,
         rows_per_tg = ROWS_PER_TG;
     } else if (use_2row) {
         pipe = ctx->matvec_4bit_2row;
-        rows_per_tg = ROWS_PER_TG * 2;  // 32 effective rows per TG
+        rows_per_tg = ROWS_PER_TG * 2;  // 32 effective rows per TG (2 rows/simdgroup)
     } else {
         pipe = ctx->matvec_4bit;
         rows_per_tg = ROWS_PER_TG;
