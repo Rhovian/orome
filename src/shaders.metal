@@ -1,9 +1,15 @@
 /*
- * shaders.metal — Phase 1 kernels for Qwen3.5-35B-A3B
+ * shaders.metal — GPU kernels for orome inference engine
  */
 
 #include <metal_stdlib>
 using namespace metal;
+
+// Max input dimension for matvec shared buffer.
+// Must fit the largest in_dim across all models:
+//   397B O projection: max(32*256, 64*128) = 8192
+// Using half precision to stay within 32KB threadgroup memory limit.
+#define MATVEC_X_SHARED_SIZE 8192
 
 // ============================================================================
 // BFloat16 helpers
@@ -39,10 +45,10 @@ kernel void dequant_matvec_4bit_v3(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup float x_shared[4096];
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
 
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = x[i];
+        x_shared[i] = half(x[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -124,9 +130,9 @@ kernel void dequant_matvec_4bit_2row(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup float x_shared[4096];
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = x[i];
+        x_shared[i] = half(x[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -225,9 +231,9 @@ kernel void batch_expert_matvec_4bit(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup float x_shared[4096];
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = x[i];
+        x_shared[i] = half(x[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -298,10 +304,10 @@ kernel void batch_expert_down_4bit(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup float x_shared[4096];
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
     device const float* x_expert = x + expert * in_dim;
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = x_expert[i];
+        x_shared[i] = half(x_expert[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -383,10 +389,10 @@ kernel void dequant_matvec_2bit(
     uint packed_cols = in_dim / 16;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup float x_shared[4096];
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
 
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = x[i];
+        x_shared[i] = half(x[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1388,9 +1394,9 @@ kernel void expert_gate_up_swiglu_dyn(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup float x_shared[4096];
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = x[i];
+        x_shared[i] = half(x[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1479,9 +1485,9 @@ kernel void batch_expert_mv_dyn(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup float x_shared[4096];
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = x[i];
+        x_shared[i] = half(x[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1632,10 +1638,10 @@ kernel void batch_expert_down_dyn(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup float x_shared[4096];
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
     device const float* x_expert = x + expert_k * in_dim;
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = x_expert[i];
+        x_shared[i] = half(x_expert[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1713,10 +1719,10 @@ kernel void batch_expert_down_dyn_2row(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup float x_shared[4096];
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
     device const float* x_expert = x + expert_k * in_dim;
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = x_expert[i];
+        x_shared[i] = half(x_expert[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
