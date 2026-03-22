@@ -855,23 +855,63 @@ int engine_step(Engine *eng, int token_id) {
         t_moe_total += t1 - t0;
     }
 
-    // Sync GPU: wait for last expert forward and read back hidden
-    if (gpu_resident) {
-        // Submit sentinel command buffer to ensure all prior work is done
-        id<MTLCommandBuffer> sync_cmd = [ctx->queue commandBuffer];
-        [sync_cmd commit];
-        [sync_cmd waitUntilCompleted];
-        memcpy(eng->hidden, [ctx->buf_moe_hidden contents], H * sizeof(float));
-    }
-
-    // 3. Final norm
-    uint16_t *final_norm_w = weights_tensor_ptr(eng->wf, "model.norm.weight");
-    float normed[H];
-    cpu_rms_norm(eng->hidden, final_norm_w, normed, H, cfg->rms_norm_eps);
-
-    // 4. LM head
+    // Sync GPU + final norm + LM head — fused into one GPU command buffer
     t0 = now_ms();
-    lm_head_forward(eng->wf, eng->ctx, cfg, normed, eng->logits);
+    if (gpu_resident) {
+        uint8_t *base = (uint8_t *)[ctx->buf_weights contents];
+        uint16_t *final_norm_w = weights_tensor_ptr(eng->wf, "model.norm.weight");
+        uint32_t *lm_w = weights_tensor_ptr(eng->wf, "lm_head.weight");
+        uint16_t *lm_s = weights_tensor_ptr(eng->wf, "lm_head.scales");
+        uint16_t *lm_b = weights_tensor_ptr(eng->wf, "lm_head.biases");
+
+        id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+
+        // RMS norm: buf_moe_hidden → buf_input
+        [enc setComputePipelineState:ctx->norm_sum_sq];
+        [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:1];
+        { uint d = (uint)H; [enc setBytes:&d length:sizeof(uint) atIndex:2]; }
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [enc setComputePipelineState:ctx->norm_apply];
+        [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_weights offset:(uint8_t *)final_norm_w - base atIndex:1];
+        [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
+        [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
+        { uint d = (uint)H; float e = cfg->rms_norm_eps;
+          [enc setBytes:&d length:sizeof(uint) atIndex:4];
+          [enc setBytes:&e length:sizeof(float) atIndex:5]; }
+        [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // LM head matvec: buf_input → buf_output
+        GpuMatvecJob lm_job = {
+            .w_buf = ctx->buf_weights, .w_off = (uint8_t *)lm_w - base,
+            .s_buf = ctx->buf_weights, .s_off = (uint8_t *)lm_s - base,
+            .b_buf = ctx->buf_weights, .b_off = (uint8_t *)lm_b - base,
+            .in_buf = ctx->buf_input, .in_off = 0,
+            .out_buf = ctx->buf_output, .out_off = 0,
+            .out_ptr = NULL, .out_dim = cfg->vocab_size, .in_dim = H,
+            .group_size = cfg->group_size, .is_2bit = false
+        };
+        gpu_encode_matvec_job(enc, ctx, &lm_job);
+
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+
+        memcpy(eng->logits, [ctx->buf_output contents],
+               cfg->vocab_size * sizeof(float));
+    } else {
+        uint16_t *final_norm_w = weights_tensor_ptr(eng->wf, "model.norm.weight");
+        float normed[H];
+        cpu_rms_norm(eng->hidden, final_norm_w, normed, H, cfg->rms_norm_eps);
+        lm_head_forward(eng->wf, eng->ctx, cfg, normed, eng->logits);
+    }
     t1 = now_ms();
     t_lmhead_total += t1 - t0;
 
