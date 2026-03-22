@@ -125,6 +125,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->copy_buffer     = make_pipeline(ctx, @"copy_buffer");
     ctx->residual_add_sq = make_pipeline(ctx, @"residual_add_sum_sq");
     ctx->norm_apply_partial = make_pipeline(ctx, @"rms_norm_apply_partial");
+    ctx->moe_combine_copy_sq = make_pipeline(ctx, @"moe_combine_copy_sq");
 
     if (!ctx->matvec_4bit || !ctx->norm_sum_sq || !ctx->norm_apply) {
         fprintf(stderr, "ERROR: Required Metal pipelines missing\n");

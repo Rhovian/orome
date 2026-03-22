@@ -1104,6 +1104,54 @@ kernel void moe_combine_residual_packed(
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
 }
 
+// MoE combine + copy residual + partial sum_sq for next layer's norm
+// Fuses moe_combine_packed + copy_buffer + norm_sum_sq into 1 dispatch
+// Saves 2 dispatches + 2 barriers per layer
+kernel void moe_combine_copy_sq(
+    device const float* h_mid        [[buffer(0)]],
+    device const float* shared_out   [[buffer(1)]],
+    device float*       hidden_out   [[buffer(2)]],
+    device const float* expert_out   [[buffer(3)]],
+    device const float* params       [[buffer(4)]],
+    constant uint&      dim          [[buffer(5)]],
+    constant uint&      K            [[buffer(6)]],
+    device float*       residual_out [[buffer(7)]],
+    device float*       sum_sq_parts [[buffer(8)]],
+    uint tid  [[thread_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    float val = 0.0f;
+    if (tid < dim) {
+        float shared_gate = 1.0f / (1.0f + exp(-params[8]));
+        float moe = 0.0f;
+        for (uint k = 0; k < K && k < 8; k++) {
+            moe += params[k] * expert_out[k * dim + tid];
+        }
+        val = h_mid[tid] + moe + shared_gate * shared_out[tid];
+        hidden_out[tid] = val;
+        residual_out[tid] = val;
+    }
+
+    // Partial sum of squares for next layer's RMS norm
+    float sq = val * val;
+    float simd_val = simd_sum(sq);
+    threadgroup float shared[32];
+    if (simd_lane == 0) shared[simd_group] = simd_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0) {
+        float v = (simd_lane < (tg_size + 31) / 32) ? shared[simd_lane] : 0.0f;
+        v = simd_sum(v);
+        if (simd_lane == 0) {
+            sum_sq_parts[tgid] = v;
+        }
+    }
+}
+
 // ============================================================================
 // GPU softmax + top-K routing — eliminates CPU readback sync point
 // ============================================================================
