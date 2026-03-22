@@ -128,6 +128,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->moe_combine_copy_sq = make_pipeline(ctx, @"moe_combine_copy_sq");
     ctx->matvec_4bit_2row = make_pipeline(ctx, @"dequant_matvec_4bit_2row");
     ctx->batch_expert_down_dyn_2row = make_pipeline(ctx, @"batch_expert_down_dyn_2row");
+    ctx->argmax = make_pipeline(ctx, @"argmax_kernel");
 
     if (!ctx->matvec_4bit || !ctx->norm_sum_sq || !ctx->norm_apply) {
         fprintf(stderr, "ERROR: Required Metal pipelines missing\n");
@@ -145,6 +146,8 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
                                               options:MTLResourceStorageModeShared];
     ctx->buf_output = [ctx->device newBufferWithLength:max_dim * sizeof(float)
                                                options:MTLResourceStorageModeShared];
+    ctx->buf_argmax_result = [ctx->device newBufferWithLength:sizeof(uint32_t)
+                                                       options:MTLResourceStorageModeShared];
     ctx->buf_sum_sq = [ctx->device newBufferWithLength:32 * sizeof(float)
                                                options:MTLResourceStorageModeShared];
     ctx->buf_residual = [ctx->device newBufferWithLength:H * sizeof(float)

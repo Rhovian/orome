@@ -1246,13 +1246,22 @@ int engine_step(Engine *eng, int token_id) {
         };
         gpu_encode_matvec_job(enc, ctx, &lm_job);
 
+        // GPU argmax: find max index without copying 993KB logits to CPU
+        if (ctx->argmax && ctx->buf_argmax_result) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:ctx->argmax];
+            [enc setBuffer:ctx->buf_output offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_argmax_result offset:0 atIndex:1];
+            { uint v = (uint)cfg->vocab_size;
+              [enc setBytes:&v length:sizeof(uint) atIndex:2]; }
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+        }
+
         [enc endEncoding];
         id<MTLCommandBuffer> wait_cmd = fwd_cmd ? fwd_cmd : cmd;
         [wait_cmd commit];
         [wait_cmd waitUntilCompleted];
-
-        memcpy(eng->logits, [ctx->buf_output contents],
-               cfg->vocab_size * sizeof(float));
     } else {
         uint16_t *final_norm_w = weights_tensor_ptr(eng->wf, "model.norm.weight");
         float normed[H];
@@ -1263,7 +1272,13 @@ int engine_step(Engine *eng, int token_id) {
     t_lmhead_total += t1 - t0;
 
     // 5. Sample (greedy argmax)
-    int next_token = cpu_argmax(eng->logits, cfg->vocab_size);
+    int next_token;
+    if (gpu_resident && ctx->argmax && ctx->buf_argmax_result) {
+        // GPU argmax already computed — just read the 4-byte result
+        next_token = (int)(*(uint32_t *)[ctx->buf_argmax_result contents]);
+    } else {
+        next_token = cpu_argmax(eng->logits, cfg->vocab_size);
+    }
 
     eng->pos++;
     profile_count++;

@@ -1515,6 +1515,66 @@ kernel void copy_buffer(
     dst[tid] = src[tid];
 }
 
+// GPU argmax — find index of maximum element. Single TG, 1024 threads.
+// Avoids copying full logits (248320 floats = 993KB) back to CPU.
+kernel void argmax_kernel(
+    device const float* data    [[buffer(0)]],
+    device uint32_t*    result  [[buffer(1)]],   // single uint32: argmax index
+    constant uint&      count   [[buffer(2)]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    // Phase 1: each thread finds local max across its strided range
+    float local_max = -INFINITY;
+    uint local_idx = 0;
+    for (uint i = lid; i < count; i += tg_size) {
+        float val = data[i];
+        if (val > local_max) {
+            local_max = val;
+            local_idx = i;
+        }
+    }
+
+    // Phase 2: simdgroup reduction (find max within each 32-thread simdgroup)
+    for (uint offset = 16; offset > 0; offset >>= 1) {
+        float other_val = simd_shuffle_down(local_max, offset);
+        uint other_idx = simd_shuffle_down(local_idx, offset);
+        if (other_val > local_max) {
+            local_max = other_val;
+            local_idx = other_idx;
+        }
+    }
+
+    // Phase 3: cross-simdgroup reduction via threadgroup memory
+    threadgroup float tg_vals[32];
+    threadgroup uint tg_idxs[32];
+    if (simd_lane == 0) {
+        tg_vals[simd_group] = local_max;
+        tg_idxs[simd_group] = local_idx;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Phase 4: first simdgroup reduces across all simdgroups
+    uint num_simdgroups = (tg_size + 31) / 32;
+    if (simd_group == 0) {
+        float val = (simd_lane < num_simdgroups) ? tg_vals[simd_lane] : -INFINITY;
+        uint idx = (simd_lane < num_simdgroups) ? tg_idxs[simd_lane] : 0;
+        for (uint offset = 16; offset > 0; offset >>= 1) {
+            float other_val = simd_shuffle_down(val, offset);
+            uint other_idx = simd_shuffle_down(idx, offset);
+            if (other_val > val) {
+                val = other_val;
+                idx = other_idx;
+            }
+        }
+        if (simd_lane == 0) {
+            result[0] = idx;
+        }
+    }
+}
+
 // Dynamic batch expert down matvec — per-expert packed input, GPU-driven indices
 kernel void batch_expert_down_dyn(
     device const uint8_t*  layer_data    [[buffer(0)]],

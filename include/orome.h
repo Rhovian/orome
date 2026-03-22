@@ -235,10 +235,12 @@ typedef struct {
     id<MTLComputePipelineState> moe_combine_copy_sq;
     id<MTLComputePipelineState> matvec_4bit_2row;
     id<MTLComputePipelineState> batch_expert_down_dyn_2row;
+    id<MTLComputePipelineState> argmax;
 
     // Shared buffers (allocated based on ModelConfig)
     id<MTLBuffer> buf_input;
     id<MTLBuffer> buf_output;
+    id<MTLBuffer> buf_argmax_result;   // single uint32 for GPU argmax
     id<MTLBuffer> buf_sum_sq;
     id<MTLBuffer> buf_residual;
     id<MTLBuffer> buf_h_mid;
