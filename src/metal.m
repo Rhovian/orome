@@ -98,6 +98,9 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->gated_rms_norm   = make_pipeline(ctx, @"gated_rms_norm");
     ctx->batch_expert_mv  = make_pipeline(ctx, @"batch_expert_matvec_4bit");
     ctx->batch_swiglu     = make_pipeline(ctx, @"batch_swiglu");
+    ctx->rms_norm_qk_w    = make_pipeline(ctx, @"rms_norm_qk_weighted");
+    ctx->rope_apply       = make_pipeline(ctx, @"rope_apply");
+    ctx->kv_cache_write   = make_pipeline(ctx, @"kv_cache_write");
 
     if (!ctx->matvec_4bit || !ctx->norm_sum_sq || !ctx->norm_apply) {
         fprintf(stderr, "ERROR: Required Metal pipelines missing\n");

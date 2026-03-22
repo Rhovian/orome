@@ -752,6 +752,141 @@ kernel void gated_rms_norm(
 }
 
 // ============================================================================
+// Kernel 17: Per-head weighted RMS norm for full attention Q/K
+// ============================================================================
+// Q: [num_q_heads * head_dim], K: [num_kv_heads * head_dim]
+// Apply weighted RMS norm per head (separate weights for Q and K)
+// Q heads also get scaled by inv_scale
+// Dispatch: max(num_q_heads, num_kv_heads) threadgroups, head_dim threads each
+
+kernel void rms_norm_qk_weighted(
+    device float *q,                  // [num_q_heads * head_dim] in/out
+    device float *k,                  // [num_kv_heads * head_dim] in/out
+    device const uint16_t *q_weight,  // [head_dim] bf16 norm weight for Q
+    device const uint16_t *k_weight,  // [head_dim] bf16 norm weight for K
+    constant uint &head_dim,          // = 256
+    constant uint &num_q_heads,       // = 16
+    constant uint &num_kv_heads,      // = 2
+    constant float &inv_scale,        // = 1/sqrt(head_dim)
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    // Process Q head if in range
+    if (head < num_q_heads && tid < head_dim) {
+        uint base = head * head_dim;
+        float qval = q[base + tid];
+
+        threadgroup float partial[256];
+        partial[tid] = qval * qval;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Reduce sum of squares
+        threadgroup float sum_sq;
+        if (tid == 0) {
+            float s = 0;
+            for (uint i = 0; i < head_dim; i++) s += partial[i];
+            sum_sq = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_rms = rsqrt(sum_sq / float(head_dim) + 1e-6f);
+        float w = bf16_to_f32(q_weight[tid]);
+        q[base + tid] = qval * inv_rms * w * inv_scale;
+    }
+
+    // Process K head if in range
+    if (head < num_kv_heads && tid < head_dim) {
+        uint base = head * head_dim;
+        float kval = k[base + tid];
+
+        threadgroup float k_partial[256];
+        k_partial[tid] = kval * kval;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup float k_sum_sq;
+        if (tid == 0) {
+            float s = 0;
+            for (uint i = 0; i < head_dim; i++) s += k_partial[i];
+            k_sum_sq = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float inv_rms = rsqrt(k_sum_sq / float(head_dim) + 1e-6f);
+        float w = bf16_to_f32(k_weight[tid]);
+        k[base + tid] = kval * inv_rms * w;
+    }
+}
+
+// ============================================================================
+// Kernel 18: RoPE (Rotary Position Embedding)
+// ============================================================================
+// Apply partial rotary embedding to Q and K.
+// Q: [num_q_heads * head_dim], K: [num_kv_heads * head_dim]
+// Only rotary_dim elements per head are rotated (first half_rot pairs).
+// Dispatch: max(num_q_heads, num_kv_heads) threadgroups, half_rot threads each
+
+kernel void rope_apply(
+    device float *q,                  // [num_q_heads * head_dim] in/out
+    device float *k,                  // [num_kv_heads * head_dim] in/out
+    constant uint &head_dim,          // = 256
+    constant uint &rotary_dim,        // = 64
+    constant uint &num_q_heads,       // = 16
+    constant uint &num_kv_heads,      // = 2
+    constant uint &pos,               // current position
+    constant float &theta,            // rope_theta = 10M
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    uint half_rot = rotary_dim / 2;
+    if (tid >= half_rot) return;
+
+    float freq = 1.0f / pow(theta, float(2 * tid) / float(rotary_dim));
+    float angle = float(pos) * freq;
+    float cos_a = cos(angle);
+    float sin_a = sin(angle);
+
+    // Rotate Q head
+    if (head < num_q_heads) {
+        uint base = head * head_dim;
+        float q0 = q[base + tid];
+        float q1 = q[base + tid + half_rot];
+        q[base + tid]            = q0 * cos_a - q1 * sin_a;
+        q[base + tid + half_rot] = q0 * sin_a + q1 * cos_a;
+    }
+
+    // Rotate K head
+    if (head < num_kv_heads) {
+        uint base = head * head_dim;
+        float k0 = k[base + tid];
+        float k1 = k[base + tid + half_rot];
+        k[base + tid]            = k0 * cos_a - k1 * sin_a;
+        k[base + tid + half_rot] = k0 * sin_a + k1 * cos_a;
+    }
+}
+
+// ============================================================================
+// Kernel 19: KV cache write (scatter one token's K/V into cache)
+// ============================================================================
+// Write K[kv_dim] and V[kv_dim] at position pos into the KV cache.
+// Cache layout: [max_seq * kv_dim], stored row-major.
+// Dispatch: kv_dim threads
+
+kernel void kv_cache_write(
+    device const float *k_in,         // [kv_dim] new K vector
+    device const float *v_in,         // [kv_dim] new V vector
+    device float *k_cache,            // [max_seq * kv_dim]
+    device float *v_cache,            // [max_seq * kv_dim]
+    constant uint &kv_dim,
+    constant uint &pos,               // write position
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= kv_dim) return;
+    uint offset = pos * kv_dim + tid;
+    k_cache[offset] = k_in[tid];
+    v_cache[offset] = v_in[tid];
+}
+
+// ============================================================================
 // Kernel 15: SwiGLU activation
 // ============================================================================
 

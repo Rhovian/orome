@@ -465,131 +465,250 @@ int engine_step(Engine *eng, int token_id) {
             continue;
         }
 
-        // --- FULL ATTENTION path (unchanged) ---
-        float *attn_out = NULL;
-        int attn_out_dim = 0;
+        // --- FULL ATTENTION: fully fused GPU path ---
+        // Input norm + QKV projections + QK weighted RMS norm + RoPE + KV cache write
+        // + attention (scores/softmax/values) + O-proj + residual + post-norm + routing
+        // — all in ONE GPU commit.
+        if (cfg->layer_types[layer] == ATTN_FULL && ctx && ctx->buf_weights
+            && ctx->rms_norm_qk_w && ctx->rope_apply && ctx->kv_cache_write) {
+            t0 = now_ms();
 
-        t0 = now_ms();
-        if (cfg->layer_types[layer] == ATTN_FULL) {
-            full_attention_forward(eng->wf, ctx, cfg, layer, pos,
-                                   eng->hidden, eng->residual, eng->h_post,
-                                   eng->kv_caches[full_idx],
-                                   &attn_out, &attn_out_dim);
-            full_idx++;
-        } else {
-            // CPU fallback for linear attention (no Metal)
-            linear_attention_forward(eng->wf, ctx, cfg, layer, pos,
-                                     eng->hidden, eng->residual, eng->h_post,
-                                     eng->linear_states[linear_idx],
-                                     &attn_out, &attn_out_dim);
-            linear_idx++;
-        }
-        t1 = now_ms();
-        t_attn_total += t1 - t0;
-
-        // --- Fused O-proj + residual + post-norm + MoE routing ---
-        t0 = now_ms();
-
-        // Look up O projection weights
-        const char *o_proj_name = "self_attn.o_proj";
-        char wname[128], sname[128], bname[128];
-        snprintf(wname, sizeof(wname), "%s.weight", o_proj_name);
-        snprintf(sname, sizeof(sname), "%s.scales", o_proj_name);
-        snprintf(bname, sizeof(bname), "%s.biases", o_proj_name);
-        uint32_t *o_w = weights_layer_ptr(eng->wf, layer, wname);
-        uint16_t *o_s = weights_layer_ptr(eng->wf, layer, sname);
-        uint16_t *o_b = weights_layer_ptr(eng->wf, layer, bname);
-
-        // Post-attention norm weight
-        uint16_t *post_norm_w = weights_layer_ptr(eng->wf, layer,
-                                                   "post_attention_layernorm.weight");
-
-        // MoE routing + shared expert weights
-        uint32_t *gate_w = weights_layer_ptr(eng->wf, layer, "mlp.gate.weight");
-        uint16_t *gate_s = weights_layer_ptr(eng->wf, layer, "mlp.gate.scales");
-        uint16_t *gate_b = weights_layer_ptr(eng->wf, layer, "mlp.gate.biases");
-        uint32_t *sg_w = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.gate_proj.weight");
-        uint16_t *sg_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.gate_proj.scales");
-        uint16_t *sg_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.gate_proj.biases");
-        uint32_t *su_w = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.up_proj.weight");
-        uint16_t *su_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.up_proj.scales");
-        uint16_t *su_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.up_proj.biases");
-        uint32_t *sgg_w = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.weight");
-        uint16_t *sgg_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.scales");
-        uint16_t *sgg_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.biases");
-
-        // Use fused GPU path if available
-        if (ctx && ctx->buf_weights && gate_w && sg_w && su_w && sgg_w && o_w) {
             uint8_t *base = (uint8_t *)[ctx->buf_weights contents];
+            int n_heads = cfg->num_attn_heads;
+            int n_kv = cfg->num_kv_heads;
+            int hd = cfg->head_dim;
+            int kv_dim = cfg->kv_dim;
+            int seq_len = pos + 1;
 
-            // Copy attn output to buf_output (large enough for 8192+ floats)
-            memcpy([ctx->buf_output contents], attn_out, attn_out_dim * sizeof(float));
-            // Copy residual (pre-attention hidden) to buf_residual
+            // Look up weight pointers
+            uint16_t *input_norm_w = weights_layer_ptr(eng->wf, layer, "input_layernorm.weight");
+            uint32_t *q_w = weights_layer_ptr(eng->wf, layer, "self_attn.q_proj.weight");
+            uint16_t *q_s = weights_layer_ptr(eng->wf, layer, "self_attn.q_proj.scales");
+            uint16_t *q_b = weights_layer_ptr(eng->wf, layer, "self_attn.q_proj.biases");
+            uint32_t *k_w = weights_layer_ptr(eng->wf, layer, "self_attn.k_proj.weight");
+            uint16_t *k_s = weights_layer_ptr(eng->wf, layer, "self_attn.k_proj.scales");
+            uint16_t *k_b = weights_layer_ptr(eng->wf, layer, "self_attn.k_proj.biases");
+            uint32_t *v_w = weights_layer_ptr(eng->wf, layer, "self_attn.v_proj.weight");
+            uint16_t *v_s = weights_layer_ptr(eng->wf, layer, "self_attn.v_proj.scales");
+            uint16_t *v_b = weights_layer_ptr(eng->wf, layer, "self_attn.v_proj.biases");
+            uint16_t *qnorm_w = weights_layer_ptr(eng->wf, layer, "self_attn.q_norm.weight");
+            uint16_t *knorm_w = weights_layer_ptr(eng->wf, layer, "self_attn.k_norm.weight");
+            uint32_t *o_w = weights_layer_ptr(eng->wf, layer, "self_attn.o_proj.weight");
+            uint16_t *o_s = weights_layer_ptr(eng->wf, layer, "self_attn.o_proj.scales");
+            uint16_t *o_b = weights_layer_ptr(eng->wf, layer, "self_attn.o_proj.biases");
+            uint16_t *post_norm_w = weights_layer_ptr(eng->wf, layer, "post_attention_layernorm.weight");
+            uint32_t *gate_w = weights_layer_ptr(eng->wf, layer, "mlp.gate.weight");
+            uint16_t *gate_s = weights_layer_ptr(eng->wf, layer, "mlp.gate.scales");
+            uint16_t *gate_b = weights_layer_ptr(eng->wf, layer, "mlp.gate.biases");
+            uint32_t *sg_w = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.gate_proj.weight");
+            uint16_t *sg_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.gate_proj.scales");
+            uint16_t *sg_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.gate_proj.biases");
+            uint32_t *su_w = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.up_proj.weight");
+            uint16_t *su_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.up_proj.scales");
+            uint16_t *su_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.up_proj.biases");
+            uint32_t *sgg_w = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.weight");
+            uint16_t *sgg_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.scales");
+            uint16_t *sgg_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.biases");
+
+            // Copy hidden to GPU
+            memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
             memcpy([ctx->buf_residual contents], eng->residual, H * sizeof(float));
 
-            // Build fused command buffer
             id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
-            // 1. O projection: buf_output(attn_out) → buf_h_mid
+            // --- Phase A: Input norm → buf_input ---
+            [enc setComputePipelineState:ctx->norm_sum_sq];
+            [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:1];
+            { uint d = (uint)H; [enc setBytes:&d length:sizeof(uint) atIndex:2]; }
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            [enc setComputePipelineState:ctx->norm_apply];
+            [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)input_norm_w - base atIndex:1];
+            [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
+            [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
+            { uint d = (uint)H; float e = cfg->rms_norm_eps;
+              [enc setBytes:&d length:sizeof(uint) atIndex:4];
+              [enc setBytes:&e length:sizeof(float) atIndex:5]; }
+            [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            // --- Phase B: Q/K/V projections ---
+            // Q → buf_attn_output (n_heads*hd = 4096 floats, big enough)
+            // K → buf_conv_output (reuse, kv_dim = 512 floats)
+            // V → buf_conv_input (reuse, kv_dim = 512 floats)
+            GpuMatvecJob qkv_jobs[3] = {
+                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)q_w - base,
+                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)q_s - base,
+                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)q_b - base,
+                  .out_buf = ctx->buf_attn_output, .out_off = 0,
+                  .out_ptr = NULL, .out_dim = n_heads * hd, .in_dim = H,
+                  .group_size = cfg->group_size, .is_2bit = false },
+                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)k_w - base,
+                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)k_s - base,
+                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)k_b - base,
+                  .out_buf = ctx->buf_conv_output, .out_off = 0,
+                  .out_ptr = NULL, .out_dim = n_kv * hd, .in_dim = H,
+                  .group_size = cfg->group_size, .is_2bit = false },
+                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)v_w - base,
+                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)v_s - base,
+                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)v_b - base,
+                  .out_buf = ctx->buf_conv_input, .out_off = 0,
+                  .out_ptr = NULL, .out_dim = n_kv * hd, .in_dim = H,
+                  .group_size = cfg->group_size, .is_2bit = false },
+            };
+            for (int j = 0; j < 3; j++)
+                gpu_encode_matvec_job(enc, ctx, &qkv_jobs[j]);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            // --- Phase C: Weighted QK RMS norm ---
+            // Q in buf_attn_output (16 heads × 256), K in buf_conv_output (2 heads × 256)
+            [enc setComputePipelineState:ctx->rms_norm_qk_w];
+            [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];  // Q
+            [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:1];  // K
+            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)qnorm_w - base atIndex:2];
+            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)knorm_w - base atIndex:3];
+            { uint hd_val = (uint)hd, nq = (uint)n_heads, nkv = (uint)n_kv;
+              float inv_s = 1.0f / sqrtf((float)hd);
+              [enc setBytes:&hd_val length:sizeof(uint) atIndex:4];
+              [enc setBytes:&nq length:sizeof(uint) atIndex:5];
+              [enc setBytes:&nkv length:sizeof(uint) atIndex:6];
+              [enc setBytes:&inv_s length:sizeof(float) atIndex:7]; }
+            [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            // --- Phase D: RoPE ---
+            [enc setComputePipelineState:ctx->rope_apply];
+            [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];  // Q
+            [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:1];  // K
+            { uint hd_val = (uint)hd, rd = (uint)cfg->rotary_dim;
+              uint nq = (uint)n_heads, nkv = (uint)n_kv;
+              uint p = (uint)pos; float th = cfg->rope_theta;
+              [enc setBytes:&hd_val length:sizeof(uint) atIndex:2];
+              [enc setBytes:&rd length:sizeof(uint) atIndex:3];
+              [enc setBytes:&nq length:sizeof(uint) atIndex:4];
+              [enc setBytes:&nkv length:sizeof(uint) atIndex:5];
+              [enc setBytes:&p length:sizeof(uint) atIndex:6];
+              [enc setBytes:&th length:sizeof(float) atIndex:7]; }
+            { uint half_rot = (uint)cfg->rotary_dim / 2;
+              uint max_heads = n_heads > n_kv ? n_heads : n_kv;
+              [enc dispatchThreadgroups:MTLSizeMake(max_heads, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(half_rot, 1, 1)]; }
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            // --- Phase E: KV cache write ---
+            [enc setComputePipelineState:ctx->kv_cache_write];
+            [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:0];  // K
+            [enc setBuffer:ctx->buf_conv_input offset:0 atIndex:1];   // V
+            [enc setBuffer:ctx->buf_kv_k[full_idx] offset:0 atIndex:2];
+            [enc setBuffer:ctx->buf_kv_v[full_idx] offset:0 atIndex:3];
+            { uint kvd = (uint)kv_dim, p = (uint)pos;
+              [enc setBytes:&kvd length:sizeof(uint) atIndex:4];
+              [enc setBytes:&p length:sizeof(uint) atIndex:5]; }
+            [enc dispatchThreadgroups:MTLSizeMake(((uint)kv_dim + 255) / 256, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            // --- Phase F: Attention scores (Q @ K^T) ---
+            [enc setComputePipelineState:ctx->attn_scores];
+            [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];   // Q
+            [enc setBuffer:ctx->buf_kv_k[full_idx] offset:0 atIndex:1];
+            [enc setBuffer:ctx->buf_attn_scores offset:0 atIndex:2];
+            { uint hd_val = (uint)hd, kvd = (uint)kv_dim;
+              uint sl = (uint)seq_len, ss = (uint)OROME_GPU_KV_SEQ;
+              float scale = 1.0f;  // already scaled in QK norm
+              uint hpk = (uint)(n_heads / n_kv);
+              uint nst = (uint)seq_len;
+              [enc setBytes:&hd_val length:sizeof(uint) atIndex:3];
+              [enc setBytes:&kvd length:sizeof(uint) atIndex:4];
+              [enc setBytes:&sl length:sizeof(uint) atIndex:5];
+              [enc setBytes:&ss length:sizeof(uint) atIndex:6];
+              [enc setBytes:&scale length:sizeof(float) atIndex:7];
+              [enc setBytes:&hpk length:sizeof(uint) atIndex:8];
+              [enc setBytes:&nst length:sizeof(uint) atIndex:9]; }
+            [enc dispatchThreadgroups:MTLSizeMake(n_heads * seq_len, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            // --- Phase G: Softmax ---
+            [enc setComputePipelineState:ctx->attn_softmax];
+            [enc setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];
+            { uint sl = (uint)seq_len, ss = (uint)OROME_GPU_KV_SEQ;
+              [enc setBytes:&sl length:sizeof(uint) atIndex:1];
+              [enc setBytes:&ss length:sizeof(uint) atIndex:2]; }
+            [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            // --- Phase H: Attention values (scores @ V) ---
+            // Output → buf_attn_output (reuse Q buffer, now overwritten with attn output)
+            [enc setComputePipelineState:ctx->attn_values];
+            [enc setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_kv_v[full_idx] offset:0 atIndex:1];
+            [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:2];
+            { uint hd_val = (uint)hd, kvd = (uint)kv_dim;
+              uint sl = (uint)seq_len, ss = (uint)OROME_GPU_KV_SEQ;
+              uint hpk = (uint)(n_heads / n_kv);
+              [enc setBytes:&hd_val length:sizeof(uint) atIndex:3];
+              [enc setBytes:&kvd length:sizeof(uint) atIndex:4];
+              [enc setBytes:&sl length:sizeof(uint) atIndex:5];
+              [enc setBytes:&ss length:sizeof(uint) atIndex:6];
+              [enc setBytes:&hpk length:sizeof(uint) atIndex:7]; }
+            [enc dispatchThreadgroups:MTLSizeMake(((uint)(n_heads * hd) + 255) / 256, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            // --- Phase I: O-proj (buf_attn_output → buf_h_mid) ---
             GpuMatvecJob o_job = {
                 .w_buf = ctx->buf_weights, .w_off = (uint8_t *)o_w - base,
                 .s_buf = ctx->buf_weights, .s_off = (uint8_t *)o_s - base,
                 .b_buf = ctx->buf_weights, .b_off = (uint8_t *)o_b - base,
-                .in_buf = ctx->buf_output, .in_off = 0,
+                .in_buf = ctx->buf_attn_output, .in_off = 0,
                 .out_buf = ctx->buf_h_mid, .out_off = 0,
-                .out_ptr = NULL, .out_dim = H, .in_dim = attn_out_dim,
+                .out_ptr = NULL, .out_dim = H, .in_dim = n_heads * hd,
                 .group_size = cfg->group_size, .is_2bit = false
             };
             gpu_encode_matvec_job(enc, ctx, &o_job);
-
-            // Barrier: O proj writes → residual_add reads
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // 2. Residual add: buf_residual + buf_h_mid → buf_moe_hidden
+            // --- Phase J: Residual add → buf_moe_hidden ---
             [enc setComputePipelineState:ctx->residual_add];
             [enc setBuffer:ctx->buf_residual offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_h_mid offset:0 atIndex:1];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:2];
-            { uint dim_val = (uint)H; [enc setBytes:&dim_val length:sizeof(uint) atIndex:3]; }
-            NSUInteger res_tgs = ((uint)H + 255) / 256;
-            [enc dispatchThreadgroups:MTLSizeMake(res_tgs, 1, 1)
+            { uint d = (uint)H; [enc setBytes:&d length:sizeof(uint) atIndex:3]; }
+            [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-
-            // Barrier: residual_add writes → rms_norm reads
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // 3. RMS norm sum_sq: buf_moe_hidden → buf_sum_sq
+            // --- Phase K: Post-attention RMS norm → buf_input ---
             [enc setComputePipelineState:ctx->norm_sum_sq];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:1];
-            { uint dim_val = (uint)H; [enc setBytes:&dim_val length:sizeof(uint) atIndex:2]; }
+            { uint d = (uint)H; [enc setBytes:&d length:sizeof(uint) atIndex:2]; }
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-
-            // Barrier: sum_sq write → norm_apply reads
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // 4. RMS norm apply: buf_moe_hidden + norm_w + sum_sq → buf_input
             [enc setComputePipelineState:ctx->norm_apply];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_weights offset:(uint8_t *)post_norm_w - base atIndex:1];
             [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
             [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
-            {
-                uint dim_val = (uint)H;
-                float eps_val = cfg->rms_norm_eps;
-                [enc setBytes:&dim_val length:sizeof(uint) atIndex:4];
-                [enc setBytes:&eps_val length:sizeof(float) atIndex:5];
-            }
-            NSUInteger norm_tgs = ((uint)H + 255) / 256;
-            [enc dispatchThreadgroups:MTLSizeMake(norm_tgs, 1, 1)
+            { uint d = (uint)H; float e = cfg->rms_norm_eps;
+              [enc setBytes:&d length:sizeof(uint) atIndex:4];
+              [enc setBytes:&e length:sizeof(float) atIndex:5]; }
+            [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-
-            // Barrier: norm output → routing reads
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // 5. MoE routing + shared expert projections (all read from buf_input)
+            // --- Phase L: MoE routing + shared expert projections ---
             size_t sgg_off = n_experts * sizeof(float);
             GpuMatvecJob routing_jobs[4] = {
                 { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)gate_w - base,
@@ -617,44 +736,84 @@ int engine_step(Engine *eng, int token_id) {
                   .out_ptr = NULL, .out_dim = 1, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
             };
-            for (int j = 0; j < 4; j++) {
+            for (int j = 0; j < 4; j++)
                 gpu_encode_matvec_job(enc, ctx, &routing_jobs[j]);
-            }
 
             [enc endEncoding];
             [cmd commit];
             [cmd waitUntilCompleted];
 
-            // Read back: gate_scores, shared_gate_score, hidden
+            // Read back routing scores and hidden
             memcpy(s_fused_gate_scores, [ctx->buf_output contents],
                    n_experts * sizeof(float));
             float shared_gate_score;
             memcpy(&shared_gate_score,
                    (uint8_t *)[ctx->buf_output contents] + sgg_off,
                    sizeof(float));
-            // Read back hidden (updated with O proj + residual) from buf_moe_hidden
             memcpy(eng->hidden, [ctx->buf_moe_hidden contents], H * sizeof(float));
-
-            // Save pre-MoE state for residual (hidden is now updated)
             memcpy(eng->residual, eng->hidden, H * sizeof(float));
 
-            // MoE expert forward with pre-computed routing
-            // h_post is in buf_input on GPU, shared gate/up in their GPU buffers
+            // Also sync CPU KV cache for compatibility
+            KVCache *kv = eng->kv_caches[full_idx];
+            memcpy(kv->k_cache + pos * kv_dim,
+                   (float *)[ctx->buf_kv_k[full_idx] contents] + pos * kv_dim,
+                   kv_dim * sizeof(float));
+            memcpy(kv->v_cache + pos * kv_dim,
+                   (float *)[ctx->buf_kv_v[full_idx] contents] + pos * kv_dim,
+                   kv_dim * sizeof(float));
+            kv->len = seq_len;
+
+            t1 = now_ms();
+            t_attn_total += t1 - t0;
+
+            // MoE expert forward (separate commit)
+            t0 = now_ms();
             moe_forward_routed(eng->wf, ctx, cfg, layer, eng->hidden, eng->h_post,
                                s_fused_gate_scores, shared_gate_score,
                                eng->ef, eng->active_experts, eng->quant);
+            t1 = now_ms();
+            t_moe_total += t1 - t0;
+
+            full_idx++;
+            continue;
+        }
+
+        // --- CPU FALLBACK path (no Metal or missing pipelines) ---
+        float *attn_out = NULL;
+        int attn_out_dim = 0;
+
+        t0 = now_ms();
+        if (cfg->layer_types[layer] == ATTN_FULL) {
+            full_attention_forward(eng->wf, ctx, cfg, layer, pos,
+                                   eng->hidden, eng->residual, eng->h_post,
+                                   eng->kv_caches[full_idx],
+                                   &attn_out, &attn_out_dim);
+            full_idx++;
         } else {
-            // CPU fallback: original flow
-            const char *o_proj_name_fallback = (cfg->layer_types[layer] == ATTN_FULL)
+            linear_attention_forward(eng->wf, ctx, cfg, layer, pos,
+                                     eng->hidden, eng->residual, eng->h_post,
+                                     eng->linear_states[linear_idx],
+                                     &attn_out, &attn_out_dim);
+            linear_idx++;
+        }
+        t1 = now_ms();
+        t_attn_total += t1 - t0;
+
+        // CPU fallback O-proj + norm + MoE
+        t0 = now_ms();
+        {
+            const char *o_proj_name = (cfg->layer_types[layer] == ATTN_FULL)
                 ? "self_attn.o_proj" : "linear_attn.out_proj";
-            char wn2[128], sn2[128], bn2[128];
-            snprintf(wn2, sizeof(wn2), "%s.weight", o_proj_name_fallback);
-            snprintf(sn2, sizeof(sn2), "%s.scales", o_proj_name_fallback);
-            snprintf(bn2, sizeof(bn2), "%s.biases", o_proj_name_fallback);
-            uint32_t *o_w2 = weights_layer_ptr(eng->wf, layer, wn2);
-            uint16_t *o_s2 = weights_layer_ptr(eng->wf, layer, sn2);
-            uint16_t *o_b2 = weights_layer_ptr(eng->wf, layer, bn2);
-            fast_dequant_matvec(ctx, cfg, o_w2, o_s2, o_b2, attn_out, eng->h_post,
+            char wname[128], sname[128], bname[128];
+            snprintf(wname, sizeof(wname), "%s.weight", o_proj_name);
+            snprintf(sname, sizeof(sname), "%s.scales", o_proj_name);
+            snprintf(bname, sizeof(bname), "%s.biases", o_proj_name);
+            uint32_t *o_w = weights_layer_ptr(eng->wf, layer, wname);
+            uint16_t *o_s = weights_layer_ptr(eng->wf, layer, sname);
+            uint16_t *o_b = weights_layer_ptr(eng->wf, layer, bname);
+            uint16_t *post_norm_w = weights_layer_ptr(eng->wf, layer,
+                                                       "post_attention_layernorm.weight");
+            fast_dequant_matvec(ctx, cfg, o_w, o_s, o_b, attn_out, eng->h_post,
                                 H, attn_out_dim, QUANT_4BIT);
             for (int i = 0; i < H; i++) eng->hidden[i] += eng->h_post[i];
 
