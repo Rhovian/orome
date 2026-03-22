@@ -233,6 +233,7 @@ typedef struct {
     id<MTLComputePipelineState> residual_add_sq;
     id<MTLComputePipelineState> norm_apply_partial;
     id<MTLComputePipelineState> moe_combine_copy_sq;
+    id<MTLComputePipelineState> matvec_4bit_2row;
 
     // Shared buffers (allocated based on ModelConfig)
     id<MTLBuffer> buf_input;

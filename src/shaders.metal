@@ -98,6 +98,102 @@ kernel void dequant_matvec_4bit_v3(
 }
 
 // ============================================================================
+// Kernel 1b: 2-row-per-simdgroup 4-bit dequant matvec
+// Each simdgroup computes 2 output rows, doubling effective ROWS_PER_TG to 32
+// while keeping 512 threads (16 simdgroups) for better occupancy than ROWS_PER_TG=32
+// ============================================================================
+
+kernel void dequant_matvec_4bit_2row(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row0 = tgid * (ROWS_PER_TG * 2) + simd_group * 2;
+    uint row1 = row0 + 1;
+
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup half x_shared[4096];
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = half(x[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    bool valid0 = (row0 < out_dim);
+    bool valid1 = (row1 < out_dim);
+    if (!valid0) return;
+
+    device const uint32_t* w_row0 = W_packed + row0 * packed_cols;
+    device const uint16_t* s_row0 = scales + row0 * num_groups;
+    device const uint16_t* b_row0 = biases + row0 * num_groups;
+
+    device const uint32_t* w_row1 = valid1 ? W_packed + row1 * packed_cols : w_row0;
+    device const uint16_t* s_row1 = valid1 ? scales + row1 * num_groups : s_row0;
+    device const uint16_t* b_row1 = valid1 ? biases + row1 * num_groups : b_row0;
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        uint x_base = col * 8;
+
+        float x0 = float(x_shared[x_base + 0]);
+        float x1 = float(x_shared[x_base + 1]);
+        float x2 = float(x_shared[x_base + 2]);
+        float x3 = float(x_shared[x_base + 3]);
+        float x4 = float(x_shared[x_base + 4]);
+        float x5 = float(x_shared[x_base + 5]);
+        float x6 = float(x_shared[x_base + 6]);
+        float x7 = float(x_shared[x_base + 7]);
+
+        // Row 0
+        float scale0 = bf16_to_f32(s_row0[g]);
+        float bias0  = bf16_to_f32(b_row0[g]);
+        uint32_t packed0 = w_row0[col];
+        acc0 += fma(float((packed0 >>  0) & 0xF), scale0 * x0, bias0 * x0);
+        acc0 += fma(float((packed0 >>  4) & 0xF), scale0 * x1, bias0 * x1);
+        acc0 += fma(float((packed0 >>  8) & 0xF), scale0 * x2, bias0 * x2);
+        acc0 += fma(float((packed0 >> 12) & 0xF), scale0 * x3, bias0 * x3);
+        acc0 += fma(float((packed0 >> 16) & 0xF), scale0 * x4, bias0 * x4);
+        acc0 += fma(float((packed0 >> 20) & 0xF), scale0 * x5, bias0 * x5);
+        acc0 += fma(float((packed0 >> 24) & 0xF), scale0 * x6, bias0 * x6);
+        acc0 += fma(float((packed0 >> 28) & 0xF), scale0 * x7, bias0 * x7);
+
+        // Row 1
+        float scale1 = bf16_to_f32(s_row1[g]);
+        float bias1  = bf16_to_f32(b_row1[g]);
+        uint32_t packed1 = w_row1[col];
+        acc1 += fma(float((packed1 >>  0) & 0xF), scale1 * x0, bias1 * x0);
+        acc1 += fma(float((packed1 >>  4) & 0xF), scale1 * x1, bias1 * x1);
+        acc1 += fma(float((packed1 >>  8) & 0xF), scale1 * x2, bias1 * x2);
+        acc1 += fma(float((packed1 >> 12) & 0xF), scale1 * x3, bias1 * x3);
+        acc1 += fma(float((packed1 >> 16) & 0xF), scale1 * x4, bias1 * x4);
+        acc1 += fma(float((packed1 >> 20) & 0xF), scale1 * x5, bias1 * x5);
+        acc1 += fma(float((packed1 >> 24) & 0xF), scale1 * x6, bias1 * x6);
+        acc1 += fma(float((packed1 >> 28) & 0xF), scale1 * x7, bias1 * x7);
+    }
+
+    float sum0 = simd_sum(acc0);
+    float sum1 = simd_sum(acc1);
+
+    if (simd_lane == 0) {
+        out[row0] = sum0;
+        if (valid1) out[row1] = sum1;
+    }
+}
+
+// ============================================================================
 // Batched multi-expert 4-bit matvec — processes K experts in one dispatch
 // Grid: 2D (row_groups × K), threadgroup: ROWS_PER_TG * 32
 // ============================================================================

@@ -126,6 +126,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->residual_add_sq = make_pipeline(ctx, @"residual_add_sum_sq");
     ctx->norm_apply_partial = make_pipeline(ctx, @"rms_norm_apply_partial");
     ctx->moe_combine_copy_sq = make_pipeline(ctx, @"moe_combine_copy_sq");
+    ctx->matvec_4bit_2row = make_pipeline(ctx, @"dequant_matvec_4bit_2row");
 
     if (!ctx->matvec_4bit || !ctx->norm_sum_sq || !ctx->norm_apply) {
         fprintf(stderr, "ERROR: Required Metal pipelines missing\n");
@@ -310,7 +311,20 @@ void metal_free(MetalCtx *ctx) {
 void gpu_encode_matvec_job(id<MTLComputeCommandEncoder> enc,
                            MetalCtx *ctx,
                            GpuMatvecJob *job) {
-    id<MTLComputePipelineState> pipe = job->is_2bit ? ctx->matvec_2bit : ctx->matvec_4bit;
+    // Use 2-row kernel for 4-bit matvecs (halves TG count)
+    bool use_2row = !job->is_2bit && ctx->matvec_4bit_2row;
+    id<MTLComputePipelineState> pipe;
+    NSUInteger rows_per_tg;
+    if (job->is_2bit) {
+        pipe = ctx->matvec_2bit;
+        rows_per_tg = ROWS_PER_TG;
+    } else if (use_2row) {
+        pipe = ctx->matvec_4bit_2row;
+        rows_per_tg = ROWS_PER_TG * 2;  // 32 effective rows per TG
+    } else {
+        pipe = ctx->matvec_4bit;
+        rows_per_tg = ROWS_PER_TG;
+    }
     if (!pipe) return;
 
     [enc setComputePipelineState:pipe];
@@ -328,8 +342,8 @@ void gpu_encode_matvec_job(id<MTLComputeCommandEncoder> enc,
     [enc setBytes:&in_dim  length:sizeof(uint) atIndex:6];
     [enc setBytes:&gs      length:sizeof(uint) atIndex:7];
 
-    NSUInteger tg_size = ROWS_PER_TG * 32;
-    NSUInteger num_tgs = ((uint)job->out_dim + ROWS_PER_TG - 1) / ROWS_PER_TG;
+    NSUInteger tg_size = ROWS_PER_TG * 32;  // thread count stays at 512
+    NSUInteger num_tgs = ((uint)job->out_dim + rows_per_tg - 1) / rows_per_tg;
     [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
 }
