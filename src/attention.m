@@ -117,30 +117,31 @@ void full_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cf
     memcpy(kv->v_cache + pos * kv_dim, s_v, kv_dim * sizeof(float));
     int seq_len = pos + 1;
 
-    // 6. Scaled dot-product attention (CPU, per head)
+    // 6. Scaled dot-product attention (Accelerate-optimized, per head)
+    // Static scratch for scores — avoids calloc/free per head
+    static float *s_scores = NULL;
+    static int s_scores_cap = 0;
+    if (s_scores_cap < seq_len) {
+        free(s_scores);
+        s_scores_cap = seq_len < 256 ? 256 : seq_len;
+        s_scores = malloc(s_scores_cap * sizeof(float));
+    }
+
     int heads_per_kv = n_heads / n_kv;
     for (int h = 0; h < n_heads; h++) {
         int kv_h = h / heads_per_kv;
         float *qh = s_q + h * hd;
 
-        float *scores = calloc(seq_len, sizeof(float));
-        for (int p = 0; p < seq_len; p++) {
-            float *kp = kv->k_cache + p * kv_dim + kv_h * hd;
-            float dot = 0.0f;
-            for (int d = 0; d < hd; d++) dot += qh[d] * kp[d];
-            scores[p] = dot;
-        }
-        cpu_softmax(scores, seq_len);
+        // scores = K_cache @ q  (seq_len × hd matrix times hd vector)
+        // K_cache layout: [seq_len × kv_dim], stride kv_dim, starting at kv_h * hd
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, seq_len, hd, 1.0f,
+                    kv->k_cache + kv_h * hd, kv_dim, qh, 1, 0.0f, s_scores, 1);
+        cpu_softmax(s_scores, seq_len);
 
+        // out = V_cache^T @ scores  (hd × seq_len matrix times seq_len vector)
         float *out_h = s_attn_out + h * hd;
-        memset(out_h, 0, hd * sizeof(float));
-        for (int p = 0; p < seq_len; p++) {
-            float *vp = kv->v_cache + p * kv_dim + kv_h * hd;
-            for (int d = 0; d < hd; d++) {
-                out_h[d] += scores[p] * vp[d];
-            }
-        }
-        free(scores);
+        cblas_sgemv(CblasRowMajor, CblasTrans, seq_len, hd, 1.0f,
+                    kv->v_cache + kv_h * hd, kv_dim, s_scores, 1, 0.0f, out_h, 1);
     }
 
     // 7. Export pre-O-proj output (caller handles O proj + residual)
