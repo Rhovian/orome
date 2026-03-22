@@ -173,7 +173,9 @@ WeightFile *weights_open(const char *bin_path, const char *json_path) {
         fprintf(stderr, "ERROR: mmap failed: %s\n", strerror(errno));
         return NULL;
     }
-    madvise(data, size, MADV_RANDOM);  // random access for tensor lookups
+    // Pre-fault all weight pages into RAM and lock them
+    madvise(data, size, MADV_WILLNEED);
+    mlock(data, size);
 
     TensorManifest *manifest = load_manifest(json_path);
     if (!manifest) {
