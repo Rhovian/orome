@@ -55,8 +55,9 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
             continue;
         }
 
-        // Advise the kernel we'll access this randomly (expert selection is unpredictable)
-        madvise(data, size, MADV_RANDOM);
+        // Pre-fault all pages into RAM and lock them (no page faults during inference)
+        madvise(data, size, MADV_WILLNEED);
+        mlock(data, size);
 
         ef->layer_data[i] = data;
         ef->layer_size[i] = size;
