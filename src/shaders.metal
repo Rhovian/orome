@@ -618,7 +618,7 @@ kernel void sigmoid_gate(
 // k-head sharing: 4 v-heads share 1 k-head (64 v-heads / 16 k-heads).
 
 kernel void gated_delta_net_step(
-    device float *state,             // [64 * 128 * 128] persistent state
+    device half *state,              // [64 * 128 * 128] persistent state (half precision)
     device const float *q,           // [2048] (16 k-heads * 128)
     device const float *k,           // [2048] (16 k-heads * 128)
     device const float *v,           // [8192] (64 v-heads * 128)
@@ -647,23 +647,21 @@ kernel void gated_delta_net_step(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Step 1+2: Decay state row and compute kv_mem = dot(S[vi][:], k[:])
+    // Read half → float for compute, write back as half (halves bandwidth)
     float kv_mem = 0.0f;
     for (uint ki = 0; ki < 128; ki++) {
-        float s = state[state_base + ki] * g;
-        state[state_base + ki] = s;
+        float s = float(state[state_base + ki]) * g;
+        state[state_base + ki] = half(s);
         kv_mem += s * k_shared[ki];
     }
 
-    // Step 3+4: Delta update — S[vi][ki] += k[ki] * delta
+    // Step 3+4+5: Delta update + output in one pass (saves 1 full state read)
     float delta = (v[v_base + vi] - kv_mem) * beta;
-    for (uint ki = 0; ki < 128; ki++) {
-        state[state_base + ki] += k_shared[ki] * delta;
-    }
-
-    // Step 5: Output — out[vi] = dot(S[vi][:], q[:])
     float out_val = 0.0f;
     for (uint ki = 0; ki < 128; ki++) {
-        out_val += state[state_base + ki] * q_shared[ki];
+        float s = float(state[state_base + ki]) + k_shared[ki] * delta;
+        state[state_base + ki] = half(s);
+        out_val += s * q_shared[ki];
     }
     output[v_base + vi] = out_val;
 }
