@@ -1188,25 +1188,43 @@ int engine_step(Engine *eng, int token_id) {
         }
 
         // RMS norm: buf_moe_hidden → buf_input
-        [enc setComputePipelineState:ctx->norm_sum_sq];
-        [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-        [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:1];
-        { uint d = (uint)H; [enc setBytes:&d length:sizeof(uint) atIndex:2]; }
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        // Use partial sums from last layer's moe_combine_copy_sq if available
+        if (ctx->moe_combine_copy_sq) {
+            uint num_tgs = ((uint)H + 255) / 256;
+            [enc setComputePipelineState:ctx->norm_apply_partial];
+            [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)final_norm_w - base atIndex:1];
+            [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
+            [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
+            { uint d = (uint)H; float e = cfg->rms_norm_eps;
+              uint np = num_tgs;
+              [enc setBytes:&d length:sizeof(uint) atIndex:4];
+              [enc setBytes:&e length:sizeof(float) atIndex:5];
+              [enc setBytes:&np length:sizeof(uint) atIndex:6]; }
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        } else {
+            [enc setComputePipelineState:ctx->norm_sum_sq];
+            [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:1];
+            { uint d = (uint)H; [enc setBytes:&d length:sizeof(uint) atIndex:2]; }
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        [enc setComputePipelineState:ctx->norm_apply];
-        [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-        [enc setBuffer:ctx->buf_weights offset:(uint8_t *)final_norm_w - base atIndex:1];
-        [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
-        [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
-        { uint d = (uint)H; float e = cfg->rms_norm_eps;
-          [enc setBytes:&d length:sizeof(uint) atIndex:4];
-          [enc setBytes:&e length:sizeof(float) atIndex:5]; }
-        [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:ctx->norm_apply];
+            [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)final_norm_w - base atIndex:1];
+            [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
+            [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
+            { uint d = (uint)H; float e = cfg->rms_norm_eps;
+              [enc setBytes:&d length:sizeof(uint) atIndex:4];
+              [enc setBytes:&e length:sizeof(float) atIndex:5]; }
+            [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
 
         // LM head matvec: buf_input → buf_output
         GpuMatvecJob lm_job = {
