@@ -628,24 +628,33 @@ kernel void gated_delta_net_step(
     uint k_base = kh * 128;
     uint v_base = head_id * 128;
 
+    // Load k and q into threadgroup memory (shared by all 128 threads)
+    threadgroup float k_shared[128];
+    threadgroup float q_shared[128];
+    if (vi < 128) {
+        k_shared[vi] = k[k_base + vi];
+        q_shared[vi] = q[k_base + vi];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // Step 1+2: Decay state row and compute kv_mem = dot(S[vi][:], k[:])
     float kv_mem = 0.0f;
     for (uint ki = 0; ki < 128; ki++) {
         float s = state[state_base + ki] * g;
         state[state_base + ki] = s;
-        kv_mem += s * k[k_base + ki];
+        kv_mem += s * k_shared[ki];
     }
 
     // Step 3+4: Delta update — S[vi][ki] += k[ki] * delta
     float delta = (v[v_base + vi] - kv_mem) * beta;
     for (uint ki = 0; ki < 128; ki++) {
-        state[state_base + ki] += k[k_base + ki] * delta;
+        state[state_base + ki] += k_shared[ki] * delta;
     }
 
     // Step 5: Output — out[vi] = dot(S[vi][:], q[:])
     float out_val = 0.0f;
     for (uint ki = 0; ki < 128; ki++) {
-        out_val += state[state_base + ki] * q[k_base + ki];
+        out_val += state[state_base + ki] * q_shared[ki];
     }
     output[v_base + vi] = out_val;
 }
