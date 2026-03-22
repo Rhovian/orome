@@ -430,7 +430,8 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
 void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                         int layer_idx, float *hidden, float *h_post,
                         float *gate_scores, float shared_gate_score,
-                        ExpertFiles *ef, int K, QuantType quant) {
+                        ExpertFiles *ef, int K, QuantType quant,
+                        bool gpu_combine) {
     int H = cfg->hidden_dim;
     int n_experts = cfg->num_experts;
     void *layer_data = ef->layer_data[layer_idx];
@@ -573,20 +574,59 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                 threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
         }
 
-        [enc endEncoding];
-        [cmd commit];
-        [cmd waitUntilCompleted];
+        if (gpu_combine && ctx->moe_combine) {
+            // Add barrier before combine
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        // Read back expert results
-        for (int k = 0; k < K; k++) {
-            memcpy(s_expert_out[k], [ctx->buf_multi_expert_out[k] contents],
-                   H * sizeof(float));
+            // Fill combine params: weights[0..K-1] + shared_gate_score
+            float *params = (float *)[ctx->buf_combine_params contents];
+            for (int k = 0; k < K; k++) params[k] = expert_weights[k];
+            params[8] = shared_gate_score;
+
+            // Dispatch moe_combine: buf_moe_hidden += experts + shared
+            [enc setComputePipelineState:ctx->moe_combine];
+            [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];  // h_mid (pre-MoE residual)
+            [enc setBuffer:ctx->buf_shared_out offset:0 atIndex:1];
+            [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:2];  // hidden_out (in-place)
+            for (int k = 0; k < 8 && k < K; k++) {
+                [enc setBuffer:ctx->buf_multi_expert_out[k] offset:0 atIndex:3 + k];
+            }
+            // Fill remaining expert slots with expert_out0 (won't be used, K check in kernel)
+            for (int k = K; k < 8; k++) {
+                [enc setBuffer:ctx->buf_multi_expert_out[0] offset:0 atIndex:3 + k];
+            }
+            [enc setBuffer:ctx->buf_combine_params offset:0 atIndex:11];
+            { uint d = (uint)H, kk = (uint)K;
+              [enc setBytes:&d length:sizeof(uint) atIndex:12];
+              [enc setBytes:&kk length:sizeof(uint) atIndex:13]; }
+            [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            [enc endEncoding];
+            [cmd commit];
+            // DON'T wait — caller handles synchronization via queue ordering
+        } else {
+            [enc endEncoding];
+            [cmd commit];
+            [cmd waitUntilCompleted];
+
+            // Read back expert results
+            for (int k = 0; k < K; k++) {
+                memcpy(s_expert_out[k], [ctx->buf_multi_expert_out[k] contents],
+                       H * sizeof(float));
+            }
+            memcpy(s_shared_out, [ctx->buf_shared_out contents], H * sizeof(float));
+
+            // Apply shared expert gate
+            float sw = cpu_sigmoid(shared_gate_score);
+            for (int i = 0; i < H; i++) s_shared_out[i] *= sw;
+
+            // CPU combine
+            for (int k = 0; k < K; k++) {
+                cpu_vec_madd(hidden, s_expert_out[k], expert_weights[k], H);
+            }
+            cpu_vec_add(hidden, s_shared_out, H);
         }
-        memcpy(s_shared_out, [ctx->buf_shared_out contents], H * sizeof(float));
-
-        // Apply shared expert gate
-        float sw = cpu_sigmoid(shared_gate_score);
-        for (int i = 0; i < H; i++) s_shared_out[i] *= sw;
     } else {
         // CPU fallback
         uint32_t *sg_w = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.gate_proj.weight");
@@ -609,11 +649,11 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                                   s_expert_out[k], s_expert_gate[k],
                                   s_expert_up[k], s_expert_act[k]);
         }
-    }
 
-    // 4. Combine: hidden += sum(weight[k] * expert_out[k]) + shared_out
-    for (int k = 0; k < K; k++) {
-        cpu_vec_madd(hidden, s_expert_out[k], expert_weights[k], H);
+        // CPU combine
+        for (int k = 0; k < K; k++) {
+            cpu_vec_madd(hidden, s_expert_out[k], expert_weights[k], H);
+        }
+        cpu_vec_add(hidden, s_shared_out, H);
     }
-    cpu_vec_add(hidden, s_shared_out, H);
 }

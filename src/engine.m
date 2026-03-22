@@ -174,12 +174,20 @@ int engine_step(Engine *eng, int token_id) {
         s_fused_gate_alloc = cfg->num_experts;
     }
 
-    for (int layer = 0; layer < cfg->num_layers; layer++) {
-        // Save pre-attention hidden state for residual
-        memcpy(eng->residual, eng->hidden, H * sizeof(float));
+    // Upload hidden to GPU once before the layer loop.
+    // Hidden state stays on GPU (in buf_moe_hidden) throughout all layers.
+    bool gpu_resident = (ctx && ctx->buf_weights && ctx->moe_combine);
+    if (gpu_resident) {
+        memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
+    }
 
+    for (int layer = 0; layer < cfg->num_layers; layer++) {
         int n_experts = cfg->num_experts;
         int S = cfg->shared_intermediate;
+        // For non-GPU-resident path, save residual on CPU
+        if (!gpu_resident) {
+            memcpy(eng->residual, eng->hidden, H * sizeof(float));
+        }
 
         // --- LINEAR ATTENTION: fully fused GPU path ---
         // Projections + conv1d + QK norm + decay/beta + delta_net + gated_rms_norm
@@ -231,11 +239,22 @@ int engine_step(Engine *eng, int token_id) {
             uint16_t *sgg_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.scales");
             uint16_t *sgg_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.biases");
 
-            // Copy hidden to GPU
-            memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
-            memcpy([ctx->buf_residual contents], eng->residual, H * sizeof(float));
+            // GPU-resident: hidden already in buf_moe_hidden; blit → buf_residual
+            if (!gpu_resident) {
+                memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
+                memcpy([ctx->buf_residual contents], eng->residual, H * sizeof(float));
+            }
 
             id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+
+            if (gpu_resident) {
+                id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+                [blit copyFromBuffer:ctx->buf_moe_hidden sourceOffset:0
+                            toBuffer:ctx->buf_residual destinationOffset:0
+                                size:H * sizeof(float)];
+                [blit endEncoding];
+            }
+
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
             // --- Phase A: Input norm → buf_input ---
@@ -440,24 +459,27 @@ int engine_step(Engine *eng, int token_id) {
             [cmd commit];
             [cmd waitUntilCompleted];
 
-            // Read back routing scores and hidden
+            // Read back routing scores (hidden stays on GPU if gpu_resident)
             memcpy(s_fused_gate_scores, [ctx->buf_output contents],
                    n_experts * sizeof(float));
             float shared_gate_score;
             memcpy(&shared_gate_score,
                    (uint8_t *)[ctx->buf_output contents] + sgg_off,
                    sizeof(float));
-            memcpy(eng->hidden, [ctx->buf_moe_hidden contents], H * sizeof(float));
-            memcpy(eng->residual, eng->hidden, H * sizeof(float));
+            if (!gpu_resident) {
+                memcpy(eng->hidden, [ctx->buf_moe_hidden contents], H * sizeof(float));
+                memcpy(eng->residual, eng->hidden, H * sizeof(float));
+            }
 
             t1 = now_ms();
             t_attn_total += t1 - t0;
 
-            // MoE expert forward (separate commit)
+            // MoE expert forward (gpu_combine=true: combine on GPU, don't wait)
             t0 = now_ms();
             moe_forward_routed(eng->wf, ctx, cfg, layer, eng->hidden, eng->h_post,
                                s_fused_gate_scores, shared_gate_score,
-                               eng->ef, eng->active_experts, eng->quant);
+                               eng->ef, eng->active_experts, eng->quant,
+                               gpu_resident);
             t1 = now_ms();
             t_moe_total += t1 - t0;
 
@@ -510,11 +532,22 @@ int engine_step(Engine *eng, int token_id) {
             uint16_t *sgg_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.scales");
             uint16_t *sgg_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.biases");
 
-            // Copy hidden to GPU
-            memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
-            memcpy([ctx->buf_residual contents], eng->residual, H * sizeof(float));
+            // GPU-resident: hidden already in buf_moe_hidden; blit → buf_residual
+            if (!gpu_resident) {
+                memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
+                memcpy([ctx->buf_residual contents], eng->residual, H * sizeof(float));
+            }
 
             id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+
+            if (gpu_resident) {
+                id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+                [blit copyFromBuffer:ctx->buf_moe_hidden sourceOffset:0
+                            toBuffer:ctx->buf_residual destinationOffset:0
+                                size:H * sizeof(float)];
+                [blit endEncoding];
+            }
+
             id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
             // --- Phase A: Input norm → buf_input ---
@@ -743,34 +776,29 @@ int engine_step(Engine *eng, int token_id) {
             [cmd commit];
             [cmd waitUntilCompleted];
 
-            // Read back routing scores and hidden
+            // Read back routing scores (hidden stays on GPU if gpu_resident)
             memcpy(s_fused_gate_scores, [ctx->buf_output contents],
                    n_experts * sizeof(float));
             float shared_gate_score;
             memcpy(&shared_gate_score,
                    (uint8_t *)[ctx->buf_output contents] + sgg_off,
                    sizeof(float));
-            memcpy(eng->hidden, [ctx->buf_moe_hidden contents], H * sizeof(float));
-            memcpy(eng->residual, eng->hidden, H * sizeof(float));
+            if (!gpu_resident) {
+                memcpy(eng->hidden, [ctx->buf_moe_hidden contents], H * sizeof(float));
+                memcpy(eng->residual, eng->hidden, H * sizeof(float));
+            }
 
-            // Also sync CPU KV cache for compatibility
-            KVCache *kv = eng->kv_caches[full_idx];
-            memcpy(kv->k_cache + pos * kv_dim,
-                   (float *)[ctx->buf_kv_k[full_idx] contents] + pos * kv_dim,
-                   kv_dim * sizeof(float));
-            memcpy(kv->v_cache + pos * kv_dim,
-                   (float *)[ctx->buf_kv_v[full_idx] contents] + pos * kv_dim,
-                   kv_dim * sizeof(float));
-            kv->len = seq_len;
+            // KV cache is on GPU now; no CPU sync needed for GPU-resident path
 
             t1 = now_ms();
             t_attn_total += t1 - t0;
 
-            // MoE expert forward (separate commit)
+            // MoE expert forward (gpu_combine=true: combine on GPU, don't wait)
             t0 = now_ms();
             moe_forward_routed(eng->wf, ctx, cfg, layer, eng->hidden, eng->h_post,
                                s_fused_gate_scores, shared_gate_score,
-                               eng->ef, eng->active_experts, eng->quant);
+                               eng->ef, eng->active_experts, eng->quant,
+                               gpu_resident);
             t1 = now_ms();
             t_moe_total += t1 - t0;
 
@@ -825,6 +853,15 @@ int engine_step(Engine *eng, int token_id) {
 
         t1 = now_ms();
         t_moe_total += t1 - t0;
+    }
+
+    // Sync GPU: wait for last expert forward and read back hidden
+    if (gpu_resident) {
+        // Submit sentinel command buffer to ensure all prior work is done
+        id<MTLCommandBuffer> sync_cmd = [ctx->queue commandBuffer];
+        [sync_cmd commit];
+        [sync_cmd waitUntilCompleted];
+        memcpy(eng->hidden, [ctx->buf_moe_hidden contents], H * sizeof(float));
     }
 
     // 3. Final norm

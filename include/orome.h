@@ -429,10 +429,14 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
 
 // MoE forward with pre-computed routing (skips routing GPU batch).
 // gate_scores and shared_gate_score must already be computed.
+// If gpu_combine=true: adds moe_combine kernel on GPU, writes result to
+// ctx->buf_moe_hidden, does NOT wait or read back (caller must sync).
+// If gpu_combine=false: reads back expert results, combines on CPU into hidden.
 void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                         int layer_idx, float *hidden, float *h_post,
                         float *gate_scores, float shared_gate_score,
-                        ExpertFiles *ef, int K, QuantType quant);
+                        ExpertFiles *ef, int K, QuantType quant,
+                        bool gpu_combine);
 
 // ============================================================================
 // Engine — full forward pass
