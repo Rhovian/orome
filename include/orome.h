@@ -234,6 +234,7 @@ typedef struct {
     id<MTLComputePipelineState> norm_apply_partial;
     id<MTLComputePipelineState> moe_combine_copy_sq;
     id<MTLComputePipelineState> matvec_4bit_2row;
+    id<MTLComputePipelineState> batch_expert_down_dyn_2row;
 
     // Shared buffers (allocated based on ModelConfig)
     id<MTLBuffer> buf_input;

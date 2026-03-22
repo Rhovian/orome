@@ -1594,3 +1594,94 @@ kernel void batch_expert_down_dyn(
         out[expert_k * out_dim + row] = sum;
     }
 }
+
+// 2-row-per-simdgroup variant of batch_expert_down_dyn
+kernel void batch_expert_down_dyn_2row(
+    device const uint8_t*  layer_data    [[buffer(0)]],
+    device const float*    x             [[buffer(1)]],
+    device float*          out           [[buffer(2)]],
+    device const uint32_t* expert_indices [[buffer(3)]],
+    constant uint&         expert_size   [[buffer(4)]],
+    constant uint&         proj_w_off    [[buffer(5)]],
+    constant uint&         proj_s_off    [[buffer(6)]],
+    constant uint&         proj_b_off    [[buffer(7)]],
+    constant uint&         out_dim       [[buffer(8)]],
+    constant uint&         in_dim        [[buffer(9)]],
+    constant uint&         group_size    [[buffer(10)]],
+    constant uint&         num_row_tgs   [[buffer(11)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint expert_k = tgid / num_row_tgs;
+    uint row0 = (tgid % num_row_tgs) * (ROWS_PER_TG * 2) + simd_group * 2;
+    uint row1 = row0 + 1;
+
+    uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
+
+    threadgroup half x_shared[4096];
+    device const float* x_expert = x + expert_k * in_dim;
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = half(x_expert[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    bool valid0 = (row0 < out_dim);
+    bool valid1 = (row1 < out_dim);
+    if (!valid0) return;
+
+    uint expert_id = expert_indices[expert_k];
+    uint base = expert_id * expert_size;
+
+    device const uint32_t* W = (device const uint32_t*)(layer_data + base + proj_w_off);
+    device const uint16_t* S = (device const uint16_t*)(layer_data + base + proj_s_off);
+    device const uint16_t* B = (device const uint16_t*)(layer_data + base + proj_b_off);
+
+    device const uint32_t* w_row0 = W + row0 * packed_cols;
+    device const uint16_t* s_row0 = S + row0 * num_groups;
+    device const uint16_t* b_row0 = B + row0 * num_groups;
+    device const uint32_t* w_row1 = valid1 ? W + row1 * packed_cols : w_row0;
+    device const uint16_t* s_row1 = valid1 ? S + row1 * num_groups : s_row0;
+    device const uint16_t* b_row1 = valid1 ? B + row1 * num_groups : b_row0;
+
+    float acc0 = 0.0f, acc1 = 0.0f;
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / (group_size / 8);
+        uint x_base = col * 8;
+        float x0 = float(x_shared[x_base+0]), x1 = float(x_shared[x_base+1]);
+        float x2 = float(x_shared[x_base+2]), x3 = float(x_shared[x_base+3]);
+        float x4 = float(x_shared[x_base+4]), x5 = float(x_shared[x_base+5]);
+        float x6 = float(x_shared[x_base+6]), x7 = float(x_shared[x_base+7]);
+
+        float scale0 = bf16_to_f32(s_row0[g]), bias0 = bf16_to_f32(b_row0[g]);
+        uint32_t p0 = w_row0[col];
+        acc0 += fma(float((p0>> 0)&0xF), scale0*x0, bias0*x0);
+        acc0 += fma(float((p0>> 4)&0xF), scale0*x1, bias0*x1);
+        acc0 += fma(float((p0>> 8)&0xF), scale0*x2, bias0*x2);
+        acc0 += fma(float((p0>>12)&0xF), scale0*x3, bias0*x3);
+        acc0 += fma(float((p0>>16)&0xF), scale0*x4, bias0*x4);
+        acc0 += fma(float((p0>>20)&0xF), scale0*x5, bias0*x5);
+        acc0 += fma(float((p0>>24)&0xF), scale0*x6, bias0*x6);
+        acc0 += fma(float((p0>>28)&0xF), scale0*x7, bias0*x7);
+
+        float scale1 = bf16_to_f32(s_row1[g]), bias1 = bf16_to_f32(b_row1[g]);
+        uint32_t p1 = w_row1[col];
+        acc1 += fma(float((p1>> 0)&0xF), scale1*x0, bias1*x0);
+        acc1 += fma(float((p1>> 4)&0xF), scale1*x1, bias1*x1);
+        acc1 += fma(float((p1>> 8)&0xF), scale1*x2, bias1*x2);
+        acc1 += fma(float((p1>>12)&0xF), scale1*x3, bias1*x3);
+        acc1 += fma(float((p1>>16)&0xF), scale1*x4, bias1*x4);
+        acc1 += fma(float((p1>>20)&0xF), scale1*x5, bias1*x5);
+        acc1 += fma(float((p1>>24)&0xF), scale1*x6, bias1*x6);
+        acc1 += fma(float((p1>>28)&0xF), scale1*x7, bias1*x7);
+    }
+
+    float sum0 = simd_sum(acc0), sum1 = simd_sum(acc1);
+    if (simd_lane == 0) {
+        out[expert_k * out_dim + row0] = sum0;
+        if (valid1) out[expert_k * out_dim + row1] = sum1;
+    }
+}

@@ -374,24 +374,29 @@ static void encode_fused_experts(id<MTLComputeCommandEncoder> enc,
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
     // --- Expert down projections (dynamic, per-expert packed input) ---
-    [enc setComputePipelineState:ctx->batch_expert_down_dyn];
-    [enc setBuffer:expert_layer_buf offset:0 atIndex:0];
-    [enc setBuffer:ctx->buf_batch_expert_act offset:0 atIndex:1];
-    [enc setBuffer:ctx->buf_batch_expert_out offset:0 atIndex:2];
-    [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
-    { uint es = expert_sz;
-      uint pw = (uint)layout->down_w_off, ps = (uint)layout->down_s_off, pb = (uint)layout->down_b_off;
-      uint od = (uint)H, id_ = (uint)M, gs = (uint)cfg->group_size, nrt = num_row_tgs_H;
-      [enc setBytes:&es length:sizeof(uint) atIndex:4];
-      [enc setBytes:&pw length:sizeof(uint) atIndex:5];
-      [enc setBytes:&ps length:sizeof(uint) atIndex:6];
-      [enc setBytes:&pb length:sizeof(uint) atIndex:7];
-      [enc setBytes:&od length:sizeof(uint) atIndex:8];
-      [enc setBytes:&id_ length:sizeof(uint) atIndex:9];
-      [enc setBytes:&gs length:sizeof(uint) atIndex:10];
-      [enc setBytes:&nrt length:sizeof(uint) atIndex:11]; }
-    [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_H * K, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    // Use 2-row kernel if available (halves TG count)
+    { bool use_2row_down = (ctx->batch_expert_down_dyn_2row != nil);
+      id<MTLComputePipelineState> down_pipe = use_2row_down ? ctx->batch_expert_down_dyn_2row : ctx->batch_expert_down_dyn;
+      uint down_rows_per_tg = use_2row_down ? ENGINE_ROWS_PER_TG * 2 : ENGINE_ROWS_PER_TG;
+      uint down_num_row_tgs = ((uint)H + down_rows_per_tg - 1) / down_rows_per_tg;
+      [enc setComputePipelineState:down_pipe];
+      [enc setBuffer:expert_layer_buf offset:0 atIndex:0];
+      [enc setBuffer:ctx->buf_batch_expert_act offset:0 atIndex:1];
+      [enc setBuffer:ctx->buf_batch_expert_out offset:0 atIndex:2];
+      [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
+      { uint es = expert_sz;
+        uint pw = (uint)layout->down_w_off, ps = (uint)layout->down_s_off, pb = (uint)layout->down_b_off;
+        uint od = (uint)H, id_ = (uint)M, gs = (uint)cfg->group_size, nrt = down_num_row_tgs;
+        [enc setBytes:&es length:sizeof(uint) atIndex:4];
+        [enc setBytes:&pw length:sizeof(uint) atIndex:5];
+        [enc setBytes:&ps length:sizeof(uint) atIndex:6];
+        [enc setBytes:&pb length:sizeof(uint) atIndex:7];
+        [enc setBytes:&od length:sizeof(uint) atIndex:8];
+        [enc setBytes:&id_ length:sizeof(uint) atIndex:9];
+        [enc setBytes:&gs length:sizeof(uint) atIndex:10];
+        [enc setBytes:&nrt length:sizeof(uint) atIndex:11]; }
+      [enc dispatchThreadgroups:MTLSizeMake(down_num_row_tgs * K, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
 
     // --- Shared expert down (use 2-row kernel if available) ---
     { id<MTLComputePipelineState> sd_pipe = ctx->matvec_4bit_2row ? ctx->matvec_4bit_2row : ctx->matvec_4bit;
