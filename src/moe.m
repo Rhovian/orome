@@ -276,80 +276,90 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                                       ? ctx->buf_expert_layers[layer_idx] : nil;
 
     if (expert_layer_buf && ctx->buf_weights) {
-        // GPU expert forward: batch gate+up for all K experts, then SwiGLU, then batch down
-        memcpy([ctx->buf_multi_expert_input contents], h_post, H * sizeof(float));
-
-        // Phase 1: gate + up projections (2*K matvecs in one command buffer)
-        GpuMatvecJob gate_up_jobs[2 * OROME_MAX_ACTIVE];
-        for (int k = 0; k < K; k++) {
-            size_t expert_off = (size_t)expert_indices[k] * layout->expert_size;
-
-            gate_up_jobs[k * 2] = (GpuMatvecJob){
-                .w_buf = expert_layer_buf, .w_off = expert_off + layout->gate_w_off,
-                .s_buf = expert_layer_buf, .s_off = expert_off + layout->gate_s_off,
-                .b_buf = expert_layer_buf, .b_off = expert_off + layout->gate_b_off,
-                .out_buf = ctx->buf_multi_expert_gate[k], .out_off = 0,
-                .out_ptr = s_expert_gate[k],
-                .out_dim = cfg->moe_intermediate, .in_dim = H,
-                .group_size = cfg->group_size, .is_2bit = (quant == QUANT_2BIT),
-            };
-            gate_up_jobs[k * 2 + 1] = (GpuMatvecJob){
-                .w_buf = expert_layer_buf, .w_off = expert_off + layout->up_w_off,
-                .s_buf = expert_layer_buf, .s_off = expert_off + layout->up_s_off,
-                .b_buf = expert_layer_buf, .b_off = expert_off + layout->up_b_off,
-                .out_buf = ctx->buf_multi_expert_up[k], .out_off = 0,
-                .out_ptr = s_expert_up[k],
-                .out_dim = cfg->moe_intermediate, .in_dim = H,
-                .group_size = cfg->group_size, .is_2bit = (quant == QUANT_2BIT),
-            };
-        }
-
-        // Need to set buf_input to h_post for the expert matvecs
-        // (buf_input was set to h_post earlier for routing, but may have been overwritten)
+        // GPU expert forward: gate+up → SwiGLU → down all in ONE command buffer
         memcpy([ctx->buf_input contents], h_post, H * sizeof(float));
-        gpu_run_matvec_batch(ctx, gate_up_jobs, K * 2);
 
-        // SwiGLU on CPU (small vectors, fast)
-        for (int k = 0; k < K; k++) {
-            cpu_swiglu(s_expert_gate[k], s_expert_up[k], s_expert_act[k],
-                       cfg->moe_intermediate);
-        }
-
-        // Phase 2: down projections (K matvecs in one command buffer)
-        // Each down proj has a DIFFERENT input (s_expert_act[k]), so we need to copy
-        // each into a separate input buffer. Use buf_multi_expert_act[k] as input.
         id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
 
+        int M = cfg->moe_intermediate;
+        id<MTLComputePipelineState> mv_pipe = (quant == QUANT_2BIT)
+                                               ? ctx->matvec_2bit : ctx->matvec_4bit;
+
+        // Phase 1: gate + up projections for all K experts
         for (int k = 0; k < K; k++) {
             size_t expert_off = (size_t)expert_indices[k] * layout->expert_size;
-            int M = cfg->moe_intermediate;
 
-            // Copy activation to GPU buffer for this expert
-            memcpy([ctx->buf_multi_expert_act[k] contents], s_expert_act[k],
-                   M * sizeof(float));
+            // Gate projection
+            [enc setComputePipelineState:mv_pipe];
+            [enc setBuffer:expert_layer_buf offset:expert_off + layout->gate_w_off atIndex:0];
+            [enc setBuffer:expert_layer_buf offset:expert_off + layout->gate_s_off atIndex:1];
+            [enc setBuffer:expert_layer_buf offset:expert_off + layout->gate_b_off atIndex:2];
+            [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
+            [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:4];
+            {
+                uint od = (uint)M, id_ = (uint)H, gs = (uint)cfg->group_size;
+                [enc setBytes:&od length:sizeof(uint) atIndex:5];
+                [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+                [enc setBytes:&gs length:sizeof(uint) atIndex:7];
+            }
+            NSUInteger tg_size = ROWS_PER_TG * 32;
+            NSUInteger num_tgs = ((uint)M + ROWS_PER_TG - 1) / ROWS_PER_TG;
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
 
-            id<MTLComputePipelineState> pipe = (quant == QUANT_2BIT)
-                                               ? ctx->matvec_2bit : ctx->matvec_4bit;
-            [enc setComputePipelineState:pipe];
+            // Up projection
+            [enc setComputePipelineState:mv_pipe];
+            [enc setBuffer:expert_layer_buf offset:expert_off + layout->up_w_off atIndex:0];
+            [enc setBuffer:expert_layer_buf offset:expert_off + layout->up_s_off atIndex:1];
+            [enc setBuffer:expert_layer_buf offset:expert_off + layout->up_b_off atIndex:2];
+            [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
+            [enc setBuffer:ctx->buf_multi_expert_up[k] offset:0 atIndex:4];
+            {
+                uint od = (uint)M, id_ = (uint)H, gs = (uint)cfg->group_size;
+                [enc setBytes:&od length:sizeof(uint) atIndex:5];
+                [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+                [enc setBytes:&gs length:sizeof(uint) atIndex:7];
+            }
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        }
+
+        // Phase 2: SwiGLU activation on GPU for all K experts
+        for (int k = 0; k < K; k++) {
+            [enc setComputePipelineState:ctx->swiglu];
+            [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_multi_expert_up[k] offset:0 atIndex:1];
+            [enc setBuffer:ctx->buf_multi_expert_act[k] offset:0 atIndex:2];
+            uint dim_val = (uint)M;
+            [enc setBytes:&dim_val length:sizeof(uint) atIndex:3];
+            NSUInteger swi_tgs = ((uint)M + 255) / 256;
+            [enc dispatchThreadgroups:MTLSizeMake(swi_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+
+        // Phase 3: down projections for all K experts
+        for (int k = 0; k < K; k++) {
+            size_t expert_off = (size_t)expert_indices[k] * layout->expert_size;
+
+            [enc setComputePipelineState:mv_pipe];
             [enc setBuffer:expert_layer_buf offset:expert_off + layout->down_w_off atIndex:0];
             [enc setBuffer:expert_layer_buf offset:expert_off + layout->down_s_off atIndex:1];
             [enc setBuffer:expert_layer_buf offset:expert_off + layout->down_b_off atIndex:2];
             [enc setBuffer:ctx->buf_multi_expert_act[k] offset:0 atIndex:3];
             [enc setBuffer:ctx->buf_multi_expert_out[k] offset:0 atIndex:4];
-
-            uint out_dim = (uint)H;
-            uint in_dim = (uint)M;
-            uint gs = (uint)cfg->group_size;
-            [enc setBytes:&out_dim length:sizeof(uint) atIndex:5];
-            [enc setBytes:&in_dim  length:sizeof(uint) atIndex:6];
-            [enc setBytes:&gs      length:sizeof(uint) atIndex:7];
-
+            {
+                uint od = (uint)H, id_ = (uint)M, gs = (uint)cfg->group_size;
+                [enc setBytes:&od length:sizeof(uint) atIndex:5];
+                [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+                [enc setBytes:&gs length:sizeof(uint) atIndex:7];
+            }
             NSUInteger tg_size = ROWS_PER_TG * 32;
             NSUInteger num_tgs = ((uint)H + ROWS_PER_TG - 1) / ROWS_PER_TG;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
         }
+
         [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
