@@ -54,30 +54,45 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
         return NULL;
     }
 
-    // Load and compile shaders
+    // Load precompiled metallib (fast) or fall back to source compilation
     NSError *error = nil;
-    NSString *src = [NSString stringWithContentsOfFile:@"src/shaders.metal"
-                                             encoding:NSUTF8StringEncoding
-                                                error:&error];
-    if (!src) {
-        fprintf(stderr, "ERROR: Cannot find shaders.metal\n");
-        free(ctx);
-        return NULL;
-    }
-
-    MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-    opts.mathMode = MTLMathModeFast;
-    opts.languageVersion = MTLLanguageVersion3_1;
-
     double t0 = now_ms();
-    ctx->library = [ctx->device newLibraryWithSource:src options:opts error:&error];
-    if (!ctx->library) {
-        fprintf(stderr, "ERROR: Shader compile failed: %s\n",
-                [[error localizedDescription] UTF8String]);
-        free(ctx);
-        return NULL;
+
+    NSString *metallib_path = @"src/shaders.metallib";
+    if ([[NSFileManager defaultManager] fileExistsAtPath:metallib_path]) {
+        NSURL *url = [NSURL fileURLWithPath:metallib_path];
+        ctx->library = [ctx->device newLibraryWithURL:url error:&error];
+        if (ctx->library) {
+            printf("[metal] Loaded precompiled metallib: %.0f ms\n", now_ms() - t0);
+        } else {
+            fprintf(stderr, "WARNING: Failed to load metallib: %s, falling back to source\n",
+                    [[error localizedDescription] UTF8String]);
+        }
     }
-    printf("[metal] Shader compile: %.0f ms\n", now_ms() - t0);
+
+    if (!ctx->library) {
+        NSString *src = [NSString stringWithContentsOfFile:@"src/shaders.metal"
+                                                 encoding:NSUTF8StringEncoding
+                                                    error:&error];
+        if (!src) {
+            fprintf(stderr, "ERROR: Cannot find shaders.metal\n");
+            free(ctx);
+            return NULL;
+        }
+
+        MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
+        opts.mathMode = MTLMathModeFast;
+        opts.languageVersion = MTLLanguageVersion3_1;
+
+        ctx->library = [ctx->device newLibraryWithSource:src options:opts error:&error];
+        if (!ctx->library) {
+            fprintf(stderr, "ERROR: Shader compile failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            free(ctx);
+            return NULL;
+        }
+        printf("[metal] Shader compile from source: %.0f ms\n", now_ms() - t0);
+    }
 
     // Create pipelines
     ctx->matvec_4bit      = make_pipeline(ctx, @"dequant_matvec_4bit_v3");

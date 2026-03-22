@@ -18,7 +18,7 @@ SHADER_LIB = src/shaders.metallib
 
 .PHONY: all clean run bench
 
-all: $(OROME_TARGET)
+all: $(SHADER_LIB) $(OROME_TARGET)
 
 %.o: %.m include/orome.h
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -30,7 +30,7 @@ $(OROME_TARGET): $(OROME_OBJS)
 metallib: $(SHADER_LIB)
 
 $(SHADER_AIR): $(SHADER_SRC)
-	$(METALC) -c $(SHADER_SRC) -o $(SHADER_AIR)
+	$(METALC) -c -ffast-math $(SHADER_SRC) -o $(SHADER_AIR)
 
 $(SHADER_LIB): $(SHADER_AIR)
 	$(METALLIB_TOOL) $(SHADER_AIR) -o $(SHADER_LIB)
