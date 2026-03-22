@@ -214,13 +214,11 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
 
     // Batch: routing gate + shared gate_proj + shared up_proj + shared_expert_gate
     // All use h_post as input. 4 dispatches → 1 GPU command buffer.
+    // Shared gate/up go to dedicated GPU buffers for later GPU SwiGLU+down.
     if (ctx && ctx->buf_weights && sg_w && su_w && sgg_w) {
         memcpy([ctx->buf_input contents], h_post, H * sizeof(float));
         uint8_t *base = (uint8_t *)[ctx->buf_weights contents];
-        // Pack outputs into buf_output at different offsets
-        size_t sg_off = n_experts * sizeof(float);
-        size_t su_off = sg_off + S * sizeof(float);
-        size_t sgg_off = su_off + S * sizeof(float);
+        size_t sgg_off = n_experts * sizeof(float);
         GpuMatvecJob jobs[4] = {
             { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)gate_w - base,
               .s_buf = ctx->buf_weights, .s_off = (uint8_t *)gate_s - base,
@@ -231,14 +229,14 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
             { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)sg_w - base,
               .s_buf = ctx->buf_weights, .s_off = (uint8_t *)sg_s - base,
               .b_buf = ctx->buf_weights, .b_off = (uint8_t *)sg_b - base,
-              .out_buf = ctx->buf_output, .out_off = sg_off,
-              .out_ptr = s_shared_gate, .out_dim = S, .in_dim = H,
+              .out_buf = ctx->buf_shared_gate, .out_off = 0,
+              .out_ptr = NULL, .out_dim = S, .in_dim = H,
               .group_size = cfg->group_size, .is_2bit = false },
             { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)su_w - base,
               .s_buf = ctx->buf_weights, .s_off = (uint8_t *)su_s - base,
               .b_buf = ctx->buf_weights, .b_off = (uint8_t *)su_b - base,
-              .out_buf = ctx->buf_output, .out_off = su_off,
-              .out_ptr = s_shared_up, .out_dim = S, .in_dim = H,
+              .out_buf = ctx->buf_shared_up, .out_off = 0,
+              .out_ptr = NULL, .out_dim = S, .in_dim = H,
               .group_size = cfg->group_size, .is_2bit = false },
             { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)sgg_w - base,
               .s_buf = ctx->buf_weights, .s_off = (uint8_t *)sgg_s - base,
@@ -263,20 +261,13 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     cpu_topk(s_gate_scores, n_experts, K, expert_indices, expert_weights);
     cpu_normalize_weights(expert_weights, K);
 
-    // 2. Shared expert SwiGLU + down projection
-    cpu_swiglu(s_shared_gate, s_shared_up, s_shared_act, S);
-    if (sd_w) fast_dequant_matvec(ctx, cfg, sd_w, sd_s, sd_b, s_shared_act, s_shared_out,
-                                   H, S, QUANT_4BIT);
-
-    float sw = cpu_sigmoid(s_shared_gate_score);
-    for (int i = 0; i < H; i++) s_shared_out[i] *= sw;
-
     // 3. Routed experts — GPU if expert Metal buffers available, else CPU
     id<MTLBuffer> expert_layer_buf = (ctx && ctx->buf_expert_layers)
                                       ? ctx->buf_expert_layers[layer_idx] : nil;
 
-    if (expert_layer_buf && ctx->buf_weights) {
-        // GPU expert forward: gate+up → SwiGLU → down all in ONE command buffer
+    if (expert_layer_buf && ctx->buf_weights && sd_w) {
+        // GPU expert+shared forward: all in ONE command buffer
+        // Shared gate/up already in GPU buffers from routing batch above
         memcpy([ctx->buf_input contents], h_post, H * sizeof(float));
 
         id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
@@ -285,12 +276,12 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
         int M = cfg->moe_intermediate;
         id<MTLComputePipelineState> mv_pipe = (quant == QUANT_2BIT)
                                                ? ctx->matvec_2bit : ctx->matvec_4bit;
+        uint8_t *wbase = (uint8_t *)[ctx->buf_weights contents];
 
-        // Phase 1: gate + up projections for all K experts
+        // Phase 1: gate + up projections for all K routed experts
         for (int k = 0; k < K; k++) {
             size_t expert_off = (size_t)expert_indices[k] * layout->expert_size;
 
-            // Gate projection
             [enc setComputePipelineState:mv_pipe];
             [enc setBuffer:expert_layer_buf offset:expert_off + layout->gate_w_off atIndex:0];
             [enc setBuffer:expert_layer_buf offset:expert_off + layout->gate_s_off atIndex:1];
@@ -308,7 +299,6 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
 
-            // Up projection
             [enc setComputePipelineState:mv_pipe];
             [enc setBuffer:expert_layer_buf offset:expert_off + layout->up_w_off atIndex:0];
             [enc setBuffer:expert_layer_buf offset:expert_off + layout->up_s_off atIndex:1];
@@ -325,7 +315,7 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                 threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
         }
 
-        // Phase 2: SwiGLU activation on GPU for all K experts
+        // Phase 2: SwiGLU for all K experts + shared expert
         for (int k = 0; k < K; k++) {
             [enc setComputePipelineState:ctx->swiglu];
             [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:0];
@@ -337,8 +327,20 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
             [enc dispatchThreadgroups:MTLSizeMake(swi_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
+        // Shared expert SwiGLU
+        {
+            [enc setComputePipelineState:ctx->swiglu];
+            [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_shared_up offset:0 atIndex:1];
+            [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:2];
+            uint dim_val = (uint)S;
+            [enc setBytes:&dim_val length:sizeof(uint) atIndex:3];
+            NSUInteger swi_tgs = ((uint)S + 255) / 256;
+            [enc dispatchThreadgroups:MTLSizeMake(swi_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
 
-        // Phase 3: down projections for all K experts
+        // Phase 3: down projections for all K experts + shared expert
         for (int k = 0; k < K; k++) {
             size_t expert_off = (size_t)expert_indices[k] * layout->expert_size;
 
@@ -359,18 +361,50 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
         }
+        // Shared expert down
+        {
+            [enc setComputePipelineState:ctx->matvec_4bit];
+            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)sd_w - wbase atIndex:0];
+            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)sd_s - wbase atIndex:1];
+            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)sd_b - wbase atIndex:2];
+            [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:3];
+            [enc setBuffer:ctx->buf_shared_out offset:0 atIndex:4];
+            {
+                uint od = (uint)H, id_ = (uint)S, gs = (uint)cfg->group_size;
+                [enc setBytes:&od length:sizeof(uint) atIndex:5];
+                [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+                [enc setBytes:&gs length:sizeof(uint) atIndex:7];
+            }
+            NSUInteger tg_size = ROWS_PER_TG * 32;
+            NSUInteger num_tgs = ((uint)H + ROWS_PER_TG - 1) / ROWS_PER_TG;
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        }
 
         [enc endEncoding];
         [cmd commit];
         [cmd waitUntilCompleted];
 
-        // Read back results
+        // Read back expert results
         for (int k = 0; k < K; k++) {
             memcpy(s_expert_out[k], [ctx->buf_multi_expert_out[k] contents],
                    H * sizeof(float));
         }
+        memcpy(s_shared_out, [ctx->buf_shared_out contents], H * sizeof(float));
+
+        // Apply shared expert gate
+        float sw = cpu_sigmoid(s_shared_gate_score);
+        for (int i = 0; i < H; i++) s_shared_out[i] *= sw;
     } else {
-        // CPU fallback
+        // CPU fallback: shared expert
+        if (sg_w) cpu_dequant_matvec((void *)sg_w, sg_s, sg_b, h_post, s_shared_gate, S, H, cfg->group_size);
+        if (su_w) cpu_dequant_matvec((void *)su_w, su_s, su_b, h_post, s_shared_up, S, H, cfg->group_size);
+        cpu_swiglu(s_shared_gate, s_shared_up, s_shared_act, S);
+        if (sd_w) cpu_dequant_matvec((void *)sd_w, sd_s, sd_b, s_shared_act, s_shared_out, H, S, cfg->group_size);
+        float sw = cpu_sigmoid(s_shared_gate_score);
+        for (int i = 0; i < H; i++) s_shared_out[i] *= sw;
+
+        // CPU fallback: routed experts
         for (int k = 0; k < K; k++) {
             const void *expert_base = (const uint8_t *)layer_data +
                 (size_t)expert_indices[k] * layout->expert_size;
