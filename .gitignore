@@ -7,12 +7,12 @@ src/*.metallib
 *.dSYM/
 
 # Experiment state (not committed — each session appends)
-results.tsv
-status.md
-logs/
+experiments/*/results.tsv
+experiments/*/status.md
+experiments/*/logs/
+experiments/*/errors.log
+experiments/*/bench_err.txt
 *.log
-bench_err.txt
-run.log
 
 # Model weights (too large for git)
 model_weights.bin
@@ -31,6 +31,10 @@ __pycache__/
 *.pyc
 .venv/
 uv.lock
+
+# Agent scratch files
+diag*.txt
+adaptive_memory_plan.md
 
 # macOS
 .DS_Store

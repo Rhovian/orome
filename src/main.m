@@ -24,6 +24,11 @@ static void print_usage(const char *prog) {
         "  --tokens N        Max tokens to generate (default: 20)\n"
         "  --k N             Active experts per layer (default: from config)\n"
         "  --2bit            Use 2-bit quantized experts\n"
+        "  --thermal-k N     Reduce K to N when thermal throttling engages\n"
+        "  --thermal-proj-ms F  Engage thermal-K when step EMA exceeds F ms\n"
+        "  --thermal-gen N   Minimum tokens before thermal-K can engage\n"
+        "  --hot-mask PATH   JSON hot expert mask for tiered quantization\n"
+        "  --profile-experts Emit routed expert IDs to stderr\n"
         "  --serve PORT      Run HTTP/SSE server on PORT\n"
         "  --timing          Print per-token timing\n"
         "  --help            Show this help\n",
@@ -39,12 +44,22 @@ int main(int argc, char **argv) {
         int use_2bit = 0;
         int serve_port = 0;
         int timing = 0;
+        int thermal_k = 0;
+        double thermal_proj_ms = 85.0;
+        int thermal_gen = 16;
+        const char *hot_mask_path = NULL;
+        int profile_experts = 0;
         static struct option long_options[] = {
             {"model",   required_argument, 0, 'm'},
             {"prompt",  required_argument, 0, 'p'},
             {"tokens",  required_argument, 0, 't'},
             {"k",       required_argument, 0, 'k'},
             {"2bit",    no_argument,       0, '2'},
+            {"thermal-k", required_argument, 0, 'K'},
+            {"thermal-proj-ms", required_argument, 0, 'P'},
+            {"thermal-gen", required_argument, 0, 'G'},
+            {"hot-mask", required_argument, 0, 'H'},
+            {"profile-experts", no_argument, 0, 'E'},
             {"serve",   required_argument, 0, 'S'},
             {"timing",  no_argument,       0, 'T'},
             {"help",    no_argument,       0, 'h'},
@@ -52,13 +67,18 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:p:t:k:2S:Th", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:p:t:k:2K:P:G:H:ES:Th", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_dir = optarg; break;
                 case 'p': prompt_text = optarg; break;
                 case 't': max_tokens = atoi(optarg); break;
                 case 'k': active_k = atoi(optarg); break;
                 case '2': use_2bit = 1; break;
+                case 'K': thermal_k = atoi(optarg); break;
+                case 'P': thermal_proj_ms = atof(optarg); break;
+                case 'G': thermal_gen = atoi(optarg); break;
+                case 'H': hot_mask_path = optarg; break;
+                case 'E': profile_experts = 1; break;
                 case 'S': serve_port = atoi(optarg); break;
                 case 'T': timing = 1; break;
 
@@ -120,7 +140,7 @@ int main(int argc, char **argv) {
         Vocabulary *vocab = vocab_load(vocab_path);
 
         // ---- Open expert files ----
-        ExpertFiles *ef = expert_files_open(&cfg, model_dir ? model_dir : ".", NULL);
+        ExpertFiles *ef = expert_files_open(&cfg, model_dir ? model_dir : ".", hot_mask_path);
 
         // ---- Wrap expert layer data as Metal buffers ----
         if (ctx) metal_set_expert_weights(ctx, ef, &cfg);
@@ -129,6 +149,15 @@ int main(int argc, char **argv) {
         QuantType quant = use_2bit ? QUANT_2BIT : QUANT_4BIT;
         Engine *eng = engine_create(&cfg, wf, ctx, ef, quant,
                                     active_k > 0 ? active_k : 0);
+        if (thermal_k > 0) {
+            eng->thermal.enabled = true;
+            eng->thermal.hot_k = thermal_k;
+            eng->thermal.proj_threshold_ms = thermal_proj_ms;
+            eng->thermal.min_gen = thermal_gen;
+            printf("[main] Thermal-K enabled: K→%d when proj EMA > %.0fms (after %d tokens)\n",
+                   thermal_k, thermal_proj_ms, thermal_gen);
+        }
+        if (profile_experts) moe_set_profile_experts(true);
 
         printf("[main] Engine ready: %s, %d layers, K=%d, %s\n",
                cfg.name, cfg.num_layers, eng->active_experts,

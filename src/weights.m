@@ -423,6 +423,12 @@ int model_config_load(ModelConfig *cfg, const char *model_dir) {
 
         memset(cfg, 0, sizeof(ModelConfig));
 
+        // HF multimodal configs nest text model params under "text_config"
+        NSDictionary *tc = json[@"text_config"];
+        if (tc && [tc isKindOfClass:[NSDictionary class]]) {
+            json = tc;
+        }
+
         // Map HF config fields to our config
         if (json[@"hidden_size"])
             cfg->hidden_dim = [json[@"hidden_size"] intValue];
@@ -458,7 +464,17 @@ int model_config_load(ModelConfig *cfg, const char *model_dir) {
         cfg->group_size = 64;
         cfg->conv_kernel_size = 4;
 
-        // Linear attention defaults (Qwen3.5 family)
+        // Linear attention — read from config, fall back to Qwen3.5-35B defaults
+        if (json[@"linear_num_value_heads"])
+            cfg->linear_num_v_heads = [json[@"linear_num_value_heads"] intValue];
+        if (json[@"linear_num_key_heads"])
+            cfg->linear_num_k_heads = [json[@"linear_num_key_heads"] intValue];
+        if (json[@"linear_key_head_dim"])
+            cfg->linear_key_dim = [json[@"linear_key_head_dim"] intValue];
+        if (json[@"linear_value_head_dim"])
+            cfg->linear_value_dim = [json[@"linear_value_head_dim"] intValue];
+        if (json[@"linear_conv_kernel_dim"])
+            cfg->conv_kernel_size = [json[@"linear_conv_kernel_dim"] intValue];
         if (cfg->linear_num_v_heads == 0) cfg->linear_num_v_heads = 32;
         if (cfg->linear_num_k_heads == 0) cfg->linear_num_k_heads = 16;
         if (cfg->linear_key_dim == 0) cfg->linear_key_dim = 128;

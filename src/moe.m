@@ -8,6 +8,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <dispatch/dispatch.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,9 +22,332 @@
 
 #define ROWS_PER_TG 16  // must match metal.m and shaders.metal
 
+static bool g_profile_experts = false;
+
+void moe_set_profile_experts(bool enabled) {
+    g_profile_experts = enabled;
+}
+
+bool moe_get_profile_experts(void) {
+    return g_profile_experts;
+}
+
+typedef struct {
+    int fd;
+    off_t offset;
+    size_t size;
+    void *dst;
+    ssize_t result;
+} ExpertReadTask;
+
+static void expert_pread_task(void *ctx) {
+    ExpertReadTask *task = (ExpertReadTask *)ctx;
+    task->result = pread(task->fd, task->dst, task->size, task->offset);
+}
+
 // ============================================================================
 // Expert file management — mmap all layers at startup
 // ============================================================================
+
+static int load_hot_mask_json(ExpertFiles *ef, const char *path,
+                              int num_layers, int num_experts) {
+    @autoreleasepool {
+        NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:path]];
+        if (!data) return -1;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if (!root) return -1;
+
+        int words_per_layer = (num_experts + 31) / 32;
+        ef->hot_mask = calloc(num_layers * words_per_layer, sizeof(uint32_t));
+        int total_hot = 0;
+        for (int layer = 0; layer < num_layers; layer++) {
+            NSString *key = [NSString stringWithFormat:@"%d", layer];
+            NSArray *experts = root[key];
+            if (!experts) continue;
+            for (NSNumber *eid in experts) {
+                int e = [eid intValue];
+                if (e >= 0 && e < num_experts) {
+                    ef->hot_mask[layer * words_per_layer + e / 32] |= (1U << (e % 32));
+                    total_hot++;
+                }
+            }
+        }
+        double avg_pct = (num_layers > 0 && num_experts > 0)
+            ? 100.0 * total_hot / (double)(num_layers * num_experts) : 0.0;
+        printf("[moe] Loaded %d hot experts from %s (%.0f%% per layer avg)\n",
+               total_hot, path, avg_pct);
+        return 0;
+    }
+}
+
+static bool expert_layer_uses_pread(const ExpertFiles *ef, int layer_idx) {
+    return ef && ef->pread_mode && ef->layer_data && ef->layer_fds
+        && !ef->layer_data[layer_idx] && ef->layer_fds[layer_idx] >= 0;
+}
+
+static void log_expert_route(int layer_idx, const int *expert_indices, int K) {
+    if (!g_profile_experts) return;
+    fprintf(stderr, "EXPERT_ROUTE layer=%d experts=", layer_idx);
+    for (int k = 0; k < K; k++) fprintf(stderr, "%s%d", k ? "," : "", expert_indices[k]);
+    fprintf(stderr, "\n");
+}
+
+static void cpu_dequant_matvec_quant(QuantType quant, const uint32_t *W,
+                                     const uint16_t *scales, const uint16_t *biases,
+                                     const float *x, float *out,
+                                     int out_dim, int in_dim, int group_size) {
+    if (quant == QUANT_2BIT) {
+        cpu_dequant_matvec_2bit(W, scales, biases, x, out, out_dim, in_dim, group_size);
+    } else {
+        cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
+    }
+}
+
+static void sync_hidden_buffer(MetalCtx *ctx, const float *hidden, int H) {
+    if (!ctx || !ctx->buf_moe_hidden) return;
+    memcpy([ctx->buf_moe_hidden contents], hidden, H * sizeof(float));
+}
+
+static void select_expert_source(const ExpertFiles *ef, const ModelConfig *cfg,
+                                 int layer_idx, int expert_id, QuantType quant,
+                                 int *fd_out, const ExpertLayout **layout_out,
+                                 bool *is_2bit_out) {
+    bool is_2bit = false;
+    if (ef->tiered_quant && ef->layer_fds_2bit && ef->layer_fds_2bit[layer_idx] >= 0) {
+        is_2bit = !expert_is_hot(ef, layer_idx, expert_id);
+    } else if (quant == QUANT_2BIT && ef->layer_fds_2bit
+               && ef->layer_fds_2bit[layer_idx] >= 0) {
+        is_2bit = true;
+    }
+
+    *is_2bit_out = is_2bit;
+    *layout_out = is_2bit ? &cfg->expert_2bit : &cfg->expert_4bit;
+    *fd_out = is_2bit ? ef->layer_fds_2bit[layer_idx] : ef->layer_fds[layer_idx];
+}
+
+static void expert_forward_direct(const ModelConfig *cfg, const ExpertLayout *layout,
+                                  const void *expert_base, const float *input,
+                                  float *output, float *gate_buf, float *up_buf,
+                                  float *act_buf, QuantType quant);
+
+static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
+                                          const ExpertFiles *ef, int layer_idx,
+                                          const int *expert_indices, int K,
+                                          QuantType quant, bool *expert_is_2bit) {
+    if (!ctx || !ctx->queue) return -1;
+
+    dispatch_group_t group = dispatch_group_create();
+    dispatch_queue_attr_t attr =
+        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT,
+                                                QOS_CLASS_USER_INITIATED, 0);
+    dispatch_queue_t queue = dispatch_queue_create("orome.expert-pread", attr);
+    ExpertReadTask tasks[OROME_MAX_ACTIVE];
+    memset(tasks, 0, sizeof(tasks));
+
+    for (int k = 0; k < K; k++) {
+        const ExpertLayout *elayout = NULL;
+        int fd = -1;
+        select_expert_source(ef, cfg, layer_idx, expert_indices[k], quant,
+                             &fd, &elayout, &expert_is_2bit[k]);
+        if (fd < 0 || !elayout || !ctx->buf_multi_expert_data[k]) {
+            fprintf(stderr, "ERROR: Missing expert source for layer %d expert %d\n",
+                    layer_idx, expert_indices[k]);
+            return -1;
+        }
+
+        tasks[k].fd = fd;
+        tasks[k].offset = (off_t)expert_indices[k] * elayout->expert_size;
+        tasks[k].size = elayout->expert_size;
+        tasks[k].dst = [ctx->buf_multi_expert_data[k] contents];
+        tasks[k].result = -1;
+    }
+
+    for (int k = 0; k < K; k++) {
+        dispatch_group_async_f(group, queue, &tasks[k], expert_pread_task);
+    }
+
+    dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
+    for (int k = 0; k < K; k++) {
+        if (tasks[k].result != (ssize_t)tasks[k].size) {
+            fprintf(stderr,
+                    "ERROR: pread failed for layer %d expert %d (%zd/%zu bytes)\n",
+                    layer_idx, expert_indices[k], tasks[k].result, tasks[k].size);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+static int pread_experts_cpu(const ModelConfig *cfg, const ExpertFiles *ef,
+                             int layer_idx, const int *expert_indices, int K,
+                             const float *h_post, QuantType quant,
+                             float **expert_out, float **expert_gate,
+                             float **expert_up, float **expert_act) {
+    size_t max_expert_size = cfg->expert_4bit.expert_size;
+    if (cfg->expert_2bit.expert_size > max_expert_size) {
+        max_expert_size = cfg->expert_2bit.expert_size;
+    }
+    uint8_t *scratch = malloc(max_expert_size);
+    if (!scratch) return -1;
+
+    for (int k = 0; k < K; k++) {
+        const ExpertLayout *elayout = NULL;
+        int fd = -1;
+        bool is_2bit = false;
+        select_expert_source(ef, cfg, layer_idx, expert_indices[k], quant,
+                             &fd, &elayout, &is_2bit);
+        if (fd < 0 || !elayout) {
+            fprintf(stderr, "ERROR: Missing expert source for layer %d expert %d\n",
+                    layer_idx, expert_indices[k]);
+            free(scratch);
+            return -1;
+        }
+
+        ssize_t got = pread(fd, scratch, elayout->expert_size,
+                            (off_t)expert_indices[k] * elayout->expert_size);
+        if (got != (ssize_t)elayout->expert_size) {
+            fprintf(stderr, "ERROR: pread failed for layer %d expert %d (%zd/%zu bytes)\n",
+                    layer_idx, expert_indices[k], got, elayout->expert_size);
+            free(scratch);
+            return -1;
+        }
+
+        expert_forward_direct(cfg, elayout, scratch, h_post,
+                              expert_out[k], expert_gate[k],
+                              expert_up[k], expert_act[k],
+                              is_2bit ? QUANT_2BIT : QUANT_4BIT);
+    }
+
+    free(scratch);
+    return 0;
+}
+
+static bool gpu_forward_pread_experts(MetalCtx *ctx, const ModelConfig *cfg,
+                                      uint32_t *sd_w, uint16_t *sd_s, uint16_t *sd_b,
+                                      int K, const bool *expert_is_2bit,
+                                      float **expert_out, float *shared_out) {
+    if (!ctx || !ctx->queue || !ctx->buf_weights || !sd_w || !sd_s || !sd_b) return false;
+
+    int H = cfg->hidden_dim;
+    int M = cfg->moe_intermediate;
+    int S = cfg->shared_intermediate;
+    uint8_t *wbase = (uint8_t *)[ctx->buf_weights contents];
+
+    id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    if (!cmd || !enc) return false;
+
+    for (int k = 0; k < K; k++) {
+        const ExpertLayout *elayout = expert_is_2bit[k] ? &cfg->expert_2bit : &cfg->expert_4bit;
+        id<MTLComputePipelineState> mv_pipe = expert_is_2bit[k] ? ctx->matvec_2bit : ctx->matvec_4bit;
+        if (!mv_pipe) return false;
+
+        [enc setComputePipelineState:mv_pipe];
+        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:elayout->gate_w_off atIndex:0];
+        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:elayout->gate_s_off atIndex:1];
+        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:elayout->gate_b_off atIndex:2];
+        [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
+        [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:4];
+        {
+            uint od = (uint)M, id_ = (uint)H, gs = (uint)cfg->group_size;
+            [enc setBytes:&od length:sizeof(uint) atIndex:5];
+            [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+            [enc setBytes:&gs length:sizeof(uint) atIndex:7];
+        }
+        NSUInteger tg_size = ROWS_PER_TG * 32;
+        NSUInteger num_tgs = ((uint)M + ROWS_PER_TG - 1) / ROWS_PER_TG;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+
+        [enc setComputePipelineState:mv_pipe];
+        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:elayout->up_w_off atIndex:0];
+        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:elayout->up_s_off atIndex:1];
+        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:elayout->up_b_off atIndex:2];
+        [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
+        [enc setBuffer:ctx->buf_multi_expert_up[k] offset:0 atIndex:4];
+        {
+            uint od = (uint)M, id_ = (uint)H, gs = (uint)cfg->group_size;
+            [enc setBytes:&od length:sizeof(uint) atIndex:5];
+            [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+            [enc setBytes:&gs length:sizeof(uint) atIndex:7];
+        }
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    }
+
+    for (int k = 0; k < K; k++) {
+        [enc setComputePipelineState:ctx->swiglu];
+        [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_multi_expert_up[k] offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_multi_expert_act[k] offset:0 atIndex:2];
+        uint dim_val = (uint)M;
+        [enc setBytes:&dim_val length:sizeof(uint) atIndex:3];
+        NSUInteger swi_tgs = ((uint)M + 255) / 256;
+        [enc dispatchThreadgroups:MTLSizeMake(swi_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
+
+    [enc setComputePipelineState:ctx->swiglu];
+    [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
+    [enc setBuffer:ctx->buf_shared_up offset:0 atIndex:1];
+    [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:2];
+    {
+        uint dim_val = (uint)S;
+        [enc setBytes:&dim_val length:sizeof(uint) atIndex:3];
+    }
+    [enc dispatchThreadgroups:MTLSizeMake(((uint)S + 255) / 256, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    for (int k = 0; k < K; k++) {
+        const ExpertLayout *elayout = expert_is_2bit[k] ? &cfg->expert_2bit : &cfg->expert_4bit;
+        id<MTLComputePipelineState> mv_pipe = expert_is_2bit[k] ? ctx->matvec_2bit : ctx->matvec_4bit;
+        if (!mv_pipe) return false;
+
+        [enc setComputePipelineState:mv_pipe];
+        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:elayout->down_w_off atIndex:0];
+        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:elayout->down_s_off atIndex:1];
+        [enc setBuffer:ctx->buf_multi_expert_data[k] offset:elayout->down_b_off atIndex:2];
+        [enc setBuffer:ctx->buf_multi_expert_act[k] offset:0 atIndex:3];
+        [enc setBuffer:ctx->buf_multi_expert_out[k] offset:0 atIndex:4];
+        {
+            uint od = (uint)H, id_ = (uint)M, gs = (uint)cfg->group_size;
+            [enc setBytes:&od length:sizeof(uint) atIndex:5];
+            [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+            [enc setBytes:&gs length:sizeof(uint) atIndex:7];
+        }
+        NSUInteger tg_size = ROWS_PER_TG * 32;
+        NSUInteger num_tgs = ((uint)H + ROWS_PER_TG - 1) / ROWS_PER_TG;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    }
+
+    [enc setComputePipelineState:ctx->matvec_4bit];
+    [enc setBuffer:ctx->buf_weights offset:(uint8_t *)sd_w - wbase atIndex:0];
+    [enc setBuffer:ctx->buf_weights offset:(uint8_t *)sd_s - wbase atIndex:1];
+    [enc setBuffer:ctx->buf_weights offset:(uint8_t *)sd_b - wbase atIndex:2];
+    [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:3];
+    [enc setBuffer:ctx->buf_shared_out offset:0 atIndex:4];
+    {
+        uint od = (uint)H, id_ = (uint)S, gs = (uint)cfg->group_size;
+        [enc setBytes:&od length:sizeof(uint) atIndex:5];
+        [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+        [enc setBytes:&gs length:sizeof(uint) atIndex:7];
+    }
+    [enc dispatchThreadgroups:MTLSizeMake(((uint)H + ROWS_PER_TG - 1) / ROWS_PER_TG, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(ROWS_PER_TG * 32, 1, 1)];
+
+    [enc endEncoding];
+    [cmd commit];
+    [cmd waitUntilCompleted];
+
+    for (int k = 0; k < K; k++) {
+        memcpy(expert_out[k], [ctx->buf_multi_expert_out[k] contents], H * sizeof(float));
+    }
+    memcpy(shared_out, [ctx->buf_shared_out contents], H * sizeof(float));
+
+    return true;
+}
 
 ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
                                const char *hot_mask_path) {
@@ -31,6 +355,18 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
     ef->layer_data = calloc(cfg->num_layers, sizeof(void *));
     ef->layer_size = calloc(cfg->num_layers, sizeof(size_t));
     ef->layer_fds  = calloc(cfg->num_layers, sizeof(int));
+    ef->num_experts = cfg->num_experts;
+    ef->num_layers = cfg->num_layers;
+
+    uint64_t total_ram = [NSProcessInfo processInfo].physicalMemory;
+    size_t budget = (size_t)(total_ram * 0.8);
+    size_t total_expert = (size_t)cfg->num_layers * cfg->num_experts
+        * cfg->expert_4bit.expert_size;
+    bool use_pread = (total_expert > budget);
+    ef->pread_mode = use_pread;
+    printf("[moe] Memory budget: %.1f GB (0.8 × %.1f GB), expert footprint: %.1f GB → %s\n",
+           budget / 1e9, total_ram / 1e9, total_expert / 1e9,
+           use_pread ? "pread" : "mlock");
 
     size_t total_mmaped = 0;
     int opened = 0;
@@ -46,12 +382,24 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
         if (fd < 0) continue;
 
         struct stat st;
-        fstat(fd, &st);
+        if (fstat(fd, &st) != 0) {
+            close(fd);
+            continue;
+        }
         size_t size = st.st_size;
+        ef->layer_size[i] = size;
+
+        if (use_pread) {
+            ef->layer_data[i] = NULL;
+            ef->layer_fds[i] = fd;
+            opened++;
+            continue;
+        }
 
         void *data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
         if (data == MAP_FAILED) {
             close(fd);
+            ef->layer_size[i] = 0;
             continue;
         }
 
@@ -66,14 +414,37 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
         opened++;
     }
 
-    ef->all_mmaped = (opened == cfg->num_layers);
-    printf("[moe] mmap'd %d/%d layers (%.1f GB total)\n",
-           opened, cfg->num_layers, total_mmaped / 1e9);
+    ef->all_mmaped = !use_pread && (opened == cfg->num_layers);
+    if (use_pread) {
+        ef->all_mmaped = false;
+        printf("[moe] pread-opened %d/%d layers\n", opened, cfg->num_layers);
+    } else {
+        printf("[moe] mmap'd %d/%d layers (%.1f GB total)\n",
+               opened, cfg->num_layers, total_mmaped / 1e9);
+    }
 
     if (hot_mask_path) {
-        int words_per_layer = (cfg->num_experts + 31) / 32;
-        ef->hot_mask = calloc(cfg->num_layers * words_per_layer, sizeof(uint32_t));
-        ef->tiered_quant = true;
+        if (load_hot_mask_json(ef, hot_mask_path, cfg->num_layers, cfg->num_experts) == 0) {
+            ef->tiered_quant = true;
+            ef->layer_fds_2bit = calloc(cfg->num_layers, sizeof(int));
+            int opened_2bit = 0;
+            for (int i = 0; i < cfg->num_layers; i++) {
+                ef->layer_fds_2bit[i] = -1;
+                char path2[512];
+                snprintf(path2, sizeof(path2), "%s/packed_experts_2bit/layer_%02d.bin",
+                         model_dir ? model_dir : ".", i);
+                ef->layer_fds_2bit[i] = open(path2, O_RDONLY);
+                if (ef->layer_fds_2bit[i] >= 0) opened_2bit++;
+            }
+            printf("[moe] Tiered quant: %d/%d 2-bit layers available\n",
+                   opened_2bit, cfg->num_layers);
+            if (opened_2bit == 0) {
+                fprintf(stderr, "WARNING: No 2-bit expert files found, disabling tiered quant\n");
+                ef->tiered_quant = false;
+            }
+        } else {
+            fprintf(stderr, "WARNING: Failed to load hot mask from %s\n", hot_mask_path);
+        }
     }
 
     return ef;
@@ -81,20 +452,23 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
 
 void expert_files_close(ExpertFiles *ef, const ModelConfig *cfg) {
     if (!ef) return;
-    for (int i = 0; i < cfg->num_layers; i++) {
-        if (ef->layer_data[i]) munmap(ef->layer_data[i], ef->layer_size[i]);
+    int num_layers = ef->num_layers > 0 ? ef->num_layers : (cfg ? cfg->num_layers : 0);
+    for (int i = 0; i < num_layers; i++) {
+        if (!ef->pread_mode && ef->layer_data[i]) munmap(ef->layer_data[i], ef->layer_size[i]);
         if (ef->layer_fds[i] >= 0) close(ef->layer_fds[i]);
+        if (ef->layer_fds_2bit && ef->layer_fds_2bit[i] >= 0) close(ef->layer_fds_2bit[i]);
     }
     free(ef->layer_data);
     free(ef->layer_size);
     free(ef->layer_fds);
+    free(ef->layer_fds_2bit);
     free(ef->hot_mask);
     free(ef);
 }
 
 bool expert_is_hot(const ExpertFiles *ef, int layer, int expert_id) {
     if (!ef->hot_mask) return true;
-    int words_per_layer = 8;
+    int words_per_layer = (ef->num_experts + 31) / 32;
     int word = expert_id / 32;
     int bit = expert_id % 32;
     return (ef->hot_mask[layer * words_per_layer + word] >> bit) & 1;
@@ -107,25 +481,28 @@ bool expert_is_hot(const ExpertFiles *ef, int layer, int expert_id) {
 static void expert_forward_direct(const ModelConfig *cfg, const ExpertLayout *layout,
                                   const void *expert_base, const float *input,
                                   float *output, float *gate_buf, float *up_buf,
-                                  float *act_buf) {
+                                  float *act_buf, QuantType quant) {
     int H = cfg->hidden_dim;
     int M = cfg->moe_intermediate;
     int G = cfg->group_size;
 
     const uint8_t *data = expert_base;
-    cpu_dequant_matvec((const uint32_t *)(data + layout->gate_w_off),
-                       (const uint16_t *)(data + layout->gate_s_off),
-                       (const uint16_t *)(data + layout->gate_b_off),
-                       input, gate_buf, M, H, G);
-    cpu_dequant_matvec((const uint32_t *)(data + layout->up_w_off),
-                       (const uint16_t *)(data + layout->up_s_off),
-                       (const uint16_t *)(data + layout->up_b_off),
-                       input, up_buf, M, H, G);
+    cpu_dequant_matvec_quant(quant,
+                             (const uint32_t *)(data + layout->gate_w_off),
+                             (const uint16_t *)(data + layout->gate_s_off),
+                             (const uint16_t *)(data + layout->gate_b_off),
+                             input, gate_buf, M, H, G);
+    cpu_dequant_matvec_quant(quant,
+                             (const uint32_t *)(data + layout->up_w_off),
+                             (const uint16_t *)(data + layout->up_s_off),
+                             (const uint16_t *)(data + layout->up_b_off),
+                             input, up_buf, M, H, G);
     cpu_swiglu(gate_buf, up_buf, act_buf, M);
-    cpu_dequant_matvec((const uint32_t *)(data + layout->down_w_off),
-                       (const uint16_t *)(data + layout->down_s_off),
-                       (const uint16_t *)(data + layout->down_b_off),
-                       act_buf, output, H, M, G);
+    cpu_dequant_matvec_quant(quant,
+                             (const uint32_t *)(data + layout->down_w_off),
+                             (const uint16_t *)(data + layout->down_s_off),
+                             (const uint16_t *)(data + layout->down_b_off),
+                             act_buf, output, H, M, G);
 }
 
 // ============================================================================
@@ -183,7 +560,8 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     int H = cfg->hidden_dim;
     int n_experts = cfg->num_experts;
     void *layer_data = ef->layer_data[layer_idx];
-    if (!layer_data || K <= 0) return;
+    bool use_pread = expert_layer_uses_pread(ef, layer_idx);
+    if ((!layer_data && !use_pread) || K <= 0) return;
 
     const ExpertLayout *layout = (quant == QUANT_2BIT) ? &cfg->expert_2bit : &cfg->expert_4bit;
     ensure_scratch(cfg);
@@ -212,6 +590,7 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
 
     int S = cfg->shared_intermediate;
     memset(s_shared_out, 0, H * sizeof(float));
+    bool shared_gpu_ready = false;
 
     // Batch: routing gate + shared gate_proj + shared up_proj + shared_expert_gate
     // All use h_post as input. 4 dispatches → 1 GPU command buffer.
@@ -247,6 +626,7 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
               .group_size = cfg->group_size, .is_2bit = false },
         };
         gpu_run_matvec_batch(ctx, jobs, 4);
+        shared_gpu_ready = true;
     } else {
         fast_dequant_matvec(ctx, cfg, gate_w, gate_s, gate_b, h_post, s_gate_scores,
                             n_experts, H, QUANT_4BIT);
@@ -261,12 +641,54 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     cpu_softmax(s_gate_scores, n_experts);
     cpu_topk(s_gate_scores, n_experts, K, expert_indices, expert_weights);
     cpu_normalize_weights(expert_weights, K);
+    log_expert_route(layer_idx, expert_indices, K);
 
     // 3. Routed experts — GPU if expert Metal buffers available, else CPU
     id<MTLBuffer> expert_layer_buf = (ctx && ctx->buf_expert_layers)
                                       ? ctx->buf_expert_layers[layer_idx] : nil;
 
-    if (expert_layer_buf && ctx->buf_weights && sd_w) {
+    if (use_pread) {
+        bool ran_gpu = false;
+        bool expert_is_2bit[OROME_MAX_ACTIVE] = {false};
+
+        if (ctx && ctx->buf_input && ctx->buf_weights && ctx->buf_shared_gate
+            && ctx->buf_shared_up && ctx->buf_shared_act && ctx->buf_shared_out && sd_w) {
+            memcpy([ctx->buf_input contents], h_post, H * sizeof(float));
+            if (!shared_gpu_ready) {
+                memcpy([ctx->buf_shared_gate contents], s_shared_gate, S * sizeof(float));
+                memcpy([ctx->buf_shared_up contents], s_shared_up, S * sizeof(float));
+            }
+            if (pread_experts_into_gpu_buffers(ctx, cfg, ef, layer_idx,
+                                               expert_indices, K, quant,
+                                               expert_is_2bit) == 0) {
+                ran_gpu = gpu_forward_pread_experts(ctx, cfg, sd_w, sd_s, sd_b,
+                                                    K, expert_is_2bit,
+                                                    s_expert_out, s_shared_out);
+            }
+            if (ran_gpu) {
+                float sw = cpu_sigmoid(s_shared_gate_score);
+                for (int i = 0; i < H; i++) s_shared_out[i] *= sw;
+            }
+        }
+
+        if (!ran_gpu) {
+            if (sg_w) cpu_dequant_matvec((void *)sg_w, sg_s, sg_b, h_post,
+                                         s_shared_gate, S, H, cfg->group_size);
+            if (su_w) cpu_dequant_matvec((void *)su_w, su_s, su_b, h_post,
+                                         s_shared_up, S, H, cfg->group_size);
+            cpu_swiglu(s_shared_gate, s_shared_up, s_shared_act, S);
+            if (sd_w) cpu_dequant_matvec((void *)sd_w, sd_s, sd_b, s_shared_act,
+                                         s_shared_out, H, S, cfg->group_size);
+            float sw = cpu_sigmoid(s_shared_gate_score);
+            for (int i = 0; i < H; i++) s_shared_out[i] *= sw;
+
+            if (pread_experts_cpu(cfg, ef, layer_idx, expert_indices, K, h_post, quant,
+                                  s_expert_out, s_expert_gate,
+                                  s_expert_up, s_expert_act) != 0) {
+                return;
+            }
+        }
+    } else if (expert_layer_buf && ctx->buf_weights && sd_w) {
         // GPU expert+shared forward: all in ONE command buffer
         // Shared gate/up already in GPU buffers from routing batch above
         memcpy([ctx->buf_input contents], h_post, H * sizeof(float));
@@ -411,7 +833,7 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                 (size_t)expert_indices[k] * layout->expert_size;
             expert_forward_direct(cfg, layout, expert_base, h_post,
                                   s_expert_out[k], s_expert_gate[k],
-                                  s_expert_up[k], s_expert_act[k]);
+                                  s_expert_up[k], s_expert_act[k], quant);
         }
     }
 
@@ -420,6 +842,18 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
         cpu_vec_madd(hidden, s_expert_out[k], expert_weights[k], H);
     }
     cpu_vec_add(hidden, s_shared_out, H);
+    if (use_pread) sync_hidden_buffer(ctx, hidden, H);
+
+    // Debug: NaN check after MoE combine
+    if (g_profile_experts) {
+        int nans = 0;
+        for (int i = 0; i < H; i++) {
+            if (hidden[i] != hidden[i]) nans++;  // NaN != NaN
+        }
+        if (nans > 0) {
+            fprintf(stderr, "NAN_CHECK moe_forward layer=%d nans=%d/%d\n", layer_idx, nans, H);
+        }
+    }
 }
 
 // ============================================================================
@@ -436,7 +870,8 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     int H = cfg->hidden_dim;
     int n_experts = cfg->num_experts;
     void *layer_data = ef->layer_data[layer_idx];
-    if (!layer_data || K <= 0) return;
+    bool use_pread = expert_layer_uses_pread(ef, layer_idx);
+    if ((!layer_data && !use_pread) || K <= 0) return;
 
     const ExpertLayout *layout = (quant == QUANT_2BIT) ? &cfg->expert_2bit : &cfg->expert_4bit;
     ensure_scratch(cfg);
@@ -448,6 +883,7 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     cpu_softmax(gate_scores, n_experts);
     cpu_topk(gate_scores, n_experts, K, expert_indices, expert_weights);
     cpu_normalize_weights(expert_weights, K);
+    log_expert_route(layer_idx, expert_indices, K);
 
     // 2. Shared expert down weights
     uint32_t *sd_w = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.down_proj.weight");
@@ -455,6 +891,7 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     uint16_t *sd_b = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.down_proj.biases");
     int S = cfg->shared_intermediate;
     memset(s_shared_out, 0, H * sizeof(float));
+    if (use_pread) gpu_combine = false;
 
     // 3. Routed experts + shared expert — GPU path
     // h_post is already in ctx->buf_input from fused command buffer
@@ -462,7 +899,63 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     id<MTLBuffer> expert_layer_buf = (ctx && ctx->buf_expert_layers)
                                       ? ctx->buf_expert_layers[layer_idx] : nil;
 
-    if (expert_layer_buf && ctx->buf_weights && sd_w &&
+    if (use_pread) {
+        bool ran_gpu = false;
+        bool expert_is_2bit[OROME_MAX_ACTIVE] = {false};
+
+        // h_post (eng->h_post) is stale in the GPU fused path — buf_input has the
+        // correct post-norm data from the fused GPU command buffer. Read it back
+        // so the CPU fallback path also uses correct data.
+        if (ctx && ctx->buf_input) {
+            memcpy(h_post, [ctx->buf_input contents], H * sizeof(float));
+        }
+
+        if (ctx && ctx->buf_input && ctx->buf_weights && ctx->buf_shared_gate
+            && ctx->buf_shared_up && ctx->buf_shared_act && ctx->buf_shared_out && sd_w) {
+            // buf_input already has correct h_post from fused GPU command buffer — don't overwrite
+            if (pread_experts_into_gpu_buffers(ctx, cfg, ef, layer_idx,
+                                               expert_indices, K, quant,
+                                               expert_is_2bit) == 0) {
+                ran_gpu = gpu_forward_pread_experts(ctx, cfg, sd_w, sd_s, sd_b,
+                                                    K, expert_is_2bit,
+                                                    s_expert_out, s_shared_out);
+            }
+            if (ran_gpu) {
+                float sw = cpu_sigmoid(shared_gate_score);
+                for (int i = 0; i < H; i++) s_shared_out[i] *= sw;
+            }
+        }
+
+        if (!ran_gpu) {
+            uint32_t *sg_w = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.gate_proj.weight");
+            uint16_t *sg_s = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.gate_proj.scales");
+            uint16_t *sg_b = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.gate_proj.biases");
+            uint32_t *su_w = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.up_proj.weight");
+            uint16_t *su_s = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.up_proj.scales");
+            uint16_t *su_b = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.up_proj.biases");
+            if (sg_w) cpu_dequant_matvec((void *)sg_w, sg_s, sg_b, h_post,
+                                         s_shared_gate, S, H, cfg->group_size);
+            if (su_w) cpu_dequant_matvec((void *)su_w, su_s, su_b, h_post,
+                                         s_shared_up, S, H, cfg->group_size);
+            cpu_swiglu(s_shared_gate, s_shared_up, s_shared_act, S);
+            if (sd_w) cpu_dequant_matvec((void *)sd_w, sd_s, sd_b, s_shared_act,
+                                         s_shared_out, H, S, cfg->group_size);
+            float sw = cpu_sigmoid(shared_gate_score);
+            for (int i = 0; i < H; i++) s_shared_out[i] *= sw;
+
+            if (pread_experts_cpu(cfg, ef, layer_idx, expert_indices, K, h_post, quant,
+                                  s_expert_out, s_expert_gate,
+                                  s_expert_up, s_expert_act) != 0) {
+                return;
+            }
+        }
+
+        for (int k = 0; k < K; k++) {
+            cpu_vec_madd(hidden, s_expert_out[k], expert_weights[k], H);
+        }
+        cpu_vec_add(hidden, s_shared_out, H);
+        sync_hidden_buffer(ctx, hidden, H);
+    } else if (expert_layer_buf && ctx->buf_weights && sd_w &&
         ctx->batch_expert_mv && ctx->batch_expert_down) {
         // buf_input already has h_post — no memcpy needed
         id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
@@ -608,7 +1101,8 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
 
             // Read back expert results
             for (int k = 0; k < K; k++) {
-                memcpy(s_expert_out[k], [ctx->buf_multi_expert_out[k] contents],
+                memcpy(s_expert_out[k],
+                       (uint8_t *)[ctx->buf_batch_expert_out contents] + (size_t)k * H * sizeof(float),
                        H * sizeof(float));
             }
             memcpy(s_shared_out, [ctx->buf_shared_out contents], H * sizeof(float));
@@ -622,6 +1116,7 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                 cpu_vec_madd(hidden, s_expert_out[k], expert_weights[k], H);
             }
             cpu_vec_add(hidden, s_shared_out, H);
+            sync_hidden_buffer(ctx, hidden, H);
         }
     } else {
         // CPU fallback
@@ -643,7 +1138,7 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                 (size_t)expert_indices[k] * layout->expert_size;
             expert_forward_direct(cfg, layout, expert_base, h_post,
                                   s_expert_out[k], s_expert_gate[k],
-                                  s_expert_up[k], s_expert_act[k]);
+                                  s_expert_up[k], s_expert_act[k], quant);
         }
 
         // CPU combine
@@ -651,5 +1146,17 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
             cpu_vec_madd(hidden, s_expert_out[k], expert_weights[k], H);
         }
         cpu_vec_add(hidden, s_shared_out, H);
+        sync_hidden_buffer(ctx, hidden, H);
+    }
+
+    // Debug: NaN check after MoE combine
+    if (g_profile_experts) {
+        int nans = 0;
+        for (int i = 0; i < H; i++) {
+            if (hidden[i] != hidden[i]) nans++;
+        }
+        if (nans > 0) {
+            fprintf(stderr, "NAN_CHECK moe_forward_routed layer=%d nans=%d/%d\n", layer_idx, nans, H);
+        }
     }
 }

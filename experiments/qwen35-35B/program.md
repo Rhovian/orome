@@ -128,8 +128,9 @@ Each experiment:
    - If tok/s improved: **keep** the change. `git add -A && git commit -m "description"`.
    - If tok/s same or worse: **discard**. `git checkout -- src/ include/ Makefile`.
    - If crash: log as crash, discard, move on.
-7. **Update `status.md`** with current state and next ideas.
-8. **Continue** to the next experiment.
+7. **Cross-model check** (after keep only): Run a quick smoke test on the other model to verify no regression. If the 397B model weights are available, run `./orome --model /Users/j/models/Qwen3.5-397B-A17B --prompt "Hello" --tokens 5 --k 10` and verify it doesn't crash. If it regresses, revert and try a different approach.
+8. **Update `status.md`** with current state and next ideas.
+9. **Continue** to the next experiment.
 
 ## Results Format
 

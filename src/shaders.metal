@@ -39,10 +39,10 @@ kernel void dequant_matvec_4bit_v3(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup half x_shared[4096];
+    threadgroup float x_shared[4096];
 
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
+        x_shared[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -62,14 +62,14 @@ kernel void dequant_matvec_4bit_v3(
         uint32_t packed = w_row[col];
         uint x_base = col * 8;
 
-        float x0 = float(x_shared[x_base + 0]);
-        float x1 = float(x_shared[x_base + 1]);
-        float x2 = float(x_shared[x_base + 2]);
-        float x3 = float(x_shared[x_base + 3]);
-        float x4 = float(x_shared[x_base + 4]);
-        float x5 = float(x_shared[x_base + 5]);
-        float x6 = float(x_shared[x_base + 6]);
-        float x7 = float(x_shared[x_base + 7]);
+        float x0 = x_shared[x_base + 0];
+        float x1 = x_shared[x_base + 1];
+        float x2 = x_shared[x_base + 2];
+        float x3 = x_shared[x_base + 3];
+        float x4 = x_shared[x_base + 4];
+        float x5 = x_shared[x_base + 5];
+        float x6 = x_shared[x_base + 6];
+        float x7 = x_shared[x_base + 7];
 
         float sx0 = scale * x0;  float bx0 = bias * x0;
         float sx1 = scale * x1;  float bx1 = bias * x1;
@@ -124,9 +124,9 @@ kernel void dequant_matvec_4bit_2row(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup half x_shared[4096];
+    threadgroup float x_shared[4096];
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
+        x_shared[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -148,14 +148,14 @@ kernel void dequant_matvec_4bit_2row(
         uint g = col / (group_size / 8);
         uint x_base = col * 8;
 
-        float x0 = float(x_shared[x_base + 0]);
-        float x1 = float(x_shared[x_base + 1]);
-        float x2 = float(x_shared[x_base + 2]);
-        float x3 = float(x_shared[x_base + 3]);
-        float x4 = float(x_shared[x_base + 4]);
-        float x5 = float(x_shared[x_base + 5]);
-        float x6 = float(x_shared[x_base + 6]);
-        float x7 = float(x_shared[x_base + 7]);
+        float x0 = x_shared[x_base + 0];
+        float x1 = x_shared[x_base + 1];
+        float x2 = x_shared[x_base + 2];
+        float x3 = x_shared[x_base + 3];
+        float x4 = x_shared[x_base + 4];
+        float x5 = x_shared[x_base + 5];
+        float x6 = x_shared[x_base + 6];
+        float x7 = x_shared[x_base + 7];
 
         // Row 0
         float scale0 = bf16_to_f32(s_row0[g]);
@@ -225,9 +225,9 @@ kernel void batch_expert_matvec_4bit(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup half x_shared[4096];
+    threadgroup float x_shared[4096];
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
+        x_shared[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -298,10 +298,10 @@ kernel void batch_expert_down_4bit(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup half x_shared[4096];
+    threadgroup float x_shared[4096];
     device const float* x_expert = x + expert * in_dim;
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x_expert[i]);
+        x_shared[i] = x_expert[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -383,10 +383,10 @@ kernel void dequant_matvec_2bit(
     uint packed_cols = in_dim / 16;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup half x_shared[4096];
+    threadgroup float x_shared[4096];
 
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
+        x_shared[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -776,7 +776,7 @@ kernel void sigmoid_gate(
 // k-head sharing: 4 v-heads share 1 k-head (64 v-heads / 16 k-heads).
 
 kernel void gated_delta_net_step(
-    device half *state,              // [64 * 128 * 128] persistent state (half precision)
+    device float *state,             // [n_v_heads * 128 * 128] persistent state (float32)
     device const float *q,           // [2048] (16 k-heads * 128)
     device const float *k,           // [2048] (16 k-heads * 128)
     device const float *v,           // [8192] (64 v-heads * 128)
@@ -805,11 +805,10 @@ kernel void gated_delta_net_step(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Step 1+2: Decay state row and compute kv_mem = dot(S[vi][:], k[:])
-    // Read half → float for compute, write back as half (halves bandwidth)
     float kv_mem = 0.0f;
     for (uint ki = 0; ki < 128; ki++) {
-        float s = float(state[state_base + ki]) * g;
-        state[state_base + ki] = half(s);
+        float s = state[state_base + ki] * g;
+        state[state_base + ki] = s;
         kv_mem += s * k_shared[ki];
     }
 
@@ -817,8 +816,8 @@ kernel void gated_delta_net_step(
     float delta = (v[v_base + vi] - kv_mem) * beta;
     float out_val = 0.0f;
     for (uint ki = 0; ki < 128; ki++) {
-        float s = float(state[state_base + ki]) + k_shared[ki] * delta;
-        state[state_base + ki] = half(s);
+        float s = state[state_base + ki] + k_shared[ki] * delta;
+        state[state_base + ki] = s;
         out_val += s * q_shared[ki];
     }
     output[v_base + vi] = out_val;
@@ -894,7 +893,7 @@ kernel void rms_norm_qk(
 ) {
     uint base = head * key_dim;
 
-    // RMS norm for q — simd reduction instead of serial
+    // RMS norm for q — simd reduction with broadcast
     float qval = (tid < key_dim) ? q[base + tid] : 0;
     float q_sq = qval * qval;
     float q_simd = simd_sum(q_sq);
@@ -902,14 +901,19 @@ kernel void rms_norm_qk(
     if (simd_lane == 0) q_shared[simd_group] = q_simd;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float q_total = 0;
-    if (tid < 4) q_total = q_shared[tid];
-    q_total = simd_sum(q_total);
-    float q_inv_rms = rsqrt(q_total / float(key_dim) + 1e-6f);
+    if (simd_group == 0) {
+        float v = (simd_lane < 4) ? q_shared[simd_lane] : 0;
+        q_total = simd_sum(v);
+    }
+    threadgroup float q_broadcast;
+    if (tid == 0) q_broadcast = q_total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_inv_rms = rsqrt(q_broadcast / float(key_dim) + 1e-6f);
     if (tid < key_dim) {
         q[base + tid] = qval * q_inv_rms * inv_scale * inv_scale;
     }
 
-    // RMS norm for k — simd reduction
+    // RMS norm for k — simd reduction with broadcast
     float kval = (tid < key_dim) ? k[base + tid] : 0;
     float k_sq = kval * kval;
     float k_simd = simd_sum(k_sq);
@@ -917,9 +921,14 @@ kernel void rms_norm_qk(
     if (simd_lane == 0) k_shared[simd_group] = k_simd;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float k_total = 0;
-    if (tid < 4) k_total = k_shared[tid];
-    k_total = simd_sum(k_total);
-    float k_inv_rms = rsqrt(k_total / float(key_dim) + 1e-6f);
+    if (simd_group == 0) {
+        float v = (simd_lane < 4) ? k_shared[simd_lane] : 0;
+        k_total = simd_sum(v);
+    }
+    threadgroup float k_broadcast;
+    if (tid == 0) k_broadcast = k_total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float k_inv_rms = rsqrt(k_broadcast / float(key_dim) + 1e-6f);
     if (tid < key_dim) {
         k[base + tid] = kval * k_inv_rms * inv_scale;
     }
@@ -979,9 +988,15 @@ kernel void gated_rms_norm(
     if (simd_lane == 0) shared_sums[simd_group] = simd_val;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float total = 0;
-    if (tid < 4) total = shared_sums[tid];
-    total = simd_sum(total);  // first simdgroup reduces
-    float inv_rms = rsqrt(total / float(value_dim) + eps);
+    if (simd_group == 0) {
+        float v2 = (simd_lane < 4) ? shared_sums[simd_lane] : 0;
+        total = simd_sum(v2);
+    }
+    // Broadcast to all simdgroups via threadgroup memory
+    threadgroup float total_broadcast;
+    if (tid == 0) total_broadcast = total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = rsqrt(total_broadcast / float(value_dim) + eps);
 
     if (tid < value_dim) {
         float normed = val * inv_rms;
@@ -1015,9 +1030,9 @@ kernel void rms_norm_qk_weighted(
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
     // Process Q head if in range
-    if (head < num_q_heads && tid < head_dim) {
+    if (head < num_q_heads) {
         uint base = head * head_dim;
-        float qval = q[base + tid];
+        float qval = (tid < head_dim) ? q[base + tid] : 0;
 
         // simd reduction for sum of squares (256 threads = 8 simdgroups)
         float q_sq = qval * qval;
@@ -1025,30 +1040,46 @@ kernel void rms_norm_qk_weighted(
         threadgroup float q_shared[8];
         if (simd_lane == 0) q_shared[simd_group] = q_simd;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float q_total = (tid < 8) ? q_shared[tid] : 0;
-        q_total = simd_sum(q_total);
+        float q_total = 0;
+        if (simd_group == 0) {
+            float v = (simd_lane < 8) ? q_shared[simd_lane] : 0;
+            q_total = simd_sum(v);
+        }
+        threadgroup float q_broadcast;
+        if (tid == 0) q_broadcast = q_total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float inv_rms = rsqrt(q_total / float(head_dim) + 1e-6f);
-        float w = bf16_to_f32(q_weight[tid]);
-        q[base + tid] = qval * inv_rms * w * inv_scale;
+        if (tid < head_dim) {
+            float inv_rms = rsqrt(q_broadcast / float(head_dim) + 1e-6f);
+            float w = bf16_to_f32(q_weight[tid]);
+            q[base + tid] = qval * inv_rms * w * inv_scale;
+        }
     }
 
     // Process K head if in range
-    if (head < num_kv_heads && tid < head_dim) {
+    if (head < num_kv_heads) {
         uint base = head * head_dim;
-        float kval = k[base + tid];
+        float kval = (tid < head_dim) ? k[base + tid] : 0;
 
         float k_sq = kval * kval;
         float k_simd = simd_sum(k_sq);
         threadgroup float k_shared[8];
         if (simd_lane == 0) k_shared[simd_group] = k_simd;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float k_total = (tid < 8) ? k_shared[tid] : 0;
-        k_total = simd_sum(k_total);
+        float k_total = 0;
+        if (simd_group == 0) {
+            float v = (simd_lane < 8) ? k_shared[simd_lane] : 0;
+            k_total = simd_sum(v);
+        }
+        threadgroup float k_broadcast;
+        if (tid == 0) k_broadcast = k_total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        float inv_rms = rsqrt(k_total / float(head_dim) + 1e-6f);
-        float w = bf16_to_f32(k_weight[tid]);
-        k[base + tid] = kval * inv_rms * w;
+        if (tid < head_dim) {
+            float inv_rms = rsqrt(k_broadcast / float(head_dim) + 1e-6f);
+            float w = bf16_to_f32(k_weight[tid]);
+            k[base + tid] = kval * inv_rms * w;
+        }
     }
 }
 
@@ -1357,9 +1388,9 @@ kernel void expert_gate_up_swiglu_dyn(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup half x_shared[4096];
+    threadgroup float x_shared[4096];
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
+        x_shared[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1448,9 +1479,9 @@ kernel void batch_expert_mv_dyn(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup half x_shared[4096];
+    threadgroup float x_shared[4096];
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
+        x_shared[i] = x[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1601,10 +1632,10 @@ kernel void batch_expert_down_dyn(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup half x_shared[4096];
+    threadgroup float x_shared[4096];
     device const float* x_expert = x + expert_k * in_dim;
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x_expert[i]);
+        x_shared[i] = x_expert[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1682,10 +1713,10 @@ kernel void batch_expert_down_dyn_2row(
     uint packed_cols = in_dim / 8;
     uint num_groups  = in_dim / group_size;
 
-    threadgroup half x_shared[4096];
+    threadgroup float x_shared[4096];
     device const float* x_expert = x + expert_k * in_dim;
     for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x_expert[i]);
+        x_shared[i] = x_expert[i];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

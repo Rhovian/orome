@@ -185,7 +185,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->buf_linear_state = (__strong id<MTLBuffer> *)calloc(n_lin, sizeof(id<MTLBuffer>));
     ctx->buf_conv_state = (__strong id<MTLBuffer> *)calloc(n_lin, sizeof(id<MTLBuffer>));
     size_t delta_size = (size_t)cfg->linear_num_v_heads * cfg->linear_value_dim
-                        * cfg->linear_key_dim * sizeof(uint16_t);  // half-precision state
+                        * cfg->linear_key_dim * sizeof(float);  // float32 state
     size_t conv_size = (size_t)(cfg->conv_kernel_size - 1) * cfg->linear_conv_dim * sizeof(float);
     for (int i = 0; i < n_lin; i++) {
         ctx->buf_linear_state[i] = [ctx->device newBufferWithLength:delta_size
@@ -196,8 +196,12 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
         if (ctx->buf_conv_state[i]) memset([ctx->buf_conv_state[i] contents], 0, conv_size);
     }
 
-    ctx->buf_linear_q = [ctx->device newBufferWithLength:cfg->linear_total_key * sizeof(float)
-                                                 options:MTLResourceStorageModeShared];
+    // buf_linear_q is reused for gated_rms_norm output (linear_total_value elements)
+    // which is larger than linear_total_key, so allocate the max of both
+    { size_t q_size = cfg->linear_total_key > cfg->linear_total_value
+                        ? cfg->linear_total_key : cfg->linear_total_value;
+    ctx->buf_linear_q = [ctx->device newBufferWithLength:q_size * sizeof(float)
+                                                 options:MTLResourceStorageModeShared]; }
     ctx->buf_linear_k = [ctx->device newBufferWithLength:cfg->linear_total_key * sizeof(float)
                                                  options:MTLResourceStorageModeShared];
     ctx->buf_linear_v = [ctx->device newBufferWithLength:cfg->linear_total_value * sizeof(float)

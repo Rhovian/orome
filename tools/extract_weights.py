@@ -101,6 +101,37 @@ def build_expert_index(header_cache, model_path, num_experts):
     }
 
 
+def _load_model_config(model_path):
+    """Read config.json from HF model dir and extract relevant fields."""
+    cfg_path = model_path / 'config.json' if isinstance(model_path, Path) else Path(model_path) / 'config.json'
+    with open(cfg_path) as f:
+        hf = json.load(f)
+    # HF multimodal models nest text config under "text_config"
+    tc = hf.get('text_config', hf)
+    return {
+        "hidden_size": tc["hidden_size"],
+        "num_hidden_layers": tc["num_hidden_layers"],
+        "num_attention_heads": tc["num_attention_heads"],
+        "num_key_value_heads": tc.get("num_key_value_heads", tc["num_attention_heads"]),
+        "head_dim": tc.get("head_dim", tc["hidden_size"] // tc["num_attention_heads"]),
+        "vocab_size": tc["vocab_size"],
+        "rms_norm_eps": tc.get("rms_norm_eps", 1e-6),
+        "num_experts": tc["num_experts"],
+        "num_experts_per_tok": tc["num_experts_per_tok"],
+        "moe_intermediate_size": tc["moe_intermediate_size"],
+        "shared_expert_intermediate_size": tc.get("shared_expert_intermediate_size",
+                                                   tc["moe_intermediate_size"]),
+        "full_attention_interval": tc.get("full_attention_interval", 4),
+        "linear_num_value_heads": tc.get("v_head_dim", 32),
+        "linear_num_key_heads": tc.get("num_key_value_heads", 16),
+        "linear_key_head_dim": tc.get("key_dim", 128),
+        "linear_value_head_dim": tc.get("v_head_dim", 128),
+        "linear_conv_kernel_dim": tc.get("conv_kernel_size", 4),
+        "partial_rotary_factor": tc.get("partial_rotary_factor", 0.25),
+        "rope_theta": tc.get("rope_theta", 10000000.0),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='Extract non-expert weights to binary')
     parser.add_argument('--model', type=str, required=True,
@@ -177,34 +208,17 @@ def main():
         "model": str(model_path),
         "num_tensors": len(all_tensors),
         "tensors": {},
-        # Model config for the C engine
-        "config": {
-            "hidden_size": 2048,
-            "num_hidden_layers": 40,
-            "num_attention_heads": 16,
-            "num_key_value_heads": 2,
-            "head_dim": 256,
-            "vocab_size": 248320,
-            "rms_norm_eps": 1e-6,
-            "num_experts": 256,
-            "num_experts_per_tok": 8,
-            "moe_intermediate_size": 512,
-            "shared_expert_intermediate_size": 512,
-            "full_attention_interval": 4,
-            "linear_num_value_heads": 32,
-            "linear_num_key_heads": 16,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "partial_rotary_factor": 0.25,
-            "rope_theta": 10000000.0,
-        }
+        # Model config — read from HF config.json
+        "config": _load_model_config(model_path),
     }
 
+    num_layers = manifest["config"]["num_hidden_layers"]
+
     # Layer type map
+    full_attn_interval = manifest["config"].get("full_attention_interval", 4)
     layer_types = []
-    for i in range(40):
-        if (i + 1) % 4 == 0:
+    for i in range(num_layers):
+        if (i + 1) % full_attn_interval == 0:
             layer_types.append("full_attention")
         else:
             layer_types.append("linear_attention")

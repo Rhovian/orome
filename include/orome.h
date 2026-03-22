@@ -425,6 +425,10 @@ typedef struct {
     void **layer_data;      // [num_layers] mmap'd expert data (NULL if not loaded)
     size_t *layer_size;     // [num_layers] size of each mmap
     int *layer_fds;         // [num_layers] fd (kept open for mmap lifetime)
+    bool pread_mode;        // true when experts are loaded via pread into staging buffers
+    int *layer_fds_2bit;    // [num_layers] fd for 2-bit expert files
+    int num_experts;        // cached for hot mask checks
+    int num_layers;         // cached for cleanup
     uint32_t *hot_mask;     // [num_layers * (max_experts/32)] bitmask of hot experts
     bool tiered_quant;      // using tiered quantization?
     bool all_mmaped;        // true if all layers are mmap'd in memory
@@ -434,6 +438,8 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
                                const char *hot_mask_path);
 void         expert_files_close(ExpertFiles *ef, const ModelConfig *cfg);
 bool         expert_is_hot(const ExpertFiles *ef, int layer, int expert_id);
+void         moe_set_profile_experts(bool enabled);
+bool         moe_get_profile_experts(void);
 
 // Wrap mmap'd expert layer data as Metal buffers for GPU expert forward.
 void metal_set_expert_weights(MetalCtx *ctx, ExpertFiles *ef, const ModelConfig *cfg);
@@ -458,6 +464,17 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
 // ============================================================================
 
 typedef struct {
+    bool enabled;
+    int hot_k;                  // reduced K when engaged
+    int min_gen;                // minimum generated tokens before engaging
+    double proj_threshold_ms;   // EMA threshold for engagement
+    double proj_ema_ms;         // current EMA
+    int generated;              // number of timed tokens seen
+    bool engaged;               // latched once throttling engages
+    bool have_proj;             // true after first timing sample
+} ThermalKState;
+
+typedef struct {
     ModelConfig     *cfg;
     WeightFile      *wf;
     MetalCtx        *ctx;       // NULL if CPU-only
@@ -477,6 +494,7 @@ typedef struct {
     int pos;
     QuantType quant;
     int active_experts;     // runtime K (may differ from cfg default)
+    ThermalKState thermal;
 
     // Precomputed weight offsets (opaque, owned by engine.m)
     void *weight_cache;
