@@ -230,6 +230,8 @@ typedef struct {
     id<MTLComputePipelineState> batch_expert_down_dyn;
     id<MTLComputePipelineState> expert_gate_up_swiglu;
     id<MTLComputePipelineState> copy_buffer;
+    id<MTLComputePipelineState> residual_add_sq;
+    id<MTLComputePipelineState> norm_apply_partial;
 
     // Shared buffers (allocated based on ModelConfig)
     id<MTLBuffer> buf_input;
@@ -470,6 +472,9 @@ typedef struct {
     int pos;
     QuantType quant;
     int active_experts;     // runtime K (may differ from cfg default)
+
+    // Precomputed weight offsets (opaque, owned by engine.m)
+    void *weight_cache;
 } Engine;
 
 Engine *engine_create(ModelConfig *cfg, WeightFile *wf, MetalCtx *ctx,

@@ -12,6 +12,103 @@
 #include "orome.h"
 
 // ============================================================================
+// Precomputed weight byte offsets — eliminates ~1200 hash lookups per token
+// ============================================================================
+
+// All offsets are relative to wf->data base pointer.
+// Linear attention layers use .lin, full attention layers use .full.
+typedef struct {
+    size_t input_norm_w;
+    // MoE routing + shared expert (common to both attn types)
+    size_t gate_w, gate_s, gate_b;
+    size_t sg_w, sg_s, sg_b;   // shared expert gate_proj
+    size_t su_w, su_s, su_b;   // shared expert up_proj
+    size_t sgg_w, sgg_s, sgg_b; // shared_expert_gate
+    size_t sd_w, sd_s, sd_b;   // shared expert down_proj
+    size_t post_norm_w;
+    union {
+        struct {
+            size_t qkv_w, qkv_s, qkv_b;
+            size_t z_w, z_s, z_b;
+            size_t a_w, a_s, a_b;
+            size_t b_w, b_s, b_b;
+            size_t conv_w, A_log, dt_bias, o_norm_w;
+            size_t o_w, o_s, o_b;
+        } lin;
+        struct {
+            size_t q_w, q_s, q_b;
+            size_t k_w, k_s, k_b;
+            size_t v_w, v_s, v_b;
+            size_t qnorm_w, knorm_w;
+            size_t o_w, o_s, o_b;
+        } full;
+    };
+} LayerWeightCache;
+
+static LayerWeightCache *build_weight_cache(WeightFile *wf, const ModelConfig *cfg) {
+    LayerWeightCache *cache = calloc(cfg->num_layers, sizeof(LayerWeightCache));
+    uint8_t *base = (uint8_t *)wf->data;
+    for (int i = 0; i < cfg->num_layers; i++) {
+        LayerWeightCache *c = &cache[i];
+        c->input_norm_w = (uint8_t *)weights_layer_ptr(wf, i, "input_layernorm.weight") - base;
+        c->post_norm_w = (uint8_t *)weights_layer_ptr(wf, i, "post_attention_layernorm.weight") - base;
+        c->gate_w = (uint8_t *)weights_layer_ptr(wf, i, "mlp.gate.weight") - base;
+        c->gate_s = (uint8_t *)weights_layer_ptr(wf, i, "mlp.gate.scales") - base;
+        c->gate_b = (uint8_t *)weights_layer_ptr(wf, i, "mlp.gate.biases") - base;
+        c->sg_w = (uint8_t *)weights_layer_ptr(wf, i, "mlp.shared_expert.gate_proj.weight") - base;
+        c->sg_s = (uint8_t *)weights_layer_ptr(wf, i, "mlp.shared_expert.gate_proj.scales") - base;
+        c->sg_b = (uint8_t *)weights_layer_ptr(wf, i, "mlp.shared_expert.gate_proj.biases") - base;
+        c->su_w = (uint8_t *)weights_layer_ptr(wf, i, "mlp.shared_expert.up_proj.weight") - base;
+        c->su_s = (uint8_t *)weights_layer_ptr(wf, i, "mlp.shared_expert.up_proj.scales") - base;
+        c->su_b = (uint8_t *)weights_layer_ptr(wf, i, "mlp.shared_expert.up_proj.biases") - base;
+        c->sgg_w = (uint8_t *)weights_layer_ptr(wf, i, "mlp.shared_expert_gate.weight") - base;
+        c->sgg_s = (uint8_t *)weights_layer_ptr(wf, i, "mlp.shared_expert_gate.scales") - base;
+        c->sgg_b = (uint8_t *)weights_layer_ptr(wf, i, "mlp.shared_expert_gate.biases") - base;
+        c->sd_w = (uint8_t *)weights_layer_ptr(wf, i, "mlp.shared_expert.down_proj.weight") - base;
+        c->sd_s = (uint8_t *)weights_layer_ptr(wf, i, "mlp.shared_expert.down_proj.scales") - base;
+        c->sd_b = (uint8_t *)weights_layer_ptr(wf, i, "mlp.shared_expert.down_proj.biases") - base;
+
+        if (cfg->layer_types[i] == ATTN_LINEAR) {
+            c->lin.qkv_w = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.in_proj_qkv.weight") - base;
+            c->lin.qkv_s = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.in_proj_qkv.scales") - base;
+            c->lin.qkv_b = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.in_proj_qkv.biases") - base;
+            c->lin.z_w = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.in_proj_z.weight") - base;
+            c->lin.z_s = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.in_proj_z.scales") - base;
+            c->lin.z_b = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.in_proj_z.biases") - base;
+            c->lin.a_w = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.in_proj_a.weight") - base;
+            c->lin.a_s = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.in_proj_a.scales") - base;
+            c->lin.a_b = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.in_proj_a.biases") - base;
+            c->lin.b_w = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.in_proj_b.weight") - base;
+            c->lin.b_s = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.in_proj_b.scales") - base;
+            c->lin.b_b = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.in_proj_b.biases") - base;
+            c->lin.conv_w = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.conv1d.weight") - base;
+            c->lin.A_log = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.A_log") - base;
+            c->lin.dt_bias = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.dt_bias") - base;
+            c->lin.o_norm_w = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.norm.weight") - base;
+            c->lin.o_w = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.out_proj.weight") - base;
+            c->lin.o_s = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.out_proj.scales") - base;
+            c->lin.o_b = (uint8_t *)weights_layer_ptr(wf, i, "linear_attn.out_proj.biases") - base;
+        } else {
+            c->full.q_w = (uint8_t *)weights_layer_ptr(wf, i, "self_attn.q_proj.weight") - base;
+            c->full.q_s = (uint8_t *)weights_layer_ptr(wf, i, "self_attn.q_proj.scales") - base;
+            c->full.q_b = (uint8_t *)weights_layer_ptr(wf, i, "self_attn.q_proj.biases") - base;
+            c->full.k_w = (uint8_t *)weights_layer_ptr(wf, i, "self_attn.k_proj.weight") - base;
+            c->full.k_s = (uint8_t *)weights_layer_ptr(wf, i, "self_attn.k_proj.scales") - base;
+            c->full.k_b = (uint8_t *)weights_layer_ptr(wf, i, "self_attn.k_proj.biases") - base;
+            c->full.v_w = (uint8_t *)weights_layer_ptr(wf, i, "self_attn.v_proj.weight") - base;
+            c->full.v_s = (uint8_t *)weights_layer_ptr(wf, i, "self_attn.v_proj.scales") - base;
+            c->full.v_b = (uint8_t *)weights_layer_ptr(wf, i, "self_attn.v_proj.biases") - base;
+            c->full.qnorm_w = (uint8_t *)weights_layer_ptr(wf, i, "self_attn.q_norm.weight") - base;
+            c->full.knorm_w = (uint8_t *)weights_layer_ptr(wf, i, "self_attn.k_norm.weight") - base;
+            c->full.o_w = (uint8_t *)weights_layer_ptr(wf, i, "self_attn.o_proj.weight") - base;
+            c->full.o_s = (uint8_t *)weights_layer_ptr(wf, i, "self_attn.o_proj.scales") - base;
+            c->full.o_b = (uint8_t *)weights_layer_ptr(wf, i, "self_attn.o_proj.biases") - base;
+        }
+    }
+    return cache;
+}
+
+// ============================================================================
 // Engine lifecycle
 // ============================================================================
 
@@ -44,6 +141,7 @@ Engine *engine_create(ModelConfig *cfg, WeightFile *wf, MetalCtx *ctx,
     }
 
     eng->pos = 0;
+    eng->weight_cache = build_weight_cache(wf, cfg);
     return eng;
 }
 
@@ -66,6 +164,7 @@ void engine_free(Engine *eng) {
         }
         free(eng->linear_states);
     }
+    free(eng->weight_cache);
     free(eng);
 }
 
@@ -153,8 +252,9 @@ static void lm_head_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cf
 
 static void encode_fused_experts(id<MTLComputeCommandEncoder> enc,
                                   MetalCtx *ctx, const ModelConfig *cfg,
-                                  WeightFile *wf, int layer, int K,
-                                  QuantType quant, uint8_t *wbase) {
+                                  int layer, int K,
+                                  QuantType quant,
+                                  const LayerWeightCache *lw) {
     int H = cfg->hidden_dim;
     int M = cfg->moe_intermediate;
     int S = cfg->shared_intermediate;
@@ -162,10 +262,6 @@ static void encode_fused_experts(id<MTLComputeCommandEncoder> enc,
 
     const ExpertLayout *layout = (quant == QUANT_2BIT) ? &cfg->expert_2bit : &cfg->expert_4bit;
     id<MTLBuffer> expert_layer_buf = ctx->buf_expert_layers[layer];
-
-    uint32_t *sd_w = weights_layer_ptr(wf, layer, "mlp.shared_expert.down_proj.weight");
-    uint16_t *sd_s = weights_layer_ptr(wf, layer, "mlp.shared_expert.down_proj.scales");
-    uint16_t *sd_b = weights_layer_ptr(wf, layer, "mlp.shared_expert.down_proj.biases");
 
     NSUInteger tg_size = ENGINE_ROWS_PER_TG * 32;
     uint num_row_tgs_M = ((uint)M + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
@@ -299,9 +395,9 @@ static void encode_fused_experts(id<MTLComputeCommandEncoder> enc,
 
     // --- Shared expert down ---
     [enc setComputePipelineState:ctx->matvec_4bit];
-    [enc setBuffer:ctx->buf_weights offset:(uint8_t *)sd_w - wbase atIndex:0];
-    [enc setBuffer:ctx->buf_weights offset:(uint8_t *)sd_s - wbase atIndex:1];
-    [enc setBuffer:ctx->buf_weights offset:(uint8_t *)sd_b - wbase atIndex:2];
+    [enc setBuffer:ctx->buf_weights offset:lw->sd_w atIndex:0];
+    [enc setBuffer:ctx->buf_weights offset:lw->sd_s atIndex:1];
+    [enc setBuffer:ctx->buf_weights offset:lw->sd_b atIndex:2];
     [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:3];
     [enc setBuffer:ctx->buf_shared_out offset:0 atIndex:4];
     { uint od = (uint)H, id_ = (uint)S, gs = (uint)cfg->group_size;
@@ -348,6 +444,7 @@ int engine_step(Engine *eng, int token_id) {
     int full_idx = 0, linear_idx = 0;
     double t0, t1;
     MetalCtx *ctx = eng->ctx;
+    LayerWeightCache *wcache = (LayerWeightCache *)eng->weight_cache;
 
     // Static scratch for gate scores readback
     static float *s_fused_gate_scores = NULL;
@@ -384,7 +481,6 @@ int engine_step(Engine *eng, int token_id) {
         if (cfg->layer_types[layer] == ATTN_LINEAR && ctx && ctx->buf_weights) {
             t0 = now_ms();
 
-            uint8_t *base = (uint8_t *)[ctx->buf_weights contents];
             int total_key = cfg->linear_total_key;
             int total_value = cfg->linear_total_value;
             int conv_dim = cfg->linear_conv_dim;
@@ -393,40 +489,7 @@ int engine_step(Engine *eng, int token_id) {
             int key_dim = cfg->linear_key_dim;
             int value_dim = cfg->linear_value_dim;
 
-            // Look up all weight pointers
-            uint16_t *input_norm_w = weights_layer_ptr(eng->wf, layer, "input_layernorm.weight");
-            uint32_t *qkv_w = weights_layer_ptr(eng->wf, layer, "linear_attn.in_proj_qkv.weight");
-            uint16_t *qkv_s = weights_layer_ptr(eng->wf, layer, "linear_attn.in_proj_qkv.scales");
-            uint16_t *qkv_b = weights_layer_ptr(eng->wf, layer, "linear_attn.in_proj_qkv.biases");
-            uint32_t *z_w = weights_layer_ptr(eng->wf, layer, "linear_attn.in_proj_z.weight");
-            uint16_t *z_s = weights_layer_ptr(eng->wf, layer, "linear_attn.in_proj_z.scales");
-            uint16_t *z_b = weights_layer_ptr(eng->wf, layer, "linear_attn.in_proj_z.biases");
-            uint32_t *a_w = weights_layer_ptr(eng->wf, layer, "linear_attn.in_proj_a.weight");
-            uint16_t *a_s = weights_layer_ptr(eng->wf, layer, "linear_attn.in_proj_a.scales");
-            uint16_t *a_b = weights_layer_ptr(eng->wf, layer, "linear_attn.in_proj_a.biases");
-            uint32_t *b_w = weights_layer_ptr(eng->wf, layer, "linear_attn.in_proj_b.weight");
-            uint16_t *b_s = weights_layer_ptr(eng->wf, layer, "linear_attn.in_proj_b.scales");
-            uint16_t *b_b = weights_layer_ptr(eng->wf, layer, "linear_attn.in_proj_b.biases");
-            uint16_t *conv_w = weights_layer_ptr(eng->wf, layer, "linear_attn.conv1d.weight");
-            float *A_log = weights_layer_ptr(eng->wf, layer, "linear_attn.A_log");
-            uint16_t *dt_bias = weights_layer_ptr(eng->wf, layer, "linear_attn.dt_bias");
-            uint16_t *o_norm_w = weights_layer_ptr(eng->wf, layer, "linear_attn.norm.weight");
-            uint32_t *o_w = weights_layer_ptr(eng->wf, layer, "linear_attn.out_proj.weight");
-            uint16_t *o_s = weights_layer_ptr(eng->wf, layer, "linear_attn.out_proj.scales");
-            uint16_t *o_b = weights_layer_ptr(eng->wf, layer, "linear_attn.out_proj.biases");
-            uint16_t *post_norm_w = weights_layer_ptr(eng->wf, layer, "post_attention_layernorm.weight");
-            uint32_t *gate_w = weights_layer_ptr(eng->wf, layer, "mlp.gate.weight");
-            uint16_t *gate_s = weights_layer_ptr(eng->wf, layer, "mlp.gate.scales");
-            uint16_t *gate_b = weights_layer_ptr(eng->wf, layer, "mlp.gate.biases");
-            uint32_t *sg_w = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.gate_proj.weight");
-            uint16_t *sg_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.gate_proj.scales");
-            uint16_t *sg_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.gate_proj.biases");
-            uint32_t *su_w = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.up_proj.weight");
-            uint16_t *su_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.up_proj.scales");
-            uint16_t *su_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.up_proj.biases");
-            uint32_t *sgg_w = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.weight");
-            uint16_t *sgg_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.scales");
-            uint16_t *sgg_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.biases");
+            const LayerWeightCache *lw = &wcache[layer];
 
             // GPU-resident: copy buf_moe_hidden → buf_residual
             if (!gpu_resident) {
@@ -471,7 +534,7 @@ int engine_step(Engine *eng, int token_id) {
 
             [enc setComputePipelineState:ctx->norm_apply];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)input_norm_w - base atIndex:1];
+            [enc setBuffer:ctx->buf_weights offset:lw->input_norm_w atIndex:1];
             [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
             [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
             { uint d = (uint)H; float e = cfg->rms_norm_eps;
@@ -485,27 +548,27 @@ int engine_step(Engine *eng, int token_id) {
             // QKV → buf_conv_input, Z → buf_linear_output, alpha → buf_linear_decay, beta → buf_linear_beta
             // (reuse buf_linear_output for Z since delta_net hasn't run yet)
             GpuMatvecJob proj_jobs[4] = {
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)qkv_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)qkv_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)qkv_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->lin.qkv_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->lin.qkv_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->lin.qkv_b,
                   .out_buf = ctx->buf_conv_input, .out_off = 0,
                   .out_ptr = NULL, .out_dim = conv_dim, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)z_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)z_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)z_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->lin.z_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->lin.z_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->lin.z_b,
                   .out_buf = ctx->buf_linear_output, .out_off = 0,
                   .out_ptr = NULL, .out_dim = total_value, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)a_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)a_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)a_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->lin.a_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->lin.a_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->lin.a_b,
                   .out_buf = ctx->buf_linear_decay, .out_off = 0,
                   .out_ptr = NULL, .out_dim = n_v_heads, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)b_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)b_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)b_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->lin.b_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->lin.b_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->lin.b_b,
                   .out_buf = ctx->buf_linear_beta, .out_off = 0,
                   .out_ptr = NULL, .out_dim = n_v_heads, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
@@ -519,7 +582,7 @@ int engine_step(Engine *eng, int token_id) {
             [enc setComputePipelineState:ctx->conv1d];
             [enc setBuffer:ctx->buf_conv_state[linear_idx] offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_conv_input offset:0 atIndex:1];
-            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)conv_w - base atIndex:2];
+            [enc setBuffer:ctx->buf_weights offset:lw->lin.conv_w atIndex:2];
             [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:3];
             { uint cd = (uint)conv_dim; [enc setBytes:&cd length:sizeof(uint) atIndex:4]; }
             [enc dispatchThreadgroups:MTLSizeMake(((uint)conv_dim + 255) / 256, 1, 1)
@@ -544,8 +607,8 @@ int engine_step(Engine *eng, int token_id) {
             [enc setComputePipelineState:ctx->decay_beta];
             [enc setBuffer:ctx->buf_linear_decay offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_linear_beta offset:0 atIndex:1];
-            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)A_log - base atIndex:2];
-            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)dt_bias - base atIndex:3];
+            [enc setBuffer:ctx->buf_weights offset:lw->lin.A_log atIndex:2];
+            [enc setBuffer:ctx->buf_weights offset:lw->lin.dt_bias atIndex:3];
             [enc setBuffer:ctx->buf_linear_decay offset:0 atIndex:4];  // output overwrites
             [enc setBuffer:ctx->buf_linear_beta offset:0 atIndex:5];   // output overwrites
             [enc dispatchThreadgroups:MTLSizeMake(((uint)n_v_heads + 63) / 64, 1, 1)
@@ -574,7 +637,7 @@ int engine_step(Engine *eng, int token_id) {
             [enc setComputePipelineState:ctx->gated_rms_norm];
             [enc setBuffer:ctx->buf_linear_v offset:0 atIndex:0];       // values
             [enc setBuffer:ctx->buf_linear_output offset:0 atIndex:1];  // z
-            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)o_norm_w - base atIndex:2];
+            [enc setBuffer:ctx->buf_weights offset:lw->lin.o_norm_w atIndex:2];
             [enc setBuffer:ctx->buf_linear_q offset:0 atIndex:3];       // output (reuse buf_linear_q)
             { uint vd = (uint)value_dim; float e = cfg->rms_norm_eps;
               [enc setBytes:&vd length:sizeof(uint) atIndex:4];
@@ -584,73 +647,69 @@ int engine_step(Engine *eng, int token_id) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase H: O projection (attn_out in buf_linear_q → buf_h_mid) ---
-            GpuMatvecJob o_job = {
-                .w_buf = ctx->buf_weights, .w_off = (uint8_t *)o_w - base,
-                .s_buf = ctx->buf_weights, .s_off = (uint8_t *)o_s - base,
-                .b_buf = ctx->buf_weights, .b_off = (uint8_t *)o_b - base,
+            { GpuMatvecJob o_job = {
+                .w_buf = ctx->buf_weights, .w_off = lw->lin.o_w,
+                .s_buf = ctx->buf_weights, .s_off = lw->lin.o_s,
+                .b_buf = ctx->buf_weights, .b_off = lw->lin.o_b,
                 .in_buf = ctx->buf_linear_q, .in_off = 0,
                 .out_buf = ctx->buf_h_mid, .out_off = 0,
                 .out_ptr = NULL, .out_dim = H, .in_dim = total_value,
                 .group_size = cfg->group_size, .is_2bit = false
             };
-            gpu_encode_matvec_job(enc, ctx, &o_job);
+            gpu_encode_matvec_job(enc, ctx, &o_job); }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // --- Phase I: Residual add → buf_moe_hidden ---
-            [enc setComputePipelineState:ctx->residual_add];
+            // --- Phase I+J: Fused residual add + sum_sq → buf_moe_hidden ---
+            { uint num_tgs = ((uint)H + 255) / 256;
+            [enc setComputePipelineState:ctx->residual_add_sq];
             [enc setBuffer:ctx->buf_residual offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_h_mid offset:0 atIndex:1];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:2];
-            { uint d = (uint)H; [enc setBytes:&d length:sizeof(uint) atIndex:3]; }
-            [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+            [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:3];
+            { uint d = (uint)H; [enc setBytes:&d length:sizeof(uint) atIndex:4]; }
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // --- Phase J: Post-attention RMS norm → buf_input ---
-            [enc setComputePipelineState:ctx->norm_sum_sq];
+            // Post-attention RMS norm with partial sums → buf_input
+            [enc setComputePipelineState:ctx->norm_apply_partial];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:1];
-            { uint d = (uint)H; [enc setBytes:&d length:sizeof(uint) atIndex:2]; }
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-            [enc setComputePipelineState:ctx->norm_apply];
-            [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)post_norm_w - base atIndex:1];
+            [enc setBuffer:ctx->buf_weights offset:lw->post_norm_w atIndex:1];
             [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
             [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
             { uint d = (uint)H; float e = cfg->rms_norm_eps;
+              uint np = num_tgs;
               [enc setBytes:&d length:sizeof(uint) atIndex:4];
-              [enc setBytes:&e length:sizeof(float) atIndex:5]; }
-            [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+              [enc setBytes:&e length:sizeof(float) atIndex:5];
+              [enc setBytes:&np length:sizeof(uint) atIndex:6]; }
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
 
             // --- Phase K: MoE routing + shared expert projections ---
             size_t sgg_off = n_experts * sizeof(float);
             GpuMatvecJob routing_jobs[4] = {
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)gate_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)gate_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)gate_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->gate_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->gate_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->gate_b,
                   .out_buf = ctx->buf_output, .out_off = 0,
                   .out_ptr = NULL, .out_dim = n_experts, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)sg_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)sg_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)sg_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->sg_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->sg_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->sg_b,
                   .out_buf = ctx->buf_shared_gate, .out_off = 0,
                   .out_ptr = NULL, .out_dim = S, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)su_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)su_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)su_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->su_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->su_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->su_b,
                   .out_buf = ctx->buf_shared_up, .out_off = 0,
                   .out_ptr = NULL, .out_dim = S, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)sgg_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)sgg_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)sgg_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->sgg_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->sgg_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->sgg_b,
                   .out_buf = ctx->buf_output, .out_off = sgg_off,
                   .out_ptr = NULL, .out_dim = 1, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
@@ -661,14 +720,12 @@ int engine_step(Engine *eng, int token_id) {
             // Fused path: softmax+topk+experts entirely on GPU, no CPU readback
             if (gpu_resident && ctx->softmax_topk && ctx->batch_expert_mv_dyn
                 && ctx->buf_expert_layers && ctx->buf_expert_layers[layer]) {
-                encode_fused_experts(enc, ctx, cfg, eng->wf, layer,
-                                     eng->active_experts, eng->quant, base);
+                encode_fused_experts(enc, ctx, cfg, layer,
+                                     eng->active_experts, eng->quant, lw);
                 if (!fwd_enc) {
-                    // Per-layer CB fallback: end and commit
                     [enc endEncoding];
                     [cmd commit];
                 }
-                // With fwd_enc: continue encoding next layer in same CB
             } else {
                 [enc endEncoding];
                 if (cmd) [cmd commit];
@@ -706,42 +763,13 @@ int engine_step(Engine *eng, int token_id) {
             && ctx->rms_norm_qk_w && ctx->rope_apply && ctx->kv_cache_write) {
             t0 = now_ms();
 
-            uint8_t *base = (uint8_t *)[ctx->buf_weights contents];
             int n_heads = cfg->num_attn_heads;
             int n_kv = cfg->num_kv_heads;
             int hd = cfg->head_dim;
             int kv_dim = cfg->kv_dim;
             int seq_len = pos + 1;
 
-            // Look up weight pointers
-            uint16_t *input_norm_w = weights_layer_ptr(eng->wf, layer, "input_layernorm.weight");
-            uint32_t *q_w = weights_layer_ptr(eng->wf, layer, "self_attn.q_proj.weight");
-            uint16_t *q_s = weights_layer_ptr(eng->wf, layer, "self_attn.q_proj.scales");
-            uint16_t *q_b = weights_layer_ptr(eng->wf, layer, "self_attn.q_proj.biases");
-            uint32_t *k_w = weights_layer_ptr(eng->wf, layer, "self_attn.k_proj.weight");
-            uint16_t *k_s = weights_layer_ptr(eng->wf, layer, "self_attn.k_proj.scales");
-            uint16_t *k_b = weights_layer_ptr(eng->wf, layer, "self_attn.k_proj.biases");
-            uint32_t *v_w = weights_layer_ptr(eng->wf, layer, "self_attn.v_proj.weight");
-            uint16_t *v_s = weights_layer_ptr(eng->wf, layer, "self_attn.v_proj.scales");
-            uint16_t *v_b = weights_layer_ptr(eng->wf, layer, "self_attn.v_proj.biases");
-            uint16_t *qnorm_w = weights_layer_ptr(eng->wf, layer, "self_attn.q_norm.weight");
-            uint16_t *knorm_w = weights_layer_ptr(eng->wf, layer, "self_attn.k_norm.weight");
-            uint32_t *o_w = weights_layer_ptr(eng->wf, layer, "self_attn.o_proj.weight");
-            uint16_t *o_s = weights_layer_ptr(eng->wf, layer, "self_attn.o_proj.scales");
-            uint16_t *o_b = weights_layer_ptr(eng->wf, layer, "self_attn.o_proj.biases");
-            uint16_t *post_norm_w = weights_layer_ptr(eng->wf, layer, "post_attention_layernorm.weight");
-            uint32_t *gate_w = weights_layer_ptr(eng->wf, layer, "mlp.gate.weight");
-            uint16_t *gate_s = weights_layer_ptr(eng->wf, layer, "mlp.gate.scales");
-            uint16_t *gate_b = weights_layer_ptr(eng->wf, layer, "mlp.gate.biases");
-            uint32_t *sg_w = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.gate_proj.weight");
-            uint16_t *sg_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.gate_proj.scales");
-            uint16_t *sg_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.gate_proj.biases");
-            uint32_t *su_w = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.up_proj.weight");
-            uint16_t *su_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.up_proj.scales");
-            uint16_t *su_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert.up_proj.biases");
-            uint32_t *sgg_w = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.weight");
-            uint16_t *sgg_s = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.scales");
-            uint16_t *sgg_b = weights_layer_ptr(eng->wf, layer, "mlp.shared_expert_gate.biases");
+            const LayerWeightCache *lw = &wcache[layer];
 
             // GPU-resident: copy buf_moe_hidden → buf_residual
             if (!gpu_resident) {
@@ -785,7 +813,7 @@ int engine_step(Engine *eng, int token_id) {
 
             [enc setComputePipelineState:ctx->norm_apply];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)input_norm_w - base atIndex:1];
+            [enc setBuffer:ctx->buf_weights offset:lw->input_norm_w atIndex:1];
             [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
             [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
             { uint d = (uint)H; float e = cfg->rms_norm_eps;
@@ -800,21 +828,21 @@ int engine_step(Engine *eng, int token_id) {
             // K → buf_conv_output (reuse, kv_dim = 512 floats)
             // V → buf_conv_input (reuse, kv_dim = 512 floats)
             GpuMatvecJob qkv_jobs[3] = {
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)q_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)q_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)q_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->full.q_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->full.q_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->full.q_b,
                   .out_buf = ctx->buf_attn_output, .out_off = 0,
                   .out_ptr = NULL, .out_dim = n_heads * hd, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)k_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)k_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)k_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->full.k_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->full.k_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->full.k_b,
                   .out_buf = ctx->buf_conv_output, .out_off = 0,
                   .out_ptr = NULL, .out_dim = n_kv * hd, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)v_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)v_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)v_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->full.v_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->full.v_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->full.v_b,
                   .out_buf = ctx->buf_conv_input, .out_off = 0,
                   .out_ptr = NULL, .out_dim = n_kv * hd, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
@@ -828,8 +856,8 @@ int engine_step(Engine *eng, int token_id) {
             [enc setComputePipelineState:ctx->rms_norm_qk_w];
             [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];  // Q
             [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:1];  // K
-            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)qnorm_w - base atIndex:2];
-            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)knorm_w - base atIndex:3];
+            [enc setBuffer:ctx->buf_weights offset:lw->full.qnorm_w atIndex:2];
+            [enc setBuffer:ctx->buf_weights offset:lw->full.knorm_w atIndex:3];
             { uint hd_val = (uint)hd, nq = (uint)n_heads, nkv = (uint)n_kv;
               float inv_s = 1.0f / sqrtf((float)hd);
               [enc setBytes:&hd_val length:sizeof(uint) atIndex:4];
@@ -922,73 +950,69 @@ int engine_step(Engine *eng, int token_id) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase I: O-proj (buf_attn_output → buf_h_mid) ---
-            GpuMatvecJob o_job = {
-                .w_buf = ctx->buf_weights, .w_off = (uint8_t *)o_w - base,
-                .s_buf = ctx->buf_weights, .s_off = (uint8_t *)o_s - base,
-                .b_buf = ctx->buf_weights, .b_off = (uint8_t *)o_b - base,
+            { GpuMatvecJob o_job = {
+                .w_buf = ctx->buf_weights, .w_off = lw->full.o_w,
+                .s_buf = ctx->buf_weights, .s_off = lw->full.o_s,
+                .b_buf = ctx->buf_weights, .b_off = lw->full.o_b,
                 .in_buf = ctx->buf_attn_output, .in_off = 0,
                 .out_buf = ctx->buf_h_mid, .out_off = 0,
                 .out_ptr = NULL, .out_dim = H, .in_dim = n_heads * hd,
                 .group_size = cfg->group_size, .is_2bit = false
             };
-            gpu_encode_matvec_job(enc, ctx, &o_job);
+            gpu_encode_matvec_job(enc, ctx, &o_job); }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // --- Phase J: Residual add → buf_moe_hidden ---
-            [enc setComputePipelineState:ctx->residual_add];
+            // --- Phase J+K: Fused residual add + sum_sq → buf_moe_hidden ---
+            { uint num_tgs = ((uint)H + 255) / 256;
+            [enc setComputePipelineState:ctx->residual_add_sq];
             [enc setBuffer:ctx->buf_residual offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_h_mid offset:0 atIndex:1];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:2];
-            { uint d = (uint)H; [enc setBytes:&d length:sizeof(uint) atIndex:3]; }
-            [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+            [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:3];
+            { uint d = (uint)H; [enc setBytes:&d length:sizeof(uint) atIndex:4]; }
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // --- Phase K: Post-attention RMS norm → buf_input ---
-            [enc setComputePipelineState:ctx->norm_sum_sq];
+            // Post-attention RMS norm with partial sums → buf_input
+            [enc setComputePipelineState:ctx->norm_apply_partial];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:1];
-            { uint d = (uint)H; [enc setBytes:&d length:sizeof(uint) atIndex:2]; }
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-            [enc setComputePipelineState:ctx->norm_apply];
-            [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)post_norm_w - base atIndex:1];
+            [enc setBuffer:ctx->buf_weights offset:lw->post_norm_w atIndex:1];
             [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
             [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
             { uint d = (uint)H; float e = cfg->rms_norm_eps;
+              uint np = num_tgs;
               [enc setBytes:&d length:sizeof(uint) atIndex:4];
-              [enc setBytes:&e length:sizeof(float) atIndex:5]; }
-            [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+              [enc setBytes:&e length:sizeof(float) atIndex:5];
+              [enc setBytes:&np length:sizeof(uint) atIndex:6]; }
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
 
             // --- Phase L: MoE routing + shared expert projections ---
             size_t sgg_off = n_experts * sizeof(float);
             GpuMatvecJob routing_jobs[4] = {
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)gate_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)gate_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)gate_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->gate_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->gate_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->gate_b,
                   .out_buf = ctx->buf_output, .out_off = 0,
                   .out_ptr = NULL, .out_dim = n_experts, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)sg_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)sg_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)sg_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->sg_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->sg_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->sg_b,
                   .out_buf = ctx->buf_shared_gate, .out_off = 0,
                   .out_ptr = NULL, .out_dim = S, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)su_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)su_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)su_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->su_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->su_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->su_b,
                   .out_buf = ctx->buf_shared_up, .out_off = 0,
                   .out_ptr = NULL, .out_dim = S, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = (uint8_t *)sgg_w - base,
-                  .s_buf = ctx->buf_weights, .s_off = (uint8_t *)sgg_s - base,
-                  .b_buf = ctx->buf_weights, .b_off = (uint8_t *)sgg_b - base,
+                { .w_buf = ctx->buf_weights, .w_off = lw->sgg_w,
+                  .s_buf = ctx->buf_weights, .s_off = lw->sgg_s,
+                  .b_buf = ctx->buf_weights, .b_off = lw->sgg_b,
                   .out_buf = ctx->buf_output, .out_off = sgg_off,
                   .out_ptr = NULL, .out_dim = 1, .in_dim = H,
                   .group_size = cfg->group_size, .is_2bit = false },
@@ -999,8 +1023,8 @@ int engine_step(Engine *eng, int token_id) {
             // Fused path: softmax+topk+experts entirely on GPU, no CPU readback
             if (gpu_resident && ctx->softmax_topk && ctx->batch_expert_mv_dyn
                 && ctx->buf_expert_layers && ctx->buf_expert_layers[layer]) {
-                encode_fused_experts(enc, ctx, cfg, eng->wf, layer,
-                                     eng->active_experts, eng->quant, base);
+                encode_fused_experts(enc, ctx, cfg, layer,
+                                     eng->active_experts, eng->quant, lw);
                 if (!fwd_enc) {
                     [enc endEncoding];
                     [cmd commit];

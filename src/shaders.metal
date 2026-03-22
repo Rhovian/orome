@@ -425,6 +425,68 @@ kernel void residual_add(
     out[tid] = a[tid] + b[tid];
 }
 
+// Fused residual add + per-TG partial sum of squares (for subsequent RMS norm)
+// Each threadgroup writes its partial sum_sq to sum_sq_parts[tgid]
+kernel void residual_add_sum_sq(
+    device const float* a          [[buffer(0)]],
+    device const float* b          [[buffer(1)]],
+    device float*       out        [[buffer(2)]],
+    device float*       sum_sq_parts [[buffer(3)]],
+    constant uint&      dim        [[buffer(4)]],
+    uint tid  [[thread_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    float val = 0.0f;
+    if (tid < dim) {
+        val = a[tid] + b[tid];
+        out[tid] = val;
+    }
+
+    // Compute partial sum of squares within this threadgroup
+    float sq = val * val;
+    float simd_val = simd_sum(sq);
+
+    threadgroup float shared[32];
+    if (simd_lane == 0) shared[simd_group] = simd_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0) {
+        float v = (simd_lane < (tg_size + 31) / 32) ? shared[simd_lane] : 0.0f;
+        v = simd_sum(v);
+        if (simd_lane == 0) {
+            sum_sq_parts[tgid] = v;
+        }
+    }
+}
+
+// RMS norm apply with partial sum_sq (reads N partial sums, computes total)
+kernel void rms_norm_apply_partial(
+    device const float*    x           [[buffer(0)]],
+    device const uint16_t* weight      [[buffer(1)]],
+    device const float*    sum_sq_parts [[buffer(2)]],
+    device float*          out         [[buffer(3)]],
+    constant uint&         dim         [[buffer(4)]],
+    constant float&        eps         [[buffer(5)]],
+    constant uint&         num_parts   [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= dim) return;
+
+    // Sum partial sums (num_parts is small, e.g. 8)
+    float total_sq = 0.0f;
+    for (uint i = 0; i < num_parts; i++) {
+        total_sq += sum_sq_parts[i];
+    }
+
+    float rms = rsqrt(total_sq / float(dim) + eps);
+    float w = bf16_to_f32(weight[tid]);
+    out[tid] = x[tid] * rms * w;
+}
+
 // ============================================================================
 // Kernel 6: Batched GPU attention scores (Q @ K^T, scaled) — all heads at once
 // ============================================================================
