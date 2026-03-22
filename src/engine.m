@@ -365,14 +365,10 @@ int engine_step(Engine *eng, int token_id) {
         memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
     }
 
-    // Single command buffer for entire forward pass (GPU-resident path).
-    // Eliminates 40 command buffer creations + 40 blit-to-compute transitions.
+    // Per-layer command buffers with compute copy (no blit encoder transition).
     id<MTLCommandBuffer> fwd_cmd = nil;
     id<MTLComputeCommandEncoder> fwd_enc = nil;
-    if (gpu_resident) {
-        fwd_cmd = [ctx->queue commandBuffer];
-        fwd_enc = [fwd_cmd computeCommandEncoder];
-    }
+    // fwd_enc = nil means per-layer CBs will be used
 
     for (int layer = 0; layer < cfg->num_layers; layer++) {
         int n_experts = cfg->num_experts;
@@ -451,14 +447,17 @@ int engine_step(Engine *eng, int token_id) {
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             } else {
                 cmd = [ctx->queue commandBuffer];
-                if (gpu_resident) {
-                    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-                    [blit copyFromBuffer:ctx->buf_moe_hidden sourceOffset:0
-                                toBuffer:ctx->buf_residual destinationOffset:0
-                                    size:H * sizeof(float)];
-                    [blit endEncoding];
-                }
                 enc = [cmd computeCommandEncoder];
+                if (gpu_resident) {
+                    // Copy residual via compute kernel (no blit transition)
+                    [enc setComputePipelineState:ctx->copy_buffer];
+                    [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
+                    [enc setBuffer:ctx->buf_residual offset:0 atIndex:1];
+                    { uint c = (uint)H; [enc setBytes:&c length:sizeof(uint) atIndex:2]; }
+                    [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
             }
 
             // --- Phase A: Input norm → buf_input ---
@@ -763,14 +762,16 @@ int engine_step(Engine *eng, int token_id) {
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             } else {
                 cmd = [ctx->queue commandBuffer];
-                if (gpu_resident) {
-                    id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
-                    [blit copyFromBuffer:ctx->buf_moe_hidden sourceOffset:0
-                                toBuffer:ctx->buf_residual destinationOffset:0
-                                    size:H * sizeof(float)];
-                    [blit endEncoding];
-                }
                 enc = [cmd computeCommandEncoder];
+                if (gpu_resident) {
+                    [enc setComputePipelineState:ctx->copy_buffer];
+                    [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
+                    [enc setBuffer:ctx->buf_residual offset:0 atIndex:1];
+                    { uint c = (uint)H; [enc setBytes:&c length:sizeof(uint) atIndex:2]; }
+                    [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
             }
 
             // --- Phase A: Input norm → buf_input ---
