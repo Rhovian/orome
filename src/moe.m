@@ -432,7 +432,10 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
         size_t size = st.st_size;
         ef->layer_size[i] = size;
 
-        bool allow_resident_layer = (resident_bytes + size <= resident_budget);
+        // Only mlock layers when the FULL expert set fits in the resident budget.
+        // Partial mlock starves the OS page cache and is slower than pure pread.
+        bool allow_resident_layer = fits_fully_resident
+            && (resident_bytes + size <= resident_budget);
         if (allow_resident_layer) {
             void *data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
             if (data == MAP_FAILED) {
