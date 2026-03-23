@@ -36,6 +36,8 @@ uv.lock
 # Agent scratch files
 diag*.txt
 adaptive_memory_plan.md
+tracing_plan.md
+*.trace.json
 
 # macOS
 .DS_Store
