@@ -291,7 +291,8 @@ void metal_set_expert_weights(MetalCtx *ctx, ExpertFiles *ef, const ModelConfig 
     ctx->num_expert_layers = n;
     int wrapped = 0;
     for (int i = 0; i < n; i++) {
-        if (!ef->layer_data[i] || ef->layer_size[i] == 0) continue;
+        if (!ef->layer_resident || !ef->layer_resident[i]
+            || !ef->layer_data[i] || ef->layer_size[i] == 0) continue;
         size_t page_size = 16384;
         size_t aligned = (ef->layer_size[i] + page_size - 1) & ~(page_size - 1);
         ctx->buf_expert_layers[i] = [ctx->device newBufferWithBytesNoCopy:ef->layer_data[i]

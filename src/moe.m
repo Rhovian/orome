@@ -1,9 +1,9 @@
 /*
  * moe.m — Mixture of Experts: routing, expert I/O, expert forward pass.
  *
- * On machines with enough RAM (e.g. 96GB M2 Max), all expert weights are
- * mmap'd at startup — zero per-token I/O overhead. Expert data is accessed
- * directly from the mmap'd region with no copies.
+ * Expert loading is hardware-aware. Layers are only treated as GPU-resident
+ * when they fit inside a conservative resident-memory budget on the current
+ * machine; the remainder stay on the streaming pread path.
  */
 
 #import <Foundation/Foundation.h>
@@ -80,9 +80,37 @@ static int load_hot_mask_json(ExpertFiles *ef, const char *path,
     }
 }
 
+static size_t bytes_gib(size_t gib) {
+    return gib * (size_t)1024 * 1024 * 1024;
+}
+
+static size_t clamp_subtract(size_t total, size_t used) {
+    return total > used ? total - used : 0;
+}
+
+static size_t model_shared_weight_bytes(const char *model_dir) {
+    if (!model_dir) return 0;
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/model_weights.bin", model_dir);
+
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size <= 0) return 0;
+    return (size_t)st.st_size;
+}
+
+static bool expert_layer_is_resident(const ExpertFiles *ef, int layer_idx) {
+    return ef && ef->layer_resident && ef->layer_data
+        && layer_idx >= 0 && layer_idx < ef->num_layers
+        && ef->layer_resident[layer_idx]
+        && ef->layer_data[layer_idx] != NULL;
+}
+
 static bool expert_layer_uses_pread(const ExpertFiles *ef, int layer_idx) {
-    return ef && ef->pread_mode && ef->layer_data && ef->layer_fds
-        && !ef->layer_data[layer_idx] && ef->layer_fds[layer_idx] >= 0;
+    return ef && ef->layer_data && ef->layer_fds
+        && layer_idx >= 0 && layer_idx < ef->num_layers
+        && !expert_layer_is_resident(ef, layer_idx)
+        && ef->layer_fds[layer_idx] >= 0;
 }
 
 static void log_expert_route(int layer_idx, const int *expert_indices, int K) {
@@ -355,21 +383,36 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
     ef->layer_data = calloc(cfg->num_layers, sizeof(void *));
     ef->layer_size = calloc(cfg->num_layers, sizeof(size_t));
     ef->layer_fds  = calloc(cfg->num_layers, sizeof(int));
+    ef->layer_resident = calloc(cfg->num_layers, sizeof(bool));
     ef->num_experts = cfg->num_experts;
     ef->num_layers = cfg->num_layers;
 
     uint64_t total_ram = [NSProcessInfo processInfo].physicalMemory;
-    size_t budget = (size_t)(total_ram * 0.8);
+    size_t process_budget = (size_t)(total_ram * 0.8);
+    size_t shared_weight_bytes = model_shared_weight_bytes(model_dir);
+    // Leave extra headroom for Metal allocations, WindowServer, and swap breathing room
+    // during long 397B runs on unified memory machines.
+    size_t runtime_reserve = total_ram / 16;
+    if (runtime_reserve < bytes_gib(6)) runtime_reserve = bytes_gib(6);
+
     size_t total_expert = (size_t)cfg->num_layers * cfg->num_experts
         * cfg->expert_4bit.expert_size;
-    bool use_pread = (total_expert > budget);
-    ef->pread_mode = use_pread;
-    printf("[moe] Memory budget: %.1f GB (0.8 × %.1f GB), expert footprint: %.1f GB → %s\n",
-           budget / 1e9, total_ram / 1e9, total_expert / 1e9,
-           use_pread ? "pread" : "mlock");
+    size_t resident_budget = clamp_subtract(process_budget,
+                                            shared_weight_bytes + runtime_reserve);
+    ef->resident_budget_bytes = resident_budget;
+    ef->shared_weight_bytes = shared_weight_bytes;
+    ef->runtime_reserve_bytes = runtime_reserve;
 
-    size_t total_mmaped = 0;
-    int opened = 0;
+    bool fits_fully_resident = (total_expert <= resident_budget);
+    printf("[moe] Hardware budget: RAM %.1f GB, process cap %.1f GB, shared %.2f GB, runtime reserve %.1f GB → resident experts %.1f GB\n",
+           total_ram / 1e9, process_budget / 1e9, shared_weight_bytes / 1e9,
+           runtime_reserve / 1e9, resident_budget / 1e9);
+    printf("[moe] Expert footprint: %.1f GB → %s\n",
+           total_expert / 1e9, fits_fully_resident ? "fully resident" : "hybrid/streaming");
+
+    size_t resident_bytes = 0;
+    int resident_layers = 0;
+    int streamed_layers = 0;
 
     for (int i = 0; i < cfg->num_layers; i++) {
         ef->layer_fds[i] = -1;
@@ -389,38 +432,46 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
         size_t size = st.st_size;
         ef->layer_size[i] = size;
 
-        if (use_pread) {
-            ef->layer_data[i] = NULL;
-            ef->layer_fds[i] = fd;
-            opened++;
-            continue;
+        bool allow_resident_layer = (resident_bytes + size <= resident_budget);
+        if (allow_resident_layer) {
+            void *data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (data == MAP_FAILED) {
+                fprintf(stderr, "WARNING: mmap failed for expert layer %d, falling back to pread streaming\n",
+                        i);
+            } else {
+                madvise(data, size, MADV_WILLNEED);
+                if (mlock(data, size) == 0) {
+                    ef->layer_data[i] = data;
+                    ef->layer_fds[i] = fd;
+                    ef->layer_resident[i] = true;
+                    resident_bytes += size;
+                    resident_layers++;
+                    continue;
+                }
+
+                fprintf(stderr, "WARNING: mlock failed for expert layer %d, falling back to pread streaming\n",
+                        i);
+                munmap(data, size);
+            }
         }
 
-        void *data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
-        if (data == MAP_FAILED) {
-            close(fd);
-            ef->layer_size[i] = 0;
-            continue;
-        }
-
-        // Pre-fault all pages into RAM and lock them (no page faults during inference)
-        madvise(data, size, MADV_WILLNEED);
-        mlock(data, size);
-
-        ef->layer_data[i] = data;
-        ef->layer_size[i] = size;
         ef->layer_fds[i] = fd;
-        total_mmaped += size;
-        opened++;
+        ef->layer_resident[i] = false;
+        streamed_layers++;
     }
 
-    ef->all_mmaped = !use_pread && (opened == cfg->num_layers);
-    if (use_pread) {
-        ef->all_mmaped = false;
-        printf("[moe] pread-opened %d/%d layers\n", opened, cfg->num_layers);
+    ef->resident_bytes = resident_bytes;
+    ef->all_resident = (resident_layers == cfg->num_layers);
+    ef->pread_mode = !ef->all_resident;
+    ef->gpu_resident_safe = ef->all_resident;
+
+    if (ef->all_resident) {
+        printf("[moe] resident policy: all %d/%d layers mlock'd (%.1f GB resident)\n",
+               resident_layers, cfg->num_layers, resident_bytes / 1e9);
     } else {
-        printf("[moe] mmap'd %d/%d layers (%.1f GB total)\n",
-               opened, cfg->num_layers, total_mmaped / 1e9);
+        printf("[moe] resident policy: %d/%d layers resident (%.1f GB), %d streamed via pread\n",
+               resident_layers, cfg->num_layers, resident_bytes / 1e9, streamed_layers);
+        printf("[moe] safety guard: fused global GPU-resident path disabled because expert footprint exceeds resident budget on this machine\n");
     }
 
     if (hot_mask_path) {
@@ -454,13 +505,14 @@ void expert_files_close(ExpertFiles *ef, const ModelConfig *cfg) {
     if (!ef) return;
     int num_layers = ef->num_layers > 0 ? ef->num_layers : (cfg ? cfg->num_layers : 0);
     for (int i = 0; i < num_layers; i++) {
-        if (!ef->pread_mode && ef->layer_data[i]) munmap(ef->layer_data[i], ef->layer_size[i]);
+        if (ef->layer_data[i]) munmap(ef->layer_data[i], ef->layer_size[i]);
         if (ef->layer_fds[i] >= 0) close(ef->layer_fds[i]);
         if (ef->layer_fds_2bit && ef->layer_fds_2bit[i] >= 0) close(ef->layer_fds_2bit[i]);
     }
     free(ef->layer_data);
     free(ef->layer_size);
     free(ef->layer_fds);
+    free(ef->layer_resident);
     free(ef->layer_fds_2bit);
     free(ef->hot_mask);
     free(ef);
@@ -559,7 +611,8 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                  ExpertFiles *ef, int K, QuantType quant) {
     int H = cfg->hidden_dim;
     int n_experts = cfg->num_experts;
-    void *layer_data = ef->layer_data[layer_idx];
+    void *layer_data = expert_layer_is_resident(ef, layer_idx)
+        ? ef->layer_data[layer_idx] : NULL;
     bool use_pread = expert_layer_uses_pread(ef, layer_idx);
     if ((!layer_data && !use_pread) || K <= 0) return;
 
@@ -869,7 +922,8 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                         bool gpu_combine) {
     int H = cfg->hidden_dim;
     int n_experts = cfg->num_experts;
-    void *layer_data = ef->layer_data[layer_idx];
+    void *layer_data = expert_layer_is_resident(ef, layer_idx)
+        ? ef->layer_data[layer_idx] : NULL;
     bool use_pread = expert_layer_uses_pread(ef, layer_idx);
     if ((!layer_data && !use_pread) || K <= 0) return;
 

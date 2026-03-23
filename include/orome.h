@@ -427,13 +427,19 @@ typedef struct {
     void **layer_data;      // [num_layers] mmap'd expert data (NULL if not loaded)
     size_t *layer_size;     // [num_layers] size of each mmap
     int *layer_fds;         // [num_layers] fd (kept open for mmap lifetime)
+    bool *layer_resident;   // [num_layers] safe for direct GPU access (resident, not streamed)
     bool pread_mode;        // true when experts are loaded via pread into staging buffers
     int *layer_fds_2bit;    // [num_layers] fd for 2-bit expert files
     int num_experts;        // cached for hot mask checks
     int num_layers;         // cached for cleanup
     uint32_t *hot_mask;     // [num_layers * (max_experts/32)] bitmask of hot experts
     bool tiered_quant;      // using tiered quantization?
-    bool all_mmaped;        // true if all layers are mmap'd in memory
+    bool all_resident;      // true if every layer is resident and direct-access safe
+    bool gpu_resident_safe; // true only when fused GPU path is safe across all layers
+    size_t resident_budget_bytes;
+    size_t resident_bytes;
+    size_t shared_weight_bytes;
+    size_t runtime_reserve_bytes;
 } ExpertFiles;
 
 ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,

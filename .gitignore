@@ -12,6 +12,7 @@ experiments/*/status.md
 experiments/*/logs/
 experiments/*/errors.log
 experiments/*/bench_err.txt
+experiments/*/*.txt
 *.log
 
 # Model weights (too large for git)

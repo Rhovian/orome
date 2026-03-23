@@ -2,7 +2,7 @@
 
 You are an autonomous research agent optimizing a Metal inference engine for Qwen3.5-397B-A17B on an M2 Max Mac Studio (96GB unified memory, ~400 GB/s bandwidth, 38 GPU cores, actively cooled).
 
-This is the larger sibling of the 35B model. The 35B optimization campaign achieved 62.53 tok/s with all experts mlock'd in RAM. The 397B model's experts (~73 GB at 4-bit) don't fit entirely in memory with headroom, so this campaign focuses on **adaptive memory strategies** — pread, tiered quantization, thermal-aware K — while maintaining the GPU dispatch optimizations already proven on 35B.
+This is the larger sibling of the 35B model. The 35B optimization campaign achieved 62.53 tok/s with all experts mlock'd in RAM. On this machine, the 397B model's packed expert layers are about **217 GB on disk** (60 x ~3.62 GB), so they categorically do not fit as a fully resident expert set. This campaign therefore focuses on **adaptive memory strategies** — pread, tiered quantization, thermal-aware K, and hardware-aware hybrid residency — while maintaining the GPU dispatch optimizations already proven on 35B.
 
 ## Setup
 
@@ -25,7 +25,7 @@ The 397B model architecture:
 - Expert size (4-bit): ~2.36 MB each (vs ~590 KB)
 - Total expert weight: ~72.5 GB at 4-bit
 
-Memory budget: 0.8 × 96 GB = ~76.8 GB. Expert weights alone are ~72.5 GB, plus ~20 GB non-expert + runtime. **This model requires the pread path.**
+Memory budget on the current Mac Studio: the machine reports ~103.1 GB physical RAM, so 0.8 x RAM is ~82.5 GB. `model_weights.bin` is ~5.52 GB, leaving roughly ~69-73 GB of safe resident budget for experts after runtime headroom. The packed expert footprint is ~217.4 GB. **This model requires a streaming/pread-aware path; do not treat it as globally GPU-resident.**
 
 Secondary goals (don't sacrifice tok/s for these):
 - Minimize TTFT (time to first token)
@@ -50,9 +50,11 @@ Once the model produces correct output, switch to the optimization axes below.
 
 4. **Thermal-aware K** — EMA-based projection latency tracking. Reduce K from 10 to a lower value when sustained generation causes GPU pressure. Less critical on the actively cooled Mac Studio but still useful under memory pressure.
 
-5. **Pread I/O optimization** — Tune GCD queue priorities, experiment with readahead patterns, async pread-ahead for the next layer while current layer computes.
+5. **Hybrid mlock/pread** — Instead of pure pread for all 60 layers, keep as many expert layers resident as fit inside the measured resident budget on this machine, and pread the rest. At ~3.62 GB/layer and ~69-73 GB safe resident budget, expect roughly 19-20 resident layers while the remaining ~40 stream from SSD. This eliminates pread latency for a significant fraction of layers. Implement in `moe.m` expert loading — make the decision from actual layer file sizes and measured hardware budget, not from nominal model specs. Must not regress 35B (which already fits entirely in mlock).
 
-6. **GPU dispatch efficiency** — All the 35B optimizations (batched dispatch, fused experts, deferred execution) should carry over. Verify they work correctly with the larger dimensions.
+6. **Pread I/O optimization** — Tune GCD queue priorities, experiment with readahead patterns, async pread-ahead for the next layer while current layer computes.
+
+7. **GPU dispatch efficiency** — All the 35B optimizations (batched dispatch, fused experts, deferred execution) should carry over. Verify they work correctly with the larger dimensions.
 
 ## Codebase Structure
 
@@ -95,15 +97,16 @@ Benchmark: `uv run tools/benchmark.py --trials 3 --model-dir /Users/j/models/Qwe
 
 | Resource | Value |
 |---|---|
-| Memory | 96 GB unified |
+| Memory | ~103.1 GB physical unified (machine-reported) |
 | GPU cores | 38 |
 | Bandwidth | ~400 GB/s |
 | Cooling | Active fan |
-| Expert weights (4-bit) | ~72.5 GB (exceeds 0.8 × RAM) |
+| Expert weights (packed 4-bit layers) | ~217.4 GB total |
 | Expert weights (2-bit) | ~36.3 GB (fits comfortably) |
 | Expert weights (tiered 25% hot) | ~45.4 GB |
-| Non-expert weights | ~10 GB mmap'd |
-| Memory for page cache | ~23 GB at 4-bit, ~50 GB at 2-bit |
+| Non-expert weights | ~5.52 GB mmap'd |
+| Safe resident expert budget | ~69-73 GB on this machine |
+| Memory for page cache / OS headroom | whatever remains after resident budget; do not consume it with "virtual fit" mappings |
 
 ## Experiment Protocol
 
@@ -141,6 +144,8 @@ commit	tok_sec	ttft_ms	proj_avg_ms	status	description
 
 - **NEVER STOP**. Run experiments indefinitely until manually interrupted. The user is sleeping.
 - **NEVER ask questions**. You are autonomous. Make decisions and move on.
+- **Be hardware-aware**. Every memory-path experiment must budget against the actual machine-reported RAM and the actual on-disk model files on this machine, not nominal parameter-count estimates.
+- **Never confuse virtual mapping with safe residency**. A successful `mmap` of oversized expert files does not mean the model fits in unified memory. Do not disable streaming or enable the fused global GPU-resident path unless the full expert footprint fits inside the computed resident budget.
 - **Keep changes atomic**. One idea per experiment. Don't combine multiple changes — you won't know which helped.
 - **Log everything**. Every experiment gets a row in results.tsv, even crashes.
 - **Write status.md before finishing**. This is your handoff to the next session. Include: current best tok/s, what you've tried, what to try next, any insights.

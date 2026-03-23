@@ -531,7 +531,7 @@ int engine_step(Engine *eng, int token_id) {
     // Upload hidden to GPU once before the layer loop.
     // Hidden state stays on GPU (in buf_moe_hidden) throughout all layers.
     bool gpu_resident = (ctx && ctx->buf_weights && ctx->moe_combine
-                         && !eng->ef->pread_mode);
+                         && eng->ef->gpu_resident_safe);
     if (gpu_resident) {
         memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
     }
