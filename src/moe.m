@@ -46,7 +46,7 @@ static void expert_pread_task(void *ctx) {
 }
 
 // ============================================================================
-// Expert file management — mmap all layers at startup
+// Expert file management — resident layers mmap + streaming fallback
 // ============================================================================
 
 static int load_hot_mask_json(ExpertFiles *ef, const char *path,
@@ -469,9 +469,9 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
         printf("[moe] resident policy: all %d/%d layers mlock'd (%.1f GB resident)\n",
                resident_layers, cfg->num_layers, resident_bytes / 1e9);
     } else {
-        printf("[moe] resident policy: %d/%d layers resident (%.1f GB), %d streamed via pread\n",
+        printf("[moe] resident policy: %d/%d layers mlock'd (%.1f GB), %d streamed via pread\n",
                resident_layers, cfg->num_layers, resident_bytes / 1e9, streamed_layers);
-        printf("[moe] safety guard: fused global GPU-resident path disabled because expert footprint exceeds resident budget on this machine\n");
+        printf("[moe] safety guard: non-resident layers stay on streaming path to avoid virtual-fit OOMs\n");
     }
 
     if (hot_mask_path) {
@@ -696,11 +696,12 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     cpu_normalize_weights(expert_weights, K);
     log_expert_route(layer_idx, expert_indices, K);
 
-    // 3. Routed experts — GPU if expert Metal buffers available, else CPU
+    // 3. Routed experts — GPU if a resident expert Metal buffer is available,
+    // otherwise stay on the streaming/pread path.
     id<MTLBuffer> expert_layer_buf = (ctx && ctx->buf_expert_layers)
                                       ? ctx->buf_expert_layers[layer_idx] : nil;
 
-    if (use_pread) {
+    if (!expert_layer_buf && use_pread) {
         bool ran_gpu = false;
         bool expert_is_2bit[OROME_MAX_ACTIVE] = {false};
 
@@ -945,7 +946,6 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     uint16_t *sd_b = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.down_proj.biases");
     int S = cfg->shared_intermediate;
     memset(s_shared_out, 0, H * sizeof(float));
-    if (use_pread) gpu_combine = false;
 
     // 3. Routed experts + shared expert — GPU path
     // h_post is already in ctx->buf_input from fused command buffer
@@ -953,7 +953,10 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     id<MTLBuffer> expert_layer_buf = (ctx && ctx->buf_expert_layers)
                                       ? ctx->buf_expert_layers[layer_idx] : nil;
 
-    if (use_pread) {
+    // Prefer direct Metal buffer access for resident layers over pread staging.
+    if (!expert_layer_buf && use_pread) gpu_combine = false;
+
+    if (!expert_layer_buf && use_pread) {
         bool ran_gpu = false;
         bool expert_is_2bit[OROME_MAX_ACTIVE] = {false};
 

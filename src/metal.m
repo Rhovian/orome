@@ -291,6 +291,7 @@ void metal_set_expert_weights(MetalCtx *ctx, ExpertFiles *ef, const ModelConfig 
     ctx->num_expert_layers = n;
     int wrapped = 0;
     for (int i = 0; i < n; i++) {
+        // Only wrap layers that are explicitly inside the resident budget.
         if (!ef->layer_resident || !ef->layer_resident[i]
             || !ef->layer_data[i] || ef->layer_size[i] == 0) continue;
         size_t page_size = 16384;
@@ -301,7 +302,7 @@ void metal_set_expert_weights(MetalCtx *ctx, ExpertFiles *ef, const ModelConfig 
                                                                deallocator:nil];
         if (ctx->buf_expert_layers[i]) wrapped++;
     }
-    printf("[metal] Expert layers wrapped as Metal buffers: %d/%d\n", wrapped, n);
+    printf("[metal] Resident expert layers wrapped as Metal buffers: %d/%d\n", wrapped, n);
 }
 
 void metal_free(MetalCtx *ctx) {

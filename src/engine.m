@@ -826,18 +826,31 @@ int engine_step(Engine *eng, int token_id) {
             for (int j = 0; j < 4; j++)
                 gpu_encode_matvec_job(enc, ctx, &routing_jobs[j]);
 
-            // Fused path: softmax+topk+experts entirely on GPU, no CPU readback
-            if (gpu_resident && ctx->softmax_topk && ctx->batch_expert_mv_dyn
+            // Per-layer fused path: use fused experts when layer has Metal buffer
+            bool layer_fused = ctx->softmax_topk && ctx->batch_expert_mv_dyn
                 && ctx->buf_expert_layers && ctx->buf_expert_layers[layer]
-                && !moe_get_profile_experts()) {
+                && !moe_get_profile_experts();
+
+            if (gpu_resident && layer_fused) {
+                // Fully GPU-resident: no readback between layers
                 encode_fused_experts(enc, ctx, cfg, layer,
                                      effective_k, eng->quant, lw);
                 if (!fwd_enc) {
                     [enc endEncoding];
                     [cmd commit];
                 }
-
+            } else if (layer_fused) {
+                // Hybrid fused: this resident layer has a direct Metal buffer
+                // GPU does softmax+topk+experts — no CPU routing readback
+                encode_fused_experts(enc, ctx, cfg, layer,
+                                     effective_k, eng->quant, lw);
+                [enc endEncoding];
+                [cmd commit];
+                [cmd waitUntilCompleted];
+                // Sync hidden back to CPU for next layer
+                memcpy(eng->hidden, [ctx->buf_moe_hidden contents], H * sizeof(float));
             } else {
+                // Fallback: CPU routing readback + moe_forward_routed
                 [enc endEncoding];
                 if (cmd) [cmd commit];
                 if (cmd) [cmd waitUntilCompleted];
@@ -849,84 +862,6 @@ int engine_step(Engine *eng, int token_id) {
                        (uint8_t *)[ctx->buf_output contents] + sgg_off,
                        sizeof(float));
 
-                // Debug: check gate scores and hidden state for NaN
-                if (moe_get_profile_experts()) {
-                    int nans = 0;
-                    for (int j = 0; j < n_experts; j++)
-                        if (s_fused_gate_scores[j] != s_fused_gate_scores[j]) nans++;
-                    if (nans > 0)
-                        fprintf(stderr, "NAN_GATE pos=%d layer=%d nans=%d/%d\n", pos, layer, nans, n_experts);
-                    float *h = (float *)[ctx->buf_moe_hidden contents];
-                    int hnans = 0;
-                    for (int j = 0; j < H; j++)
-                        if (h[j] != h[j]) hnans++;
-                    float *hp = (float *)[ctx->buf_input contents];
-                    int hpnans = 0;
-                    for (int j = 0; j < H; j++)
-                        if (hp[j] != hp[j]) hpnans++;
-                    if (hnans > 0 || hpnans > 0)
-                        fprintf(stderr, "NAN_HIDDEN pos=%d layer=%d moe_hidden=%d/%d h_post=%d/%d\n",
-                                layer, hnans, H, hpnans, H);
-
-                    // Detailed buffer checks for layers near first NaN
-                    if (layer >= 50 && layer <= 60 && cfg->layer_types[layer] == ATTN_LINEAR) {
-                        float *dv = (float *)[ctx->buf_linear_v contents];
-                        int dv_nans = 0; float dv_max = 0;
-                        for (int j = 0; j < cfg->linear_total_value; j++) {
-                            if (dv[j] != dv[j]) dv_nans++;
-                            else if (fabsf(dv[j]) > dv_max) dv_max = fabsf(dv[j]);
-                        }
-                        float *co = (float *)[ctx->buf_conv_output contents];
-                        int co_nans = 0; float co_max = 0;
-                        for (int j = 0; j < cfg->linear_conv_dim; j++) {
-                            if (co[j] != co[j]) co_nans++;
-                            else if (fabsf(co[j]) > co_max) co_max = fabsf(co[j]);
-                        }
-                        float *hm = (float *)[ctx->buf_h_mid contents];
-                        int hm_nans = 0; float hm_max = 0;
-                        for (int j = 0; j < H; j++) {
-                            if (hm[j] != hm[j]) hm_nans++;
-                            else if (fabsf(hm[j]) > hm_max) hm_max = fabsf(hm[j]);
-                        }
-                        float *dc = (float *)[ctx->buf_linear_decay contents];
-                        float *bt = (float *)[ctx->buf_linear_beta contents];
-                        int dc_nans = 0, bt_nans = 0;
-                        float dc_min = 1e30f, dc_max2 = -1e30f;
-                        for (int j = 0; j < cfg->linear_num_v_heads; j++) {
-                            if (dc[j] != dc[j]) dc_nans++;
-                            else { if (dc[j] < dc_min) dc_min = dc[j]; if (dc[j] > dc_max2) dc_max2 = dc[j]; }
-                            if (bt[j] != bt[j]) bt_nans++;
-                        }
-                        float *res = (float *)[ctx->buf_residual contents];
-                        int res_nans = 0; float res_max = 0;
-                        for (int j = 0; j < H; j++) {
-                            if (res[j] != res[j]) res_nans++;
-                            else if (fabsf(res[j]) > res_max) res_max = fabsf(res[j]);
-                        }
-                        // Check Z projection (buf_linear_output)
-                        float *zp = (float *)[ctx->buf_linear_output contents];
-                        int zp_nans = 0; float zp_max = 0;
-                        for (int j = 0; j < cfg->linear_total_value; j++) {
-                            if (zp[j] != zp[j]) zp_nans++;
-                            else if (fabsf(zp[j]) > zp_max) zp_max = fabsf(zp[j]);
-                        }
-                        // Check gated_rms_norm output (buf_linear_q)
-                        float *gn = (float *)[ctx->buf_linear_q contents];
-                        int gn_nans = 0; float gn_max = 0;
-                        for (int j = 0; j < cfg->linear_total_value; j++) {
-                            if (gn[j] != gn[j]) gn_nans++;
-                            else if (fabsf(gn[j]) > gn_max) gn_max = fabsf(gn[j]);
-                        }
-                        fprintf(stderr, "DIAG layer=%d conv(nans=%d,max=%.3e) "
-                                "delta(nans=%d,max=%.3e) Z(nans=%d,max=%.3e) "
-                                "gated_norm(nans=%d,max=%.3e) "
-                                "oproj(nans=%d,max=%.3e) res(nans=%d,max=%.3e)\n",
-                                layer, co_nans, co_max, dv_nans, dv_max,
-                                zp_nans, zp_max, gn_nans, gn_max,
-                                hm_nans, hm_max, res_nans, res_max);
-                    }
-                }
-
                 if (!gpu_resident) {
                     memcpy(eng->hidden, [ctx->buf_moe_hidden contents], H * sizeof(float));
                     memcpy(eng->residual, eng->hidden, H * sizeof(float));
@@ -936,17 +871,6 @@ int engine_step(Engine *eng, int token_id) {
                                    s_fused_gate_scores, shared_gate_score,
                                    eng->ef, effective_k, eng->quant,
                                    gpu_resident);
-
-                // Debug: check hidden after MoE
-                if (moe_get_profile_experts() && !gpu_resident && layer >= 38 && layer <= 42) {
-                    int nans = 0; float maxv = 0;
-                    for (int i = 0; i < H; i++) {
-                        if (eng->hidden[i] != eng->hidden[i]) nans++;
-                        float av = fabsf(eng->hidden[i]);
-                        if (av > maxv) maxv = av;
-                    }
-                    fprintf(stderr, "DIAG_HIDDEN_POST_MOE layer=%d nans=%d max=%.3e\n", layer, nans, maxv);
-                }
             }
 
             t1 = now_ms();
@@ -1279,17 +1203,26 @@ int engine_step(Engine *eng, int token_id) {
             for (int j = 0; j < 4; j++)
                 gpu_encode_matvec_job(enc, ctx, &routing_jobs[j]);
 
-            // Fused path: softmax+topk+experts entirely on GPU, no CPU readback
-            if (gpu_resident && ctx->softmax_topk && ctx->batch_expert_mv_dyn
+            // Per-layer fused path: use fused experts when layer has Metal buffer
+            bool layer_fused_fa = ctx->softmax_topk && ctx->batch_expert_mv_dyn
                 && ctx->buf_expert_layers && ctx->buf_expert_layers[layer]
-                && !moe_get_profile_experts()) {
+                && !moe_get_profile_experts();
+
+            if (gpu_resident && layer_fused_fa) {
                 encode_fused_experts(enc, ctx, cfg, layer,
                                      effective_k, eng->quant, lw);
                 if (!fwd_enc) {
                     [enc endEncoding];
                     [cmd commit];
                 }
-
+            } else if (layer_fused_fa) {
+                // Hybrid fused: this resident layer has a direct Metal buffer
+                encode_fused_experts(enc, ctx, cfg, layer,
+                                     effective_k, eng->quant, lw);
+                [enc endEncoding];
+                [cmd commit];
+                [cmd waitUntilCompleted];
+                memcpy(eng->hidden, [ctx->buf_moe_hidden contents], H * sizeof(float));
             } else {
                 [enc endEncoding];
                 if (cmd) [cmd commit];
@@ -1302,15 +1235,6 @@ int engine_step(Engine *eng, int token_id) {
                        (uint8_t *)[ctx->buf_output contents] + sgg_off,
                        sizeof(float));
 
-                // Debug: check gate scores and hidden state for NaN
-                if (moe_get_profile_experts()) {
-                    int nans = 0;
-                    for (int j = 0; j < n_experts; j++)
-                        if (s_fused_gate_scores[j] != s_fused_gate_scores[j]) nans++;
-                    if (nans > 0)
-                        fprintf(stderr, "NAN_GATE pos=%d layer=%d nans=%d/%d\n", pos, layer, nans, n_experts);
-                }
-
                 if (!gpu_resident) {
                     memcpy(eng->hidden, [ctx->buf_moe_hidden contents], H * sizeof(float));
                     memcpy(eng->residual, eng->hidden, H * sizeof(float));
@@ -1320,17 +1244,6 @@ int engine_step(Engine *eng, int token_id) {
                                    s_fused_gate_scores, shared_gate_score,
                                    eng->ef, effective_k, eng->quant,
                                    gpu_resident);
-
-                // Debug: check hidden after MoE (full attn path)
-                if (moe_get_profile_experts() && !gpu_resident && layer >= 38 && layer <= 42) {
-                    int nans = 0; float maxv = 0;
-                    for (int i = 0; i < H; i++) {
-                        if (eng->hidden[i] != eng->hidden[i]) nans++;
-                        float av = fabsf(eng->hidden[i]);
-                        if (av > maxv) maxv = av;
-                    }
-                    fprintf(stderr, "DIAG_HIDDEN_POST_MOE layer=%d nans=%d max=%.3e type=full\n", layer, nans, maxv);
-                }
             }
 
             t1 = now_ms();
