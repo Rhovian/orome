@@ -18,9 +18,22 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 
+#include <mach/mach_time.h>
+#include <mach/mach.h>
+#include <mach/vm_statistics.h>
+
 #include "orome.h"
 
 #define ROWS_PER_TG 16  // must match metal.m and shaders.metal
+
+// --- Timing helpers ---
+static double ns_per_tick = 0;
+static void ensure_timebase(void) {
+    if (ns_per_tick > 0) return;
+    mach_timebase_info_data_t info;
+    mach_timebase_info(&info);
+    ns_per_tick = (double)info.numer / (double)info.denom;
+}
 
 static bool g_profile_experts = false;
 
@@ -38,11 +51,15 @@ typedef struct {
     size_t size;
     void *dst;
     ssize_t result;
+    uint64_t elapsed_ns;   // mach_absolute_time delta, converted to ns
 } ExpertReadTask;
 
 static void expert_pread_task(void *ctx) {
     ExpertReadTask *task = (ExpertReadTask *)ctx;
+    uint64_t t0 = mach_absolute_time();
     task->result = pread(task->fd, task->dst, task->size, task->offset);
+    uint64_t t1 = mach_absolute_time();
+    task->elapsed_ns = (uint64_t)((t1 - t0) * ns_per_tick);
 }
 
 // ============================================================================
@@ -113,7 +130,17 @@ static bool expert_layer_uses_pread(const ExpertFiles *ef, int layer_idx) {
         && ef->layer_fds[layer_idx] >= 0;
 }
 
-static void log_expert_route(int layer_idx, const int *expert_indices, int K) {
+static void log_expert_route(int layer_idx, const int *expert_indices, int K,
+                             const ExpertFiles *ef) {
+    // Always accumulate frequency stats (cheap: K array increments per call)
+    if (ef && ef->layer_stats && ef->layer_stats[layer_idx]) {
+        MoeLayerStats *st = ef->layer_stats[layer_idx];
+        for (int k = 0; k < K; k++) {
+            if (expert_indices[k] < ef->num_experts)
+                st->expert_freq[expert_indices[k]]++;
+        }
+        st->token_count++;
+    }
     if (!g_profile_experts) return;
     fprintf(stderr, "EXPERT_ROUTE layer=%d experts=", layer_idx);
     for (int k = 0; k < K; k++) fprintf(stderr, "%s%d", k ? "," : "", expert_indices[k]);
@@ -187,8 +214,10 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
     }
 
     // dispatch_apply: batched parallel pread — less overhead than dispatch_group+async_f
+    double t_io_start = now_ms();
     dispatch_apply((size_t)K, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                    ^(size_t k) { expert_pread_task(&task_ptr[k]); });
+    double t_io_end = now_ms();
 
     for (int k = 0; k < K; k++) {
         if (tasks[k].result != (ssize_t)tasks[k].size) {
@@ -196,6 +225,20 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
                     "ERROR: pread failed for layer %d expert %d (%zd/%zu bytes)\n",
                     layer_idx, expert_indices[k], tasks[k].result, tasks[k].size);
             return -1;
+        }
+    }
+
+    // Accumulate per-layer I/O stats
+    if (ef->layer_stats && ef->layer_stats[layer_idx]) {
+        MoeLayerStats *st = ef->layer_stats[layer_idx];
+        st->io_ms += t_io_end - t_io_start;
+        for (int k = 0; k < K; k++) {
+            st->io_bytes += tasks[k].size;
+            uint64_t us = tasks[k].elapsed_ns / 1000;
+            if      (us < 200)  st->pread_us_buckets[0]++;
+            else if (us < 1000) st->pread_us_buckets[1]++;
+            else if (us < 5000) st->pread_us_buckets[2]++;
+            else                st->pread_us_buckets[3]++;
         }
     }
 
@@ -374,6 +417,7 @@ static bool gpu_forward_pread_experts(MetalCtx *ctx, const ModelConfig *cfg,
 
 ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
                                const char *hot_mask_path) {
+    ensure_timebase();
     ExpertFiles *ef = calloc(1, sizeof(ExpertFiles));
     ef->layer_data = calloc(cfg->num_layers, sizeof(void *));
     ef->layer_size = calloc(cfg->num_layers, sizeof(size_t));
@@ -381,6 +425,13 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
     ef->layer_resident = calloc(cfg->num_layers, sizeof(bool));
     ef->num_experts = cfg->num_experts;
     ef->num_layers = cfg->num_layers;
+
+    // Per-layer I/O instrumentation (always allocated, ~1 KB/layer)
+    ef->layer_stats = calloc(cfg->num_layers, sizeof(MoeLayerStats *));
+    for (int i = 0; i < cfg->num_layers; i++) {
+        size_t sz = sizeof(MoeLayerStats) + cfg->num_experts * sizeof(uint16_t);
+        ef->layer_stats[i] = calloc(1, sz);
+    }
 
     uint64_t total_ram = [NSProcessInfo processInfo].physicalMemory;
     size_t process_budget = (size_t)(total_ram * 0.8);
@@ -519,7 +570,106 @@ void expert_files_close(ExpertFiles *ef, const ModelConfig *cfg) {
     free(ef->layer_resident);
     free(ef->layer_fds_2bit);
     free(ef->hot_mask);
+    if (ef->layer_stats) {
+        for (int i = 0; i < num_layers; i++) free(ef->layer_stats[i]);
+        free(ef->layer_stats);
+    }
     free(ef);
+}
+
+// ============================================================================
+// I/O instrumentation: periodic summary report
+// ============================================================================
+
+void moe_print_layer_stats(ExpertFiles *ef, bool reset) {
+    if (!ef || !ef->layer_stats) return;
+    int num_layers = ef->num_layers;
+    if (num_layers <= 0) return;
+
+    // Aggregate across all layers
+    double total_io = 0, total_compute = 0, total_combine = 0;
+    uint64_t total_bytes = 0;
+    int total_tokens = 0;
+    uint32_t total_buckets[4] = {0};
+    double min_io = 1e30, max_io = 0;
+    int min_layer = 0, max_layer = 0;
+
+    for (int i = 0; i < num_layers; i++) {
+        MoeLayerStats *st = ef->layer_stats[i];
+        if (!st || st->token_count == 0) continue;
+        double avg_io = st->io_ms / st->token_count;
+        total_io += st->io_ms;
+        total_compute += st->compute_ms;
+        total_combine += st->combine_ms;
+        total_bytes += st->io_bytes;
+        if (i == 0 || total_tokens == 0) total_tokens = st->token_count;
+        for (int b = 0; b < 4; b++) total_buckets[b] += st->pread_us_buckets[b];
+        if (avg_io < min_io) { min_io = avg_io; min_layer = i; }
+        if (avg_io > max_io) { max_io = avg_io; max_layer = i; }
+    }
+
+    if (total_tokens == 0) return;
+    double inv = 1.0 / total_tokens;
+    double bw = (total_bytes > 0 && total_io > 0)
+        ? (total_bytes / 1e9) / (total_io / 1e3) : 0;
+    uint32_t total_reads = total_buckets[0] + total_buckets[1]
+                         + total_buckets[2] + total_buckets[3];
+    double pct0 = total_reads ? 100.0 * total_buckets[0] / total_reads : 0;
+    double pct1 = total_reads ? 100.0 * total_buckets[1] / total_reads : 0;
+    double pct2 = total_reads ? 100.0 * total_buckets[2] / total_reads : 0;
+    double pct3 = total_reads ? 100.0 * total_buckets[3] / total_reads : 0;
+
+    fprintf(stderr,
+        "[moe-io] avg/tok: io=%.1fms compute=%.1fms combine=%.1fms  "
+        "bandwidth=%.2f GB/s  (%.1f MB/tok)\n",
+        total_io * inv, total_compute * inv, total_combine * inv,
+        bw, total_bytes * inv / 1e6);
+    fprintf(stderr,
+        "[moe-io] pread latency: %.0f%% <200us (cached)  %.0f%% 200us-1ms  "
+        "%.0f%% 1-5ms  %.0f%% >5ms (SSD)\n",
+        pct0, pct1, pct2, pct3);
+    fprintf(stderr,
+        "[moe-io] layer variance: fastest=%.1fms (L%02d) slowest=%.1fms (L%02d)\n",
+        min_io, min_layer, max_io, max_layer);
+
+    // Print top experts for sampled layers
+    int sample_layers[] = {0, num_layers/4, num_layers/2, 3*num_layers/4, num_layers-1};
+    for (int s = 0; s < 5; s++) {
+        int li = sample_layers[s];
+        if (li >= num_layers) continue;
+        MoeLayerStats *st = ef->layer_stats[li];
+        if (!st || st->token_count == 0) continue;
+        // Find top 5 experts by frequency
+        int top[5] = {-1,-1,-1,-1,-1};
+        for (int e = 0; e < ef->num_experts; e++) {
+            for (int t = 0; t < 5; t++) {
+                if (top[t] < 0 || st->expert_freq[e] > st->expert_freq[top[t]]) {
+                    for (int u = 4; u > t; u--) top[u] = top[u-1];
+                    top[t] = e;
+                    break;
+                }
+            }
+        }
+        fprintf(stderr, "[moe-io] L%02d top experts:", li);
+        int total_freq = st->token_count * 10; // K experts per token (approximate)
+        for (int t = 0; t < 5 && top[t] >= 0; t++) {
+            int pct = total_freq > 0 ? (int)(100.0 * st->expert_freq[top[t]] / total_freq + 0.5) : 0;
+            fprintf(stderr, " e%d=%d%%", top[t], pct);
+        }
+        fprintf(stderr, "\n");
+    }
+
+    if (reset) {
+        for (int i = 0; i < num_layers; i++) {
+            MoeLayerStats *st = ef->layer_stats[i];
+            if (!st) continue;
+            st->io_ms = st->compute_ms = st->combine_ms = 0;
+            st->io_bytes = 0;
+            st->token_count = 0;
+            memset(st->pread_us_buckets, 0, sizeof(st->pread_us_buckets));
+            memset(st->expert_freq, 0, ef->num_experts * sizeof(uint16_t));
+        }
+    }
 }
 
 bool expert_is_hot(const ExpertFiles *ef, int layer, int expert_id) {
@@ -698,7 +848,7 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     cpu_softmax(s_gate_scores, n_experts);
     cpu_topk(s_gate_scores, n_experts, K, expert_indices, expert_weights);
     cpu_normalize_weights(expert_weights, K);
-    log_expert_route(layer_idx, expert_indices, K);
+    log_expert_route(layer_idx, expert_indices, K, ef);
 
     // 3. Routed experts — GPU if a resident expert Metal buffer is available,
     // otherwise stay on the streaming/pread path.
@@ -942,7 +1092,7 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     cpu_softmax(gate_scores, n_experts);
     cpu_topk(gate_scores, n_experts, K, expert_indices, expert_weights);
     cpu_normalize_weights(expert_weights, K);
-    log_expert_route(layer_idx, expert_indices, K);
+    log_expert_route(layer_idx, expert_indices, K, ef);
 
     // 2. Shared expert down weights
     uint32_t *sd_w = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.down_proj.weight");

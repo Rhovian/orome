@@ -422,6 +422,20 @@ void linear_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *
 // MoE (Mixture of Experts)
 // ============================================================================
 
+// Per-layer I/O and compute instrumentation.
+// Accumulated across tokens, reset periodically by moe_print_layer_stats().
+typedef struct {
+    double io_ms;              // wall time in pread dispatch
+    double compute_ms;         // wall time in GPU expert compute
+    double combine_ms;         // wall time in CPU combine
+    uint64_t io_bytes;         // bytes pread'd
+    int token_count;           // tokens accumulated
+    // pread latency histogram (per-expert-read, microseconds)
+    // buckets: [0-200us] [200-1000us] [1000-5000us] [5000+us]
+    uint32_t pread_us_buckets[4];
+    uint16_t expert_freq[];    // [num_experts] routing frequency (flexible array)
+} MoeLayerStats;
+
 // Expert weight management — mmap'd for machines with enough RAM
 typedef struct {
     void **layer_data;      // [num_layers] mmap'd expert data (NULL if not loaded)
@@ -440,6 +454,7 @@ typedef struct {
     size_t resident_bytes;
     size_t shared_weight_bytes;
     size_t runtime_reserve_bytes;
+    MoeLayerStats **layer_stats; // [num_layers] per-layer I/O instrumentation
 } ExpertFiles;
 
 ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
@@ -447,6 +462,8 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
 void         expert_files_close(ExpertFiles *ef, const ModelConfig *cfg);
 bool         expert_is_hot(const ExpertFiles *ef, int layer, int expert_id);
 void         moe_set_profile_experts(bool enabled);
+bool         moe_get_profile_experts(void);
+void         moe_print_layer_stats(ExpertFiles *ef, bool reset);
 bool         moe_get_profile_experts(void);
 
 // Wrap mmap'd expert layer data as Metal buffers for GPU expert forward.
