@@ -305,9 +305,11 @@ static bool gpu_forward_pread_experts(MetalCtx *ctx, const ModelConfig *cfg,
     uint8_t *wbase = (uint8_t *)[ctx->buf_weights contents];
 
     id<MTLCommandBuffer> cmd = [ctx->queue commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+    id<MTLComputeCommandEncoder> enc =
+        [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
     if (!cmd || !enc) return false;
 
+    // Phase 1: gate + up projections for all K experts (independent, run concurrently)
     for (int k = 0; k < K; k++) {
         const ExpertLayout *elayout = expert_is_2bit[k] ? &cfg->expert_2bit : &cfg->expert_4bit;
         id<MTLComputePipelineState> mv_pipe = expert_is_2bit[k] ? ctx->matvec_2bit : ctx->matvec_4bit;
@@ -346,6 +348,10 @@ static bool gpu_forward_pread_experts(MetalCtx *ctx, const ModelConfig *cfg,
             threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
     }
 
+    // Barrier: gate+up must complete before SwiGLU
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    // Phase 2: SwiGLU for all K experts (independent, run concurrently)
     for (int k = 0; k < K; k++) {
         [enc setComputePipelineState:ctx->swiglu];
         [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:0];
@@ -369,6 +375,10 @@ static bool gpu_forward_pread_experts(MetalCtx *ctx, const ModelConfig *cfg,
     [enc dispatchThreadgroups:MTLSizeMake(((uint)S + 255) / 256, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
+    // Barrier: SwiGLU must complete before down projections
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    // Phase 3: down projections for all K experts (independent, run concurrently)
     for (int k = 0; k < K; k++) {
         const ExpertLayout *elayout = expert_is_2bit[k] ? &cfg->expert_2bit : &cfg->expert_4bit;
         id<MTLComputePipelineState> mv_pipe = expert_is_2bit[k] ? ctx->matvec_2bit : ctx->matvec_4bit;
