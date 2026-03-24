@@ -455,6 +455,9 @@ typedef struct {
     size_t shared_weight_bytes;
     size_t runtime_reserve_bytes;
     MoeLayerStats **layer_stats; // [num_layers] per-layer I/O instrumentation
+    // Token-to-token expert buffer cache: tracks which expert ID is in each GPU buffer slot
+    // per layer. Enables skipping pread for experts already loaded from the previous token.
+    int *buf_cached_ids;   // [num_layers * OROME_MAX_ACTIVE], -1 = empty
 } ExpertFiles;
 
 ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
