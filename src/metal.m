@@ -226,7 +226,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
                                                            options:MTLResourceStorageModeShared];
     // Allocate extra data buffer slots for expert caching across tokens.
     // Data buffers hold raw expert weights; gate/up/act/out are only needed for K active experts.
-    int cache_slots = cfg->num_experts_per_tok * 2;  // 2× K for caching headroom
+    int cache_slots = cfg->num_experts_per_tok * 3;  // 3× K for caching headroom
     if (cache_slots > OROME_EXPERT_CACHE_SLOTS) cache_slots = OROME_EXPERT_CACHE_SLOTS;
     for (int k = 0; k < cache_slots; k++) {
         ctx->buf_multi_expert_data[k] = [ctx->device newBufferWithLength:expert_alloc

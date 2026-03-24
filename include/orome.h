@@ -24,7 +24,7 @@
 
 #define OROME_MAX_EXPERTS       512     // largest MoE model we expect
 #define OROME_MAX_ACTIVE        16      // max active experts per token
-#define OROME_EXPERT_CACHE_SLOTS 32     // max expert data buffer slots (for caching)
+#define OROME_EXPERT_CACHE_SLOTS 48     // max expert data buffer slots (for caching)
 #define OROME_MAX_LAYERS        80      // enough for 397B (60 layers)
 #define OROME_MAX_SEQ_LEN       1048576
 #define OROME_GPU_KV_SEQ        4096    // GPU-side KV cache for attention offload

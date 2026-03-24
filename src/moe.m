@@ -629,7 +629,7 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
     }
 
     // Expert buffer cache: track which expert ID is in each GPU buffer slot
-    int cache_slots = cfg->num_experts_per_tok * 2;
+    int cache_slots = cfg->num_experts_per_tok * 3;
     if (cache_slots > OROME_EXPERT_CACHE_SLOTS) cache_slots = OROME_EXPERT_CACHE_SLOTS;
     ef->num_cache_slots = cache_slots;
     ef->buf_cached_ids = malloc(cfg->num_layers * cache_slots * sizeof(int));
