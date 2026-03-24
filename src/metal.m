@@ -224,9 +224,18 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     size_t expert_alloc = (cfg->expert_4bit.expert_size + 16383) & ~((size_t)16383);
     ctx->buf_multi_expert_input = [ctx->device newBufferWithLength:H * sizeof(float)
                                                            options:MTLResourceStorageModeShared];
-    for (int k = 0; k < cfg->num_experts_per_tok && k < OROME_MAX_ACTIVE; k++) {
+    // Allocate extra data buffer slots for expert caching across tokens.
+    // Data buffers hold raw expert weights; gate/up/act/out are only needed for K active experts.
+    int cache_slots = cfg->num_experts_per_tok * 2;  // 2× K for caching headroom
+    if (cache_slots > OROME_EXPERT_CACHE_SLOTS) cache_slots = OROME_EXPERT_CACHE_SLOTS;
+    for (int k = 0; k < cache_slots; k++) {
         ctx->buf_multi_expert_data[k] = [ctx->device newBufferWithLength:expert_alloc
                                                                  options:MTLResourceStorageModeShared];
+    }
+    ctx->num_expert_data_slots = cache_slots;
+    printf("[metal] Expert data buffer slots: %d (%d active + %d cache)\n",
+           cache_slots, cfg->num_experts_per_tok, cache_slots - cfg->num_experts_per_tok);
+    for (int k = 0; k < cfg->num_experts_per_tok && k < OROME_MAX_ACTIVE; k++) {
         ctx->buf_multi_expert_gate[k] = [ctx->device newBufferWithLength:cfg->moe_intermediate * sizeof(float)
                                                                  options:MTLResourceStorageModeShared];
         ctx->buf_multi_expert_up[k] = [ctx->device newBufferWithLength:cfg->moe_intermediate * sizeof(float)

@@ -196,17 +196,18 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
                                           int *slot_map) {
     if (!ctx || !ctx->queue) return -1;
 
+    int num_slots = ef->num_cache_slots > 0 ? ef->num_cache_slots : K;
     int *cache = ef->buf_cached_ids
-                   ? ef->buf_cached_ids + layer_idx * OROME_MAX_ACTIVE
+                   ? ef->buf_cached_ids + layer_idx * num_slots
                    : NULL;
-    bool slot_used[OROME_MAX_ACTIVE] = {false};
+    bool slot_used[OROME_EXPERT_CACHE_SLOTS] = {false};
     int cache_hits = 0;
 
     // Pass 1: find cache hits — expert already in a buffer slot from previous token
     for (int k = 0; k < K; k++) {
         slot_map[k] = -1;
         if (!cache) continue;
-        for (int s = 0; s < K; s++) {
+        for (int s = 0; s < num_slots; s++) {
             if (cache[s] == expert_indices[k] && !slot_used[s]) {
                 slot_map[k] = s;
                 slot_used[s] = true;
@@ -216,12 +217,14 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
         }
     }
 
-    // Pass 2: assign cache misses to unused buffer slots
+    // Pass 2: assign cache misses to unused buffer slots (prefer LRU — lowest index first)
     int next_free = 0;
     for (int k = 0; k < K; k++) {
         if (slot_map[k] >= 0) continue;  // cache hit
-        while (next_free < K && slot_used[next_free]) next_free++;
-        if (next_free >= K) {
+        while (next_free < num_slots && slot_used[next_free]) next_free++;
+        if (next_free >= num_slots) {
+            // All slots used by hits + earlier misses; wrap around (evict oldest)
+            // This shouldn't happen if num_slots >= K
             fprintf(stderr, "ERROR: no free buffer slot for expert %d layer %d\n",
                     expert_indices[k], layer_idx);
             return -1;
@@ -626,8 +629,11 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
     }
 
     // Expert buffer cache: track which expert ID is in each GPU buffer slot
-    ef->buf_cached_ids = malloc(cfg->num_layers * OROME_MAX_ACTIVE * sizeof(int));
-    for (int i = 0; i < cfg->num_layers * OROME_MAX_ACTIVE; i++)
+    int cache_slots = cfg->num_experts_per_tok * 2;
+    if (cache_slots > OROME_EXPERT_CACHE_SLOTS) cache_slots = OROME_EXPERT_CACHE_SLOTS;
+    ef->num_cache_slots = cache_slots;
+    ef->buf_cached_ids = malloc(cfg->num_layers * cache_slots * sizeof(int));
+    for (int i = 0; i < cfg->num_layers * cache_slots; i++)
         ef->buf_cached_ids[i] = -1;
 
     return ef;

@@ -24,6 +24,7 @@
 
 #define OROME_MAX_EXPERTS       512     // largest MoE model we expect
 #define OROME_MAX_ACTIVE        16      // max active experts per token
+#define OROME_EXPERT_CACHE_SLOTS 32     // max expert data buffer slots (for caching)
 #define OROME_MAX_LAYERS        80      // enough for 397B (60 layers)
 #define OROME_MAX_SEQ_LEN       1048576
 #define OROME_GPU_KV_SEQ        4096    // GPU-side KV cache for attention offload
@@ -252,7 +253,8 @@ typedef struct {
 
     // Per-expert GPU buffers
     id<MTLBuffer> buf_multi_expert_input;
-    id<MTLBuffer> buf_multi_expert_data[OROME_MAX_ACTIVE];
+    id<MTLBuffer> buf_multi_expert_data[OROME_EXPERT_CACHE_SLOTS];
+    int num_expert_data_slots;  // actual number of data buffer slots allocated
     id<MTLBuffer> buf_multi_expert_gate[OROME_MAX_ACTIVE];
     id<MTLBuffer> buf_multi_expert_up[OROME_MAX_ACTIVE];
     id<MTLBuffer> buf_multi_expert_act[OROME_MAX_ACTIVE];
@@ -457,7 +459,8 @@ typedef struct {
     MoeLayerStats **layer_stats; // [num_layers] per-layer I/O instrumentation
     // Token-to-token expert buffer cache: tracks which expert ID is in each GPU buffer slot
     // per layer. Enables skipping pread for experts already loaded from the previous token.
-    int *buf_cached_ids;   // [num_layers * OROME_MAX_ACTIVE], -1 = empty
+    int *buf_cached_ids;   // [num_layers * OROME_EXPERT_CACHE_SLOTS], -1 = empty
+    int num_cache_slots;   // actual number of data buffer slots allocated
 } ExpertFiles;
 
 ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
