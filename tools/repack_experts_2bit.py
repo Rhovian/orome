@@ -2,20 +2,10 @@
 """
 repack_experts_2bit.py — Requantize 4-bit packed expert files to 2-bit format.
 
-Reads packed_experts/layer_XX.bin files (256 experts x 1,769,472 bytes each)
-and writes packed_experts_2bit/layer_XX.bin (256 experts x 983,040 bytes each).
+Reads packed_experts/layer_XX.bin and writes packed_experts_2bit/layer_XX.bin.
 
-4-bit format (per expert, 1,769,472 bytes):
-  gate_proj: weights [512, 256] u32 + scales [512, 32] bf16 + biases [512, 32] bf16
-  up_proj:   weights [512, 256] u32 + scales [512, 32] bf16 + biases [512, 32] bf16
-  down_proj: weights [2048, 64] u32 + scales [2048, 8] bf16 + biases [2048, 8] bf16
-  Total: 1,769,472 bytes
-
-2-bit format (per expert, 983,040 bytes):
-  gate_proj: weights [512, 128] u32 + scales [512, 32] bf16 + biases [512, 32] bf16
-  up_proj:   weights [512, 128] u32 + scales [512, 32] bf16 + biases [512, 32] bf16
-  down_proj: weights [2048, 32] u32 + scales [2048, 8] bf16 + biases [2048, 8] bf16
-  Total: 983,040 bytes  (44.4% reduction)
+Supports both 35B (moe_intermediate=512, hidden_dim=2048, 256 experts, 40 layers)
+and 397B (moe_intermediate=1024, hidden_dim=4096, 512 experts, 60 layers).
 
 Requantization per group of 64 values:
   1. Dequantize: f[i] = uint4[i] * scale + bias  (range 0-15 mapped affinely)
@@ -23,14 +13,12 @@ Requantization per group of 64 values:
   3. Quantize:   uint2[i] = clamp(round((f[i] - B2) / S2), 0, 3)
   4. Repack:     16 x 2-bit values per uint32 (vs 8 x 4-bit per uint32)
 
-Scales/biases keep the same shape (group_size=64 preserved), just recomputed values.
-Weight arrays halve in size (16 vals/u32 vs 8 vals/u32).
-
 Usage:
-    python repack_experts_2bit.py [--model PATH] [--layer N] [--verify]
+    python repack_experts_2bit.py --model /path/to/model [--layer N] [--verify]
 """
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -38,166 +26,121 @@ import numpy as np
 from pathlib import Path
 
 
-# ============================================================================
-# 4-bit expert layout (matches infer.m constants)
-# ============================================================================
-
-EXPERT_SIZE_4BIT = 1_769_472
-NUM_EXPERTS = 256
-NUM_LAYERS = 40
 GROUP_SIZE = 64
 
-GATE_W_OFF_4 = 0
-GATE_W_SIZE_4 = 524_288
-GATE_S_OFF_4 = 524_288
-GATE_S_SIZE_4 = 32_768
-GATE_B_OFF_4 = 557_056
-GATE_B_SIZE_4 = 32_768
-
-UP_W_OFF_4 = 589_824
-UP_W_SIZE_4 = 524_288
-UP_S_OFF_4 = 1_114_112
-UP_S_SIZE_4 = 32_768
-UP_B_OFF_4 = 1_146_880
-UP_B_SIZE_4 = 32_768
-
-DOWN_W_OFF_4 = 1_179_648
-DOWN_W_SIZE_4 = 524_288
-DOWN_S_OFF_4 = 1_703_936
-DOWN_S_SIZE_4 = 32_768
-DOWN_B_OFF_4 = 1_736_704
-DOWN_B_SIZE_4 = 32_768
-
-assert GATE_W_OFF_4 + GATE_W_SIZE_4 == GATE_S_OFF_4
-assert GATE_S_OFF_4 + GATE_S_SIZE_4 == GATE_B_OFF_4
-assert GATE_B_OFF_4 + GATE_B_SIZE_4 == UP_W_OFF_4
-assert UP_W_OFF_4 + UP_W_SIZE_4 == UP_S_OFF_4
-assert UP_S_OFF_4 + UP_S_SIZE_4 == UP_B_OFF_4
-assert UP_B_OFF_4 + UP_B_SIZE_4 == DOWN_W_OFF_4
-assert DOWN_W_OFF_4 + DOWN_W_SIZE_4 == DOWN_S_OFF_4
-assert DOWN_S_OFF_4 + DOWN_S_SIZE_4 == DOWN_B_OFF_4
-assert DOWN_B_OFF_4 + DOWN_B_SIZE_4 == EXPERT_SIZE_4BIT
-
-PROJS_4BIT = [
-    ("gate", 512, 2048, GATE_W_OFF_4, GATE_S_OFF_4, GATE_B_OFF_4),
-    ("up",   512, 2048, UP_W_OFF_4,   UP_S_OFF_4,   UP_B_OFF_4),
-    ("down", 2048, 512, DOWN_W_OFF_4, DOWN_S_OFF_4, DOWN_B_OFF_4),
-]
-
 
 # ============================================================================
-# 2-bit expert layout
+# Expert layout computation (matches compute_expert_layout in weights.m)
 # ============================================================================
 
-GATE_W_SIZE_2 = 262_144
-UP_W_SIZE_2 = 262_144
-DOWN_W_SIZE_2 = 262_144
+def compute_expert_layout(moe_intermediate, hidden_dim, group_size, bits):
+    """Compute expert layout for a given quantization bitwidth."""
+    vals_per_u32 = 32 // bits
 
-GATE_W_OFF_2 = 0
-GATE_S_OFF_2 = GATE_W_OFF_2 + GATE_W_SIZE_2
-GATE_B_OFF_2 = GATE_S_OFF_2 + GATE_S_SIZE_4
-UP_W_OFF_2 = GATE_B_OFF_2 + GATE_B_SIZE_4
-UP_S_OFF_2 = UP_W_OFF_2 + UP_W_SIZE_2
-UP_B_OFF_2 = UP_S_OFF_2 + UP_S_SIZE_4
-DOWN_W_OFF_2 = UP_B_OFF_2 + UP_B_SIZE_4
-DOWN_S_OFF_2 = DOWN_W_OFF_2 + DOWN_W_SIZE_2
-DOWN_B_OFF_2 = DOWN_S_OFF_2 + DOWN_S_SIZE_4
-EXPERT_SIZE_2BIT = DOWN_B_OFF_2 + DOWN_B_SIZE_4
+    # gate_proj: [moe_intermediate, hidden_dim]
+    gate_out, gate_in = moe_intermediate, hidden_dim
+    gate_w_size = gate_out * gate_in // vals_per_u32 * 4
+    gate_groups = gate_in // group_size
+    gate_s_size = gate_out * gate_groups * 2
+    gate_b_size = gate_s_size
 
-assert GATE_S_OFF_2 == 262_144
-assert GATE_B_OFF_2 == 294_912
-assert UP_W_OFF_2 == 327_680
-assert UP_S_OFF_2 == 589_824
-assert UP_B_OFF_2 == 622_592
-assert DOWN_W_OFF_2 == 655_360
-assert DOWN_S_OFF_2 == 917_504
-assert DOWN_B_OFF_2 == 950_272
-assert EXPERT_SIZE_2BIT == 983_040
+    # up_proj: same shape as gate
+    up_w_size = gate_w_size
+    up_s_size = gate_s_size
+    up_b_size = gate_b_size
 
-PROJS_2BIT_OFFSETS = {
-    "gate": (GATE_W_OFF_2, GATE_S_OFF_2, GATE_B_OFF_2),
-    "up":   (UP_W_OFF_2,   UP_S_OFF_2,   UP_B_OFF_2),
-    "down": (DOWN_W_OFF_2, DOWN_S_OFF_2, DOWN_B_OFF_2),
-}
+    # down_proj: [hidden_dim, moe_intermediate]
+    down_out, down_in = hidden_dim, moe_intermediate
+    down_w_size = down_out * down_in // vals_per_u32 * 4
+    down_groups = down_in // group_size
+    down_s_size = down_out * down_groups * 2
+    down_b_size = down_s_size
+
+    off = 0
+    layout = {}
+    layout['gate_w_off'] = off; off += gate_w_size
+    layout['gate_s_off'] = off; off += gate_s_size
+    layout['gate_b_off'] = off; off += gate_b_size
+    layout['up_w_off'] = off; off += up_w_size
+    layout['up_s_off'] = off; off += up_s_size
+    layout['up_b_off'] = off; off += up_b_size
+    layout['down_w_off'] = off; off += down_w_size
+    layout['down_s_off'] = off; off += down_s_size
+    layout['down_b_off'] = off; off += down_b_size
+    layout['expert_size'] = off
+
+    layout['gate_w_size'] = gate_w_size
+    layout['gate_s_size'] = gate_s_size
+    layout['gate_b_size'] = gate_b_size
+    layout['up_w_size'] = up_w_size
+    layout['up_s_size'] = up_s_size
+    layout['up_b_size'] = up_b_size
+    layout['down_w_size'] = down_w_size
+    layout['down_s_size'] = down_s_size
+    layout['down_b_size'] = down_b_size
+
+    layout['projs'] = [
+        ("gate", moe_intermediate, hidden_dim,
+         layout['gate_w_off'], layout['gate_s_off'], layout['gate_b_off']),
+        ("up", moe_intermediate, hidden_dim,
+         layout['up_w_off'], layout['up_s_off'], layout['up_b_off']),
+        ("down", hidden_dim, moe_intermediate,
+         layout['down_w_off'], layout['down_s_off'], layout['down_b_off']),
+    ]
+
+    return layout
+
+
+def load_model_config(model_path):
+    """Load model config from HF config.json (handles nested text_config)."""
+    config_path = model_path / 'config.json'
+    if not config_path.exists():
+        return None
+    with open(config_path) as f:
+        cfg = json.load(f)
+    # HF configs may nest under text_config
+    tc = cfg.get('text_config', cfg)
+    return {
+        'moe_intermediate': tc.get('moe_intermediate_size', 512),
+        'hidden_dim': tc.get('hidden_size', 2048),
+        'num_experts': tc.get('num_experts', 256),
+        'num_layers': tc.get('num_hidden_layers', 40),
+    }
 
 
 # ============================================================================
 # bf16 <-> f32 conversion helpers
 # ============================================================================
 
-def bf16_to_f32(bf16_u16: np.ndarray) -> np.ndarray:
-    """Convert array of uint16 (bf16 bit pattern) to float32 via view."""
+def bf16_to_f32(bf16_u16):
     return (bf16_u16.astype(np.uint32) << 16).view(np.float32)
 
-
-def f32_to_bf16(f32: np.ndarray) -> np.ndarray:
-    """Convert float32 array to uint16 (bf16 bit pattern). Truncates (no rounding)."""
+def f32_to_bf16(f32):
     return (f32.view(np.uint32) >> 16).astype(np.uint16)
 
 
 # ============================================================================
-# Unpack 4-bit: extract 8 x 4-bit values from each uint32
+# Unpack/pack bit-packed values
 # ============================================================================
 
-def unpack_4bit(packed: np.ndarray) -> np.ndarray:
-    """
-    Unpack 4-bit values from uint32 array.
-    Input:  [..., N] uint32, each holding 8 x 4-bit values (LSB first)
-    Output: [..., N*8] uint8, values in range [0, 15]
-    """
+def unpack_4bit(packed):
     shape = packed.shape
     flat = packed.ravel()
     n = flat.size
-
     out = np.empty(n * 8, dtype=np.uint8)
     for i in range(8):
         out[i::8] = ((flat >> (i * 4)) & 0xF).astype(np.uint8)
-
     return out.reshape(shape[:-1] + (shape[-1] * 8,))
 
-
-# ============================================================================
-# Unpack 2-bit: extract 16 x 2-bit values from each uint32
-# ============================================================================
-
-def unpack_2bit(packed: np.ndarray) -> np.ndarray:
-    """
-    Unpack 2-bit values from uint32 array.
-    Input:  [..., N] uint32, each holding 16 x 2-bit values (LSB first)
-    Output: [..., N*16] uint8, values in range [0, 3]
-    """
-    shape = packed.shape
-    flat = packed.ravel()
-    n = flat.size
-
-    out = np.empty(n * 16, dtype=np.uint8)
-    for i in range(16):
-        out[i::16] = ((flat >> (i * 2)) & 0x3).astype(np.uint8)
-
-    return out.reshape(shape[:-1] + (shape[-1] * 16,))
-
-
-# ============================================================================
-# Pack 2-bit: pack 16 x 2-bit values into each uint32
-# ============================================================================
-
-def pack_2bit(vals: np.ndarray) -> np.ndarray:
-    """
-    Pack 2-bit values into uint32 array.
-    Input:  [..., M] uint8, values in range [0, 3], M must be multiple of 16
-    Output: [..., M/16] uint32, each holding 16 x 2-bit values (LSB first)
-    """
+def pack_2bit(vals):
     shape = vals.shape
-    assert shape[-1] % 16 == 0, f"Last dim {shape[-1]} not divisible by 16"
+    assert shape[-1] % 16 == 0
     n_packed = shape[-1] // 16
-
     flat = vals.reshape(-1, shape[-1])
     rows = flat.shape[0]
-
     out = np.zeros((rows, n_packed), dtype=np.uint32)
     for i in range(16):
         out |= flat[:, i::16].astype(np.uint32) << (i * 2)
-
     return out.reshape(shape[:-1] + (n_packed,))
 
 
@@ -205,22 +148,7 @@ def pack_2bit(vals: np.ndarray) -> np.ndarray:
 # Requantize one projection: 4-bit -> dequant -> optimal 2-bit
 # ============================================================================
 
-def requantize_projection(
-    packed_4bit: np.ndarray,
-    scales_bf16: np.ndarray,
-    biases_bf16: np.ndarray,
-    out_dim: int,
-    in_dim: int,
-) -> tuple:
-    """
-    Requantize a single projection from 4-bit to 2-bit.
-
-    Returns: (packed_2bit, new_scales_bf16, new_biases_bf16, rmse)
-      packed_2bit:     [out_dim, in_dim/16] uint32
-      new_scales_bf16: [out_dim, num_groups] uint16 (bf16 bit pattern)
-      new_biases_bf16: [out_dim, num_groups] uint16 (bf16 bit pattern)
-      rmse:            float -- RMSE of dequantized 2-bit vs dequantized 4-bit
-    """
+def requantize_projection(packed_4bit, scales_bf16, biases_bf16, out_dim, in_dim):
     num_groups = in_dim // GROUP_SIZE
 
     vals_4bit = unpack_4bit(packed_4bit)
@@ -261,28 +189,18 @@ def requantize_projection(
 
 
 # ============================================================================
-# Process one expert: read 4-bit blob, requantize all 3 projections
+# Process one expert
 # ============================================================================
 
-def requantize_expert(expert_blob: bytes) -> tuple:
-    """
-    Requantize a single expert from 4-bit to 2-bit.
+def requantize_expert(expert_blob, layout_4bit, layout_2bit):
+    expert_size_4 = layout_4bit['expert_size']
+    expert_size_2 = layout_2bit['expert_size']
+    assert len(expert_blob) == expert_size_4
 
-    Args:
-        expert_blob: EXPERT_SIZE_4BIT bytes
-
-    Returns:
-        (output_blob, proj_rmses)
-        output_blob: EXPERT_SIZE_2BIT bytes
-        proj_rmses: dict of projection name -> RMSE
-    """
-    assert len(expert_blob) == EXPERT_SIZE_4BIT, \
-        f"Expected {EXPERT_SIZE_4BIT} bytes, got {len(expert_blob)}"
-
-    output = bytearray(EXPERT_SIZE_2BIT)
+    output = bytearray(expert_size_2)
     proj_rmses = {}
 
-    for name, out_dim, in_dim, w_off, s_off, b_off in PROJS_4BIT:
+    for name, out_dim, in_dim, w_off, s_off, b_off in layout_4bit['projs']:
         packed_cols_4 = in_dim // 8
         num_groups = in_dim // GROUP_SIZE
 
@@ -305,7 +223,11 @@ def requantize_expert(expert_blob: bytes) -> tuple:
         )
         proj_rmses[name] = rmse
 
-        w_off_2, s_off_2, b_off_2 = PROJS_2BIT_OFFSETS[name]
+        # Find the 2-bit offsets for this projection
+        for n2, _, _, w2, s2, b2 in layout_2bit['projs']:
+            if n2 == name:
+                w_off_2, s_off_2, b_off_2 = w2, s2, b2
+                break
 
         w_data = packed_2bit.tobytes()
         s_data = new_scales.tobytes()
@@ -316,59 +238,6 @@ def requantize_expert(expert_blob: bytes) -> tuple:
         output[b_off_2 : b_off_2 + len(b_data)] = b_data
 
     return bytes(output), proj_rmses
-
-
-# ============================================================================
-# Verify: dequantize both formats and compare
-# ============================================================================
-
-def verify_expert(expert_4bit: bytes, expert_2bit: bytes) -> dict:
-    """
-    Verify 2-bit requantization by dequantizing both and comparing.
-    Returns dict of projection name -> max absolute error.
-    """
-    max_errors = {}
-
-    for name, out_dim, in_dim, w_off_4, s_off_4, b_off_4 in PROJS_4BIT:
-        packed_cols_4 = in_dim // 8
-        num_groups = in_dim // GROUP_SIZE
-
-        w4 = np.frombuffer(
-            expert_4bit[w_off_4 : w_off_4 + out_dim * packed_cols_4 * 4],
-            dtype=np.uint32).reshape(out_dim, packed_cols_4)
-        s4 = np.frombuffer(
-            expert_4bit[s_off_4 : s_off_4 + out_dim * num_groups * 2],
-            dtype=np.uint16).reshape(out_dim, num_groups)
-        b4 = np.frombuffer(
-            expert_4bit[b_off_4 : b_off_4 + out_dim * num_groups * 2],
-            dtype=np.uint16).reshape(out_dim, num_groups)
-
-        vals4 = unpack_4bit(w4).reshape(out_dim, num_groups, GROUP_SIZE).astype(np.float32)
-        sf4 = bf16_to_f32(s4)[:, :, np.newaxis]
-        bf4 = bf16_to_f32(b4)[:, :, np.newaxis]
-        deq4 = vals4 * sf4 + bf4
-
-        w_off_2, s_off_2, b_off_2 = PROJS_2BIT_OFFSETS[name]
-        packed_cols_2 = in_dim // 16
-
-        w2 = np.frombuffer(
-            expert_2bit[w_off_2 : w_off_2 + out_dim * packed_cols_2 * 4],
-            dtype=np.uint32).reshape(out_dim, packed_cols_2)
-        s2 = np.frombuffer(
-            expert_2bit[s_off_2 : s_off_2 + out_dim * num_groups * 2],
-            dtype=np.uint16).reshape(out_dim, num_groups)
-        b2 = np.frombuffer(
-            expert_2bit[b_off_2 : b_off_2 + out_dim * num_groups * 2],
-            dtype=np.uint16).reshape(out_dim, num_groups)
-
-        vals2 = unpack_2bit(w2).reshape(out_dim, num_groups, GROUP_SIZE).astype(np.float32)
-        sf2 = bf16_to_f32(s2)[:, :, np.newaxis]
-        bf2 = bf16_to_f32(b2)[:, :, np.newaxis]
-        deq2 = vals2 * sf2 + bf2
-
-        max_errors[name] = float(np.max(np.abs(deq4 - deq2)))
-
-    return max_errors
 
 
 # ============================================================================
@@ -383,11 +252,17 @@ def main():
     parser.add_argument('--output', type=str, default=None,
                         help='Output directory (default: MODEL/packed_experts_2bit)')
     parser.add_argument('--layer', type=int, default=None,
-                        help=f'Process only this layer (0-{NUM_LAYERS - 1}). Default: all layers.')
+                        help='Process only this layer. Default: all layers.')
     parser.add_argument('--verify', action='store_true',
                         help='Verify by dequantizing 2-bit output and comparing to 4-bit')
-    parser.add_argument('--experts', type=int, default=NUM_EXPERTS,
-                        help=f'Number of experts per layer (default: {NUM_EXPERTS})')
+    parser.add_argument('--moe-intermediate', type=int, default=None,
+                        help='MoE intermediate size (auto-detected from config.json)')
+    parser.add_argument('--hidden-dim', type=int, default=None,
+                        help='Hidden dimension (auto-detected from config.json)')
+    parser.add_argument('--experts', type=int, default=None,
+                        help='Number of experts per layer (auto-detected from config.json)')
+    parser.add_argument('--num-layers', type=int, default=None,
+                        help='Number of layers (auto-detected from config.json)')
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -398,31 +273,44 @@ def main():
         print(f"ERROR: {input_dir} not found", file=sys.stderr)
         sys.exit(1)
 
+    # Load config from HF config.json, override with CLI args
+    cfg = load_model_config(model_path) or {}
+    moe_intermediate = args.moe_intermediate or cfg.get('moe_intermediate', 512)
+    hidden_dim = args.hidden_dim or cfg.get('hidden_dim', 2048)
+    num_experts = args.experts or cfg.get('num_experts', 256)
+    num_layers = args.num_layers or cfg.get('num_layers', 40)
+
+    layout_4bit = compute_expert_layout(moe_intermediate, hidden_dim, GROUP_SIZE, 4)
+    layout_2bit = compute_expert_layout(moe_intermediate, hidden_dim, GROUP_SIZE, 2)
+
+    expert_size_4 = layout_4bit['expert_size']
+    expert_size_2 = layout_2bit['expert_size']
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Discover layers
     if args.layer is not None:
         layers = [args.layer]
     else:
         layers = []
-        for i in range(NUM_LAYERS):
+        for i in range(num_layers):
             if (input_dir / f'layer_{i:02d}.bin').exists():
                 layers.append(i)
         if not layers:
             print(f"ERROR: No layer_XX.bin files found in {input_dir}", file=sys.stderr)
             sys.exit(1)
 
-    num_experts = args.experts
-
     print(f"Model:       {model_path}")
     print(f"Input:       {input_dir}")
     print(f"Output:      {output_dir}")
-    print(f"Layers:      {layers}")
+    print(f"Dimensions:  moe_intermediate={moe_intermediate}, hidden_dim={hidden_dim}")
+    print(f"Layers:      {len(layers)} ({layers[0]}-{layers[-1]})")
     print(f"Experts:     {num_experts}")
-    print(f"4-bit size:  {EXPERT_SIZE_4BIT:,} bytes/expert  "
-          f"({num_experts * EXPERT_SIZE_4BIT / 1e9:.2f} GB/layer)")
-    print(f"2-bit size:  {EXPERT_SIZE_2BIT:,} bytes/expert  "
-          f"({num_experts * EXPERT_SIZE_2BIT / 1e9:.2f} GB/layer)")
-    print(f"Savings:     {1 - EXPERT_SIZE_2BIT / EXPERT_SIZE_4BIT:.1%}")
+    print(f"4-bit size:  {expert_size_4:,} bytes/expert  "
+          f"({num_experts * expert_size_4 / 1e9:.2f} GB/layer)")
+    print(f"2-bit size:  {expert_size_2:,} bytes/expert  "
+          f"({num_experts * expert_size_2 / 1e9:.2f} GB/layer)")
+    print(f"Savings:     {1 - expert_size_2 / expert_size_4:.1%}")
     print()
 
     total_t0 = time.time()
@@ -431,88 +319,68 @@ def main():
         input_path = input_dir / f'layer_{layer_idx:02d}.bin'
         output_path = output_dir / f'layer_{layer_idx:02d}.bin'
 
-        expected_size = num_experts * EXPERT_SIZE_4BIT
         actual_size = input_path.stat().st_size
-        if actual_size != expected_size:
-            print(f"WARNING: layer_{layer_idx:02d}.bin is {actual_size:,} bytes, "
-                  f"expected {expected_size:,} ({num_experts} x {EXPERT_SIZE_4BIT:,})")
-            num_experts_actual = actual_size // EXPERT_SIZE_4BIT
-            if actual_size % EXPERT_SIZE_4BIT != 0:
-                print("ERROR: File size not a multiple of EXPERT_SIZE_4BIT, skipping",
-                      file=sys.stderr)
-                continue
-            print(f"  Adjusting to {num_experts_actual} experts based on file size")
-        else:
-            num_experts_actual = num_experts
+        num_experts_actual = actual_size // expert_size_4
+        if actual_size % expert_size_4 != 0:
+            print(f"ERROR: layer_{layer_idx:02d}.bin size {actual_size:,} "
+                  f"not divisible by expert_size {expert_size_4:,}", file=sys.stderr)
+            continue
+
+        if num_experts_actual != num_experts:
+            print(f"  Adjusted to {num_experts_actual} experts based on file size")
 
         print(f"=== Layer {layer_idx:02d} ({num_experts_actual} experts, "
               f"{actual_size / 1e9:.2f} GB -> "
-              f"{num_experts_actual * EXPERT_SIZE_2BIT / 1e9:.2f} GB) ===")
+              f"{num_experts_actual * expert_size_2 / 1e9:.2f} GB) ===")
 
         layer_t0 = time.time()
-
         rmse_accum = {"gate": 0.0, "up": 0.0, "down": 0.0}
-        max_error_accum = {"gate": 0.0, "up": 0.0, "down": 0.0}
 
         with open(input_path, 'rb') as fin, open(output_path, 'wb') as fout:
             for eidx in range(num_experts_actual):
-                fin.seek(eidx * EXPERT_SIZE_4BIT)
-                expert_4bit = fin.read(EXPERT_SIZE_4BIT)
-                if len(expert_4bit) != EXPERT_SIZE_4BIT:
-                    print(f"  ERROR: Short read for expert {eidx}: "
-                          f"{len(expert_4bit)} bytes", file=sys.stderr)
+                fin.seek(eidx * expert_size_4)
+                expert_4bit = fin.read(expert_size_4)
+                if len(expert_4bit) != expert_size_4:
+                    print(f"  ERROR: Short read for expert {eidx}", file=sys.stderr)
                     break
 
-                expert_2bit, proj_rmses = requantize_expert(expert_4bit)
-                assert len(expert_2bit) == EXPERT_SIZE_2BIT
-
-                if args.verify and eidx < 4:
-                    max_errs = verify_expert(expert_4bit, expert_2bit)
-                    for p in ("gate", "up", "down"):
-                        max_error_accum[p] = max(max_error_accum[p], max_errs[p])
+                expert_2bit, proj_rmses = requantize_expert(
+                    expert_4bit, layout_4bit, layout_2bit)
+                assert len(expert_2bit) == expert_size_2
 
                 for p in ("gate", "up", "down"):
                     rmse_accum[p] += proj_rmses[p]
 
                 fout.write(expert_2bit)
 
-                if (eidx + 1) % 32 == 0 or eidx == num_experts_actual - 1:
+                if (eidx + 1) % 64 == 0 or eidx == num_experts_actual - 1:
                     elapsed = time.time() - layer_t0
-                    rate = (eidx + 1) / elapsed
+                    rate = (eidx + 1) / elapsed if elapsed > 0 else 0
                     eta = (num_experts_actual - eidx - 1) / rate if rate > 0 else 0
                     print(f"  [{eidx+1:3d}/{num_experts_actual}] "
                           f"{elapsed:.1f}s elapsed, {rate:.1f} experts/s, "
                           f"ETA {eta:.0f}s")
 
         layer_elapsed = time.time() - layer_t0
-
         avg_rmse = {p: rmse_accum[p] / num_experts_actual for p in rmse_accum}
         print(f"\n  Layer {layer_idx:02d} done in {layer_elapsed:.1f}s "
               f"({num_experts_actual / layer_elapsed:.1f} experts/s)")
         print(f"  Avg RMSE:  gate={avg_rmse['gate']:.6f}  "
               f"up={avg_rmse['up']:.6f}  down={avg_rmse['down']:.6f}")
-        if args.verify:
-            print(f"  Max error: gate={max_error_accum['gate']:.6f}  "
-                  f"up={max_error_accum['up']:.6f}  down={max_error_accum['down']:.6f}")
 
         out_size = output_path.stat().st_size
         print(f"  Output: {output_path} ({out_size / 1e9:.2f} GB)")
         print()
 
     total_elapsed = time.time() - total_t0
+    total_out = sum(
+        (model_path / 'packed_experts_2bit' / f'layer_{i:02d}.bin').stat().st_size
+        for i in layers
+        if (model_path / 'packed_experts_2bit' / f'layer_{i:02d}.bin').exists()
+    )
     print(f"Total time: {total_elapsed:.1f}s")
-    print()
-    print("2-bit expert layout offsets (for C/Metal code):")
-    print(f"  #define EXPERT_SIZE_2BIT  {EXPERT_SIZE_2BIT}")
-    print(f"  #define GATE_W_OFF_2  {GATE_W_OFF_2}")
-    print(f"  #define GATE_S_OFF_2  {GATE_S_OFF_2}")
-    print(f"  #define GATE_B_OFF_2  {GATE_B_OFF_2}")
-    print(f"  #define UP_W_OFF_2    {UP_W_OFF_2}")
-    print(f"  #define UP_S_OFF_2    {UP_S_OFF_2}")
-    print(f"  #define UP_B_OFF_2    {UP_B_OFF_2}")
-    print(f"  #define DOWN_W_OFF_2  {DOWN_W_OFF_2}")
-    print(f"  #define DOWN_S_OFF_2  {DOWN_S_OFF_2}")
-    print(f"  #define DOWN_B_OFF_2  {DOWN_B_OFF_2}")
+    print(f"Total output: {total_out / 1e9:.2f} GB")
+    print(f"Expert size 2-bit: {expert_size_2:,} bytes")
 
 
 if __name__ == '__main__':
