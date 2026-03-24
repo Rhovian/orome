@@ -480,24 +480,30 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
     if (hot_mask_path) {
         if (load_hot_mask_json(ef, hot_mask_path, cfg->num_layers, cfg->num_experts) == 0) {
             ef->tiered_quant = true;
-            ef->layer_fds_2bit = calloc(cfg->num_layers, sizeof(int));
-            int opened_2bit = 0;
-            for (int i = 0; i < cfg->num_layers; i++) {
-                ef->layer_fds_2bit[i] = -1;
-                char path2[512];
-                snprintf(path2, sizeof(path2), "%s/packed_experts_2bit/layer_%02d.bin",
-                         model_dir ? model_dir : ".", i);
-                ef->layer_fds_2bit[i] = open(path2, O_RDONLY);
-                if (ef->layer_fds_2bit[i] >= 0) opened_2bit++;
-            }
-            printf("[moe] Tiered quant: %d/%d 2-bit layers available\n",
-                   opened_2bit, cfg->num_layers);
-            if (opened_2bit == 0) {
-                fprintf(stderr, "WARNING: No 2-bit expert files found, disabling tiered quant\n");
-                ef->tiered_quant = false;
-            }
         } else {
             fprintf(stderr, "WARNING: Failed to load hot mask from %s\n", hot_mask_path);
+        }
+    }
+
+    // Open 2-bit expert files if they exist (for --2bit or tiered quant modes)
+    if (!ef->layer_fds_2bit) {
+        ef->layer_fds_2bit = calloc(cfg->num_layers, sizeof(int));
+        int opened_2bit = 0;
+        for (int i = 0; i < cfg->num_layers; i++) {
+            ef->layer_fds_2bit[i] = -1;
+            char path2[512];
+            snprintf(path2, sizeof(path2), "%s/packed_experts_2bit/layer_%02d.bin",
+                     model_dir ? model_dir : ".", i);
+            ef->layer_fds_2bit[i] = open(path2, O_RDONLY);
+            if (ef->layer_fds_2bit[i] >= 0) opened_2bit++;
+        }
+        if (opened_2bit > 0) {
+            printf("[moe] 2-bit expert files: %d/%d layers available\n",
+                   opened_2bit, cfg->num_layers);
+        }
+        if (ef->tiered_quant && opened_2bit == 0) {
+            fprintf(stderr, "WARNING: No 2-bit expert files found, disabling tiered quant\n");
+            ef->tiered_quant = false;
         }
     }
 
