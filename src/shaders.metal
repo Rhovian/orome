@@ -1223,17 +1223,17 @@ kernel void moe_combine_residual_packed(
     device const float* shared_out  [[buffer(1)]],
     device float*       hidden_out  [[buffer(2)]],
     device const float* expert_out  [[buffer(3)]],  // packed [K * dim]
-    device const float* params      [[buffer(4)]],  // [0..K-1]=weights, [8]=shared_gate_score
+    device const float* params      [[buffer(4)]],  // [0..K-1]=weights, [K]=shared_gate_score
     constant uint&      dim         [[buffer(5)]],
     constant uint&      K           [[buffer(6)]],
     uint tid [[thread_position_in_grid]]
 ) {
     if (tid >= dim) return;
 
-    float shared_gate = 1.0f / (1.0f + exp(-params[8]));
+    float shared_gate = 1.0f / (1.0f + exp(-params[K]));
 
     float moe = 0.0f;
-    for (uint k = 0; k < K && k < 8; k++) {
+    for (uint k = 0; k < K && k < 16; k++) {
         moe += params[k] * expert_out[k * dim + tid];
     }
 
@@ -1262,9 +1262,9 @@ kernel void moe_combine_copy_sq(
 ) {
     float val = 0.0f;
     if (tid < dim) {
-        float shared_gate = 1.0f / (1.0f + exp(-params[8]));
+        float shared_gate = 1.0f / (1.0f + exp(-params[K]));
         float moe = 0.0f;
-        for (uint k = 0; k < K && k < 8; k++) {
+        for (uint k = 0; k < K && k < 16; k++) {
             moe += params[k] * expert_out[k * dim + tid];
         }
         val = h_mid[tid] + moe + shared_gate * shared_out[tid];
