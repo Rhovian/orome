@@ -56,10 +56,14 @@ typedef struct {
 
 static void expert_pread_task(void *ctx) {
     ExpertReadTask *task = (ExpertReadTask *)ctx;
-    uint64_t t0 = mach_absolute_time();
-    task->result = pread(task->fd, task->dst, task->size, task->offset);
-    uint64_t t1 = mach_absolute_time();
-    task->elapsed_ns = (uint64_t)((t1 - t0) * ns_per_tick);
+    if (g_profile_experts) {
+        uint64_t t0 = mach_absolute_time();
+        task->result = pread(task->fd, task->dst, task->size, task->offset);
+        uint64_t t1 = mach_absolute_time();
+        task->elapsed_ns = (uint64_t)((t1 - t0) * ns_per_tick);
+    } else {
+        task->result = pread(task->fd, task->dst, task->size, task->offset);
+    }
 }
 
 // ============================================================================
@@ -132,7 +136,8 @@ static bool expert_layer_uses_pread(const ExpertFiles *ef, int layer_idx) {
 
 static void log_expert_route(int layer_idx, const int *expert_indices, int K,
                              const ExpertFiles *ef) {
-    // Always accumulate frequency stats (cheap: K array increments per call)
+    if (!g_profile_experts) return;
+    // Accumulate frequency stats only when profiling
     if (ef && ef->layer_stats && ef->layer_stats[layer_idx]) {
         MoeLayerStats *st = ef->layer_stats[layer_idx];
         for (int k = 0; k < K; k++) {
@@ -141,7 +146,6 @@ static void log_expert_route(int layer_idx, const int *expert_indices, int K,
         }
         st->token_count++;
     }
-    if (!g_profile_experts) return;
     fprintf(stderr, "EXPERT_ROUTE layer=%d experts=", layer_idx);
     for (int k = 0; k < K; k++) fprintf(stderr, "%s%d", k ? "," : "", expert_indices[k]);
     fprintf(stderr, "\n");
@@ -214,10 +218,10 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
     }
 
     // dispatch_apply: batched parallel pread — less overhead than dispatch_group+async_f
-    double t_io_start = now_ms();
+    double t_io_start = g_profile_experts ? now_ms() : 0;
     dispatch_apply((size_t)K, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
                    ^(size_t k) { expert_pread_task(&task_ptr[k]); });
-    double t_io_end = now_ms();
+    double t_io_end = g_profile_experts ? now_ms() : 0;
 
     for (int k = 0; k < K; k++) {
         if (tasks[k].result != (ssize_t)tasks[k].size) {
@@ -228,8 +232,8 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
         }
     }
 
-    // Accumulate per-layer I/O stats
-    if (ef->layer_stats && ef->layer_stats[layer_idx]) {
+    // Accumulate per-layer I/O stats (only when profiling)
+    if (g_profile_experts && ef->layer_stats && ef->layer_stats[layer_idx]) {
         MoeLayerStats *st = ef->layer_stats[layer_idx];
         st->io_ms += t_io_end - t_io_start;
         for (int k = 0; k < K; k++) {

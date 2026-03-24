@@ -1432,7 +1432,7 @@ int engine_step(Engine *eng, int token_id) {
         double inv = 1.0 / profile_count;
         fprintf(stderr, "[profile] avg/tok: attn=%.1fms moe=%.1fms norm=%.2fms lmhead=%.1fms\n",
                 t_attn_total * inv, t_moe_total * inv, t_norm_total * inv, t_lmhead_total * inv);
-        if (eng->ef) moe_print_layer_stats(eng->ef, true);
+        if (eng->ef && moe_get_profile_experts()) moe_print_layer_stats(eng->ef, true);
     }
 
     double step_ms = now_ms() - step_start;
