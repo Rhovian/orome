@@ -312,6 +312,41 @@ void metal_set_expert_weights(MetalCtx *ctx, ExpertFiles *ef, const ModelConfig 
         if (ctx->buf_expert_layers[i]) wrapped++;
     }
     printf("[metal] Resident expert layers wrapped as Metal buffers: %d/%d\n", wrapped, n);
+
+    // Per-layer expert cache buffers for cross-token caching on pread layers.
+    // Each non-resident layer gets a buffer holding K expert slots so data
+    // persists across tokens without inter-layer contamination.
+    int pread_layers = n - wrapped;
+    if (pread_layers > 0) {
+        bool has_2bit = false;
+        if (ef->layer_fds_2bit) {
+            for (int i = 0; i < n; i++) {
+                if (ef->layer_fds_2bit[i] >= 0) { has_2bit = true; break; }
+            }
+        }
+        size_t slot_bytes;
+        if (has_2bit && !ef->tiered_quant) {
+            slot_bytes = (cfg->expert_2bit.expert_size + 16383) & ~((size_t)16383);
+        } else {
+            size_t max_es = cfg->expert_4bit.expert_size;
+            if (cfg->expert_2bit.expert_size > max_es) max_es = cfg->expert_2bit.expert_size;
+            slot_bytes = (max_es + 16383) & ~((size_t)16383);
+        }
+        ctx->expert_cache_slot_bytes = slot_bytes;
+        int K = cfg->num_experts_per_tok;
+        size_t per_layer = (size_t)K * slot_bytes;
+        ctx->buf_expert_layer_cache = (__strong id<MTLBuffer> *)calloc(n, sizeof(id<MTLBuffer>));
+        size_t total_alloc = 0;
+        int alloc_count = 0;
+        for (int i = 0; i < n; i++) {
+            if (ef->layer_resident && ef->layer_resident[i]) continue;
+            ctx->buf_expert_layer_cache[i] = [ctx->device newBufferWithLength:per_layer
+                                                                       options:MTLResourceStorageModeShared];
+            if (ctx->buf_expert_layer_cache[i]) { total_alloc += per_layer; alloc_count++; }
+        }
+        printf("[metal] Per-layer expert cache: %d layers × %d slots × %.2f MB = %.0f MB\n",
+               alloc_count, K, (float)slot_bytes / 1048576.0f, (float)total_alloc / 1048576.0f);
+    }
 }
 
 void metal_free(MetalCtx *ctx) {
@@ -321,6 +356,7 @@ void metal_free(MetalCtx *ctx) {
     free(ctx->buf_linear_state);
     free(ctx->buf_conv_state);
     free(ctx->buf_expert_layers);
+    free(ctx->buf_expert_layer_cache);
     free(ctx);
 }
 

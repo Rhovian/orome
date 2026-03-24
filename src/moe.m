@@ -196,12 +196,15 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
                                           int *slot_map) {
     if (!ctx || !ctx->queue) return -1;
 
-    int num_slots = ef->num_cache_slots > 0 ? ef->num_cache_slots : K;
-    // Cross-token caching disabled: buf_multi_expert_data[] GPU buffer slots
-    // are shared across all 60 layers, so data cached for layer N is overwritten
-    // by layers N+1..59 within the same token. Always pread fresh data.
-    int *cache = NULL;
-    bool slot_used[OROME_EXPERT_CACHE_SLOTS] = {false};
+    // Use per-layer cache buffer if available (correct cross-token caching).
+    // Each layer has its own K buffer slots, so data persists across tokens.
+    id<MTLBuffer> layer_buf = (ctx->buf_expert_layer_cache)
+                               ? ctx->buf_expert_layer_cache[layer_idx] : nil;
+    size_t slot_bytes = ctx->expert_cache_slot_bytes;
+
+    int num_slots = layer_buf ? K : K;  // K slots in both paths
+    int *cache = layer_buf ? &ef->buf_cached_ids[layer_idx * ef->num_cache_slots] : NULL;
+    bool slot_used[OROME_MAX_ACTIVE] = {false};
     int cache_hits = 0;
 
     // Pass 1: find cache hits — expert already in a buffer slot from previous token
@@ -218,14 +221,12 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
         }
     }
 
-    // Pass 2: assign cache misses to unused buffer slots (prefer LRU — lowest index first)
+    // Pass 2: assign cache misses to unused buffer slots
     int next_free = 0;
     for (int k = 0; k < K; k++) {
         if (slot_map[k] >= 0) continue;  // cache hit
         while (next_free < num_slots && slot_used[next_free]) next_free++;
         if (next_free >= num_slots) {
-            // All slots used by hits + earlier misses; wrap around (evict oldest)
-            // This shouldn't happen if num_slots >= K
             fprintf(stderr, "ERROR: no free buffer slot for expert %d layer %d\n",
                     expert_indices[k], layer_idx);
             return -1;
@@ -245,15 +246,27 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
         int fd = -1;
         select_expert_source(ef, cfg, layer_idx, expert_indices[k], quant,
                              &fd, &elayout, &expert_is_2bit[k]);
-        if (fd < 0 || !elayout || !ctx->buf_multi_expert_data[slot_map[k]]) {
+        if (fd < 0 || !elayout) {
             fprintf(stderr, "ERROR: Missing expert source for layer %d expert %d\n",
                     layer_idx, expert_indices[k]);
             return -1;
         }
 
-        if (slot_map[k] >= 0 && cache && cache[slot_map[k]] == expert_indices[k]) {
-            // Cache hit — data already in buf_multi_expert_data[slot_map[k]]
-            continue;
+        // Determine destination buffer
+        void *dst;
+        if (layer_buf) {
+            dst = (uint8_t *)[layer_buf contents] + (size_t)slot_map[k] * slot_bytes;
+        } else {
+            if (slot_map[k] >= ctx->num_expert_data_slots || !ctx->buf_multi_expert_data[slot_map[k]]) {
+                fprintf(stderr, "ERROR: Missing buffer slot %d for layer %d expert %d\n",
+                        slot_map[k], layer_idx, expert_indices[k]);
+                return -1;
+            }
+            dst = [ctx->buf_multi_expert_data[slot_map[k]] contents];
+        }
+
+        if (cache && cache[slot_map[k]] == expert_indices[k]) {
+            continue;  // Cache hit — data already in per-layer buffer
         }
 
         int mi = num_misses++;
@@ -261,7 +274,7 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
         tasks[mi].fd = fd;
         tasks[mi].offset = (off_t)expert_indices[k] * elayout->expert_size;
         tasks[mi].size = elayout->expert_size;
-        tasks[mi].dst = [ctx->buf_multi_expert_data[slot_map[k]] contents];
+        tasks[mi].dst = dst;
         tasks[mi].result = -1;
     }
 
@@ -356,6 +369,8 @@ static bool gpu_forward_pread_experts(MetalCtx *ctx, const ModelConfig *cfg,
                                       uint32_t *sd_w, uint16_t *sd_s, uint16_t *sd_b,
                                       int K, const bool *expert_is_2bit,
                                       const int *slot_map,
+                                      id<MTLBuffer> layer_cache_buf,
+                                      size_t cache_slot_bytes,
                                       float **expert_out, float *shared_out) {
     if (!ctx || !ctx->queue || !ctx->buf_weights || !sd_w || !sd_s || !sd_b) return false;
 
@@ -376,10 +391,21 @@ static bool gpu_forward_pread_experts(MetalCtx *ctx, const ModelConfig *cfg,
         id<MTLComputePipelineState> mv_pipe = expert_is_2bit[k] ? ctx->matvec_2bit : ctx->matvec_4bit;
         if (!mv_pipe) return false;
 
+        // Select data buffer: per-layer cache (offset-based) or shared slot buffers
+        id<MTLBuffer> data_buf;
+        size_t data_base;
+        if (layer_cache_buf) {
+            data_buf = layer_cache_buf;
+            data_base = (size_t)slot * cache_slot_bytes;
+        } else {
+            data_buf = ctx->buf_multi_expert_data[slot];
+            data_base = 0;
+        }
+
         [enc setComputePipelineState:mv_pipe];
-        [enc setBuffer:ctx->buf_multi_expert_data[slot] offset:elayout->gate_w_off atIndex:0];
-        [enc setBuffer:ctx->buf_multi_expert_data[slot] offset:elayout->gate_s_off atIndex:1];
-        [enc setBuffer:ctx->buf_multi_expert_data[slot] offset:elayout->gate_b_off atIndex:2];
+        [enc setBuffer:data_buf offset:data_base + elayout->gate_w_off atIndex:0];
+        [enc setBuffer:data_buf offset:data_base + elayout->gate_s_off atIndex:1];
+        [enc setBuffer:data_buf offset:data_base + elayout->gate_b_off atIndex:2];
         [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
         [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:4];
         {
@@ -394,9 +420,9 @@ static bool gpu_forward_pread_experts(MetalCtx *ctx, const ModelConfig *cfg,
             threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
 
         [enc setComputePipelineState:mv_pipe];
-        [enc setBuffer:ctx->buf_multi_expert_data[slot] offset:elayout->up_w_off atIndex:0];
-        [enc setBuffer:ctx->buf_multi_expert_data[slot] offset:elayout->up_s_off atIndex:1];
-        [enc setBuffer:ctx->buf_multi_expert_data[slot] offset:elayout->up_b_off atIndex:2];
+        [enc setBuffer:data_buf offset:data_base + elayout->up_w_off atIndex:0];
+        [enc setBuffer:data_buf offset:data_base + elayout->up_s_off atIndex:1];
+        [enc setBuffer:data_buf offset:data_base + elayout->up_b_off atIndex:2];
         [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
         [enc setBuffer:ctx->buf_multi_expert_up[k] offset:0 atIndex:4];
         {
@@ -446,10 +472,20 @@ static bool gpu_forward_pread_experts(MetalCtx *ctx, const ModelConfig *cfg,
         id<MTLComputePipelineState> mv_pipe = expert_is_2bit[k] ? ctx->matvec_2bit : ctx->matvec_4bit;
         if (!mv_pipe) return false;
 
+        id<MTLBuffer> data_buf;
+        size_t data_base;
+        if (layer_cache_buf) {
+            data_buf = layer_cache_buf;
+            data_base = (size_t)slot * cache_slot_bytes;
+        } else {
+            data_buf = ctx->buf_multi_expert_data[slot];
+            data_base = 0;
+        }
+
         [enc setComputePipelineState:mv_pipe];
-        [enc setBuffer:ctx->buf_multi_expert_data[slot] offset:elayout->down_w_off atIndex:0];
-        [enc setBuffer:ctx->buf_multi_expert_data[slot] offset:elayout->down_s_off atIndex:1];
-        [enc setBuffer:ctx->buf_multi_expert_data[slot] offset:elayout->down_b_off atIndex:2];
+        [enc setBuffer:data_buf offset:data_base + elayout->down_w_off atIndex:0];
+        [enc setBuffer:data_buf offset:data_base + elayout->down_s_off atIndex:1];
+        [enc setBuffer:data_buf offset:data_base + elayout->down_b_off atIndex:2];
         [enc setBuffer:ctx->buf_multi_expert_act[k] offset:0 atIndex:3];
         [enc setBuffer:ctx->buf_multi_expert_out[k] offset:0 atIndex:4];
         {
@@ -629,13 +665,18 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
         }
     }
 
-    // Expert buffer cache: track which expert ID is in each GPU buffer slot
-    int cache_slots = cfg->num_experts_per_tok * 3;
-    if (cache_slots > OROME_EXPERT_CACHE_SLOTS) cache_slots = OROME_EXPERT_CACHE_SLOTS;
+    // Expert buffer cache: K slots per layer (matches per-layer GPU buffer layout)
+    int cache_slots = cfg->num_experts_per_tok;
     ef->num_cache_slots = cache_slots;
     ef->buf_cached_ids = malloc(cfg->num_layers * cache_slots * sizeof(int));
     for (int i = 0; i < cfg->num_layers * cache_slots; i++)
         ef->buf_cached_ids[i] = -1;
+
+    // Previous token routing for page cache warming
+    ef->last_routing = malloc(cfg->num_layers * OROME_MAX_ACTIVE * sizeof(int));
+    ef->last_routing_k = calloc(cfg->num_layers, sizeof(int));
+    for (int i = 0; i < cfg->num_layers * OROME_MAX_ACTIVE; i++)
+        ef->last_routing[i] = -1;
 
     return ef;
 }
@@ -655,6 +696,8 @@ void expert_files_close(ExpertFiles *ef, const ModelConfig *cfg) {
     free(ef->layer_fds_2bit);
     free(ef->hot_mask);
     free(ef->buf_cached_ids);
+    free(ef->last_routing);
+    free(ef->last_routing_k);
     if (ef->layer_stats) {
         for (int i = 0; i < num_layers; i++) free(ef->layer_stats[i]);
         free(ef->layer_stats);
@@ -794,6 +837,36 @@ static void expert_forward_direct(const ModelConfig *cfg, const ExpertLayout *la
                              (const uint16_t *)(data + layout->down_s_off),
                              (const uint16_t *)(data + layout->down_b_off),
                              act_buf, output, H, M, G);
+}
+
+// ============================================================================
+// Page cache warming via F_RDADVISE — non-blocking kernel hint
+// ============================================================================
+
+void moe_advise_experts(const ModelConfig *cfg, ExpertFiles *ef,
+                         int layer_idx, QuantType quant) {
+    if (!ef || !ef->last_routing || !ef->pread_mode) return;
+    if (layer_idx < 0 || layer_idx >= ef->num_layers) return;
+    int K = ef->last_routing_k[layer_idx];
+    if (K <= 0) return;
+
+    int *prev = ef->last_routing + layer_idx * OROME_MAX_ACTIVE;
+
+    for (int k = 0; k < K; k++) {
+        int eid = prev[k];
+        if (eid < 0 || eid >= ef->num_experts) continue;
+
+        const ExpertLayout *elayout = NULL;
+        int fd = -1;
+        bool is_2bit = false;
+        select_expert_source(ef, cfg, layer_idx, eid, quant, &fd, &elayout, &is_2bit);
+        if (fd < 0 || !elayout) continue;
+
+        struct radvisory ra;
+        ra.ra_offset = (off_t)eid * elayout->expert_size;
+        ra.ra_count = (int)elayout->expert_size;
+        fcntl(fd, F_RDADVISE, &ra);
+    }
 }
 
 // ============================================================================
@@ -952,12 +1025,14 @@ void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                 memcpy([ctx->buf_shared_up contents], s_shared_up, S * sizeof(float));
             }
             int slot_map[OROME_MAX_ACTIVE];
-            for (int kk = 0; kk < K; kk++) slot_map[kk] = kk;
+            id<MTLBuffer> layer_cache = (ctx->buf_expert_layer_cache)
+                                         ? ctx->buf_expert_layer_cache[layer_idx] : nil;
             if (pread_experts_into_gpu_buffers(ctx, cfg, ef, layer_idx,
                                                expert_indices, K, quant,
                                                expert_is_2bit, slot_map) >= 0) {
                 ran_gpu = gpu_forward_pread_experts(ctx, cfg, sd_w, sd_s, sd_b,
                                                     K, expert_is_2bit, slot_map,
+                                                    layer_cache, ctx->expert_cache_slot_bytes,
                                                     s_expert_out, s_shared_out);
             }
             if (ran_gpu) {
@@ -1181,6 +1256,12 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
     cpu_normalize_weights(expert_weights, K);
     log_expert_route(layer_idx, expert_indices, K, ef);
 
+    // Save routing for next token's page cache warming
+    if (ef->last_routing && layer_idx < ef->num_layers) {
+        memcpy(ef->last_routing + layer_idx * OROME_MAX_ACTIVE, expert_indices, K * sizeof(int));
+        ef->last_routing_k[layer_idx] = K;
+    }
+
     // 2. Shared expert down weights
     uint32_t *sd_w = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.down_proj.weight");
     uint16_t *sd_s = weights_layer_ptr(wf, layer_idx, "mlp.shared_expert.down_proj.scales");
@@ -1212,12 +1293,14 @@ void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
             && ctx->buf_shared_up && ctx->buf_shared_act && ctx->buf_shared_out && sd_w) {
             // buf_input already has correct h_post from fused GPU command buffer — don't overwrite
             int slot_map[OROME_MAX_ACTIVE];
-            for (int k = 0; k < K; k++) slot_map[k] = k;  // default identity
+            id<MTLBuffer> layer_cache = (ctx->buf_expert_layer_cache)
+                                         ? ctx->buf_expert_layer_cache[layer_idx] : nil;
             if (pread_experts_into_gpu_buffers(ctx, cfg, ef, layer_idx,
                                                expert_indices, K, quant,
                                                expert_is_2bit, slot_map) >= 0) {
                 ran_gpu = gpu_forward_pread_experts(ctx, cfg, sd_w, sd_s, sd_b,
                                                     K, expert_is_2bit, slot_map,
+                                                    layer_cache, ctx->expert_cache_slot_bytes,
                                                     s_expert_out, s_shared_out);
             }
             if (ran_gpu) {

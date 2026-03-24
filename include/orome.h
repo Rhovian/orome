@@ -286,6 +286,11 @@ typedef struct {
     id<MTLBuffer> __strong *buf_expert_layers;  // [num_layers] - mmap'd expert data
     int num_expert_layers;
 
+    // Per-layer expert data cache for correct cross-token caching (pread layers only).
+    // Each buffer holds K expert slots contiguously; slot k at offset k * expert_cache_slot_bytes.
+    id<MTLBuffer> __strong *buf_expert_layer_cache;  // [num_layers], NULL entries for resident layers
+    size_t expert_cache_slot_bytes;  // aligned bytes per expert slot
+
     // Linear attention GPU state (per layer)
     id<MTLBuffer> __strong *buf_linear_state;   // [num_linear_layers]
     id<MTLBuffer> __strong *buf_conv_state;     // [num_linear_layers]
@@ -461,6 +466,9 @@ typedef struct {
     // per layer. Enables skipping pread for experts already loaded from the previous token.
     int *buf_cached_ids;   // [num_layers * OROME_EXPERT_CACHE_SLOTS], -1 = empty
     int num_cache_slots;   // actual number of data buffer slots allocated
+    // Previous token's routing results per layer (for page cache warming)
+    int *last_routing;     // [num_layers * OROME_MAX_ACTIVE]
+    int *last_routing_k;   // [num_layers]
 } ExpertFiles;
 
 ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
@@ -474,6 +482,11 @@ bool         moe_get_profile_experts(void);
 
 // Wrap mmap'd expert layer data as Metal buffers for GPU expert forward.
 void metal_set_expert_weights(MetalCtx *ctx, ExpertFiles *ef, const ModelConfig *cfg);
+
+// Issue F_RDADVISE hints to warm the page cache for predicted experts.
+// Non-blocking: returns immediately. Call before GPU attention to overlap.
+void moe_advise_experts(const ModelConfig *cfg, ExpertFiles *ef,
+                         int layer_idx, QuantType quant);
 
 void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
                  int layer_idx, float *hidden, float *h_post,
