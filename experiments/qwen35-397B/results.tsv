@@ -1,0 +1,35 @@
+commit	tok_sec	ttft_ms	proj_avg_ms	status	description
+b624162	4.08	19373.7	241.3	keep	baseline: pread path, K=10, 100 tokens, correct output
+n/a	4.01	-	243.5	discard	static GCD pread queue + USER_INTERACTIVE QOS (no improvement)
+n/a	1.81	-	-	discard	F_RDADVISE speculative next-layer prefetch (massive regression, I/O contention)
+n/a	3.80	-	-	discard	matvec_4bit_2row for pread expert+shared down projections (within noise, GPU not bottleneck)
+n/a	3.61	21514.7	271.0	discard	hybrid mlock/pread: mlock 19 layers (69GB), pread 41 — page cache regression
+n/a	3.63	-	264	discard	per-layer fused experts for resident layers in hybrid mode (neutral, resident layers not bottleneck)
+2c05cc3	4.07	-	252.7	keep	fix: pure pread for 397B (restore baseline from partial mlock regression)
+n/a	3.97	-	-	discard	static GCD pread queue (reuse instead of per-call create, within noise)
+n/a	2.91	-	-	discard	speculative expert prefetch (prev-token indices, massive regression from I/O contention)
+n/a	4.06	-	-	discard	sorted expert indices by ID before pread (within noise, GCD concurrent anyway)
+n/a	3.99	-	-	discard	pipelined pread+GPU: split K=10 into two groups, overlap group B pread with group A GPU (slight regression, 2-cmd-buffer overhead)
+n/a	-	-	-	discard	dynamic expert pruning (min weight threshold): weights too evenly distributed (min ~3-5%), no experts pruned
+n/a	0.95	72286.1	-	discard	mmap without mlock + MADV_RANDOM for non-resident layers (massive regression, page fault overhead)
+n/a	2.92	1639.8	-	discard	fcntl(F_RDAHEAD,0) disable read-ahead on expert layer files (regression, read-ahead helps page cache)
+n/a	3.79	6119.6	-	keep	instrumentation baseline: io=165ms compute=55ms bw=25GB/s cache=87.9GB 99% preads 1-5ms
+n/a	0.95	16922.6	-	discard	mmap with default hints (no MADV_RANDOM): memcpy from mmap instead of pread — catastrophic page fault overhead
+9ef880c	6.63	3198.9	-	keep	2-bit expert quantization K=10: 44.4% I/O reduction (3.93 MB/expert vs 6.75 MB), coherent output
+9ef880c	7.74	2755.9	-	keep	2-bit K=8: 20% fewer expert reads, quality remains coherent (but deviates from K=10 architecture)
+02285aa	6.49	3251.8	-	keep	dispatch_apply for pread (cleanup): within noise of dispatch_group baseline
+0332822	5.40	4261.2	-	keep	re-implemented I/O instrumentation: 2-bit io=92-101ms/tok bw=25GB/s 78% preads 200us-1ms
+dcfcf12	6.38	12522.3	-	keep	conditional instrumentation (zero-cost when not profiling): within noise
+n/a	0.80	-	-	discard	parallel pread+CPU expert forward (eliminate GPU cmd buffer): CPU matvec 20x slower than GPU
+n/a	6.19	12376.8	-	discard	dynamic expert pruning 5% threshold: weights too even, ~1 layer pruned per token, within noise
+n/a	6.36	-	-	discard	fused batch 2-bit kernels + contiguous pread buffer: within noise of per-expert path
+1cae4eb	6.81	-	-	keep	concurrent GPU dispatch (MTLDispatchTypeConcurrent) for expert forward: +7% from better GPU utilization
+a951111	7.66	10200.9	-	keep	expert buffer caching: skip pread for cached experts (10.7% improvement)
+df14ed4	7.36	-	-	keep	expand cache to 2×K slots with proper full-width search
+n/a	7.67	10150.4	-	discard	4×K cache slots (40): no benefit over 3×K, diminishing returns
+914706b	7.69	10143.9	-	keep	3×K cache slots (30): io=57ms/tok, 33% cache hit rate, +4% over 2×K
+n/a	6.99	-	-	discard	per-layer buffer isolation (600 slots, 4.2 GB): correct caching but page cache regression from memory pressure
+n/a	7.36	10077.8	-	discard	two-phase pipelined pread (gate+up first, down during GPU): 2-cmd-buffer overhead negates I/O overlap
+n/a	6.69	11542.0	-	keep	fix: disable broken cross-token expert cache (shared GPU buffers served stale data)
+n/a	5.37	-	-	discard	CPU-side per-layer expert cache (4.25 GB, 4-bit sized): page cache regression from memory pressure
+n/a	5.49	-	-	discard	CPU-side per-layer expert cache (2.36 GB, 2-bit sized): still page cache regression

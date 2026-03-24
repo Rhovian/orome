@@ -197,9 +197,10 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
     if (!ctx || !ctx->queue) return -1;
 
     int num_slots = ef->num_cache_slots > 0 ? ef->num_cache_slots : K;
-    int *cache = ef->buf_cached_ids
-                   ? ef->buf_cached_ids + layer_idx * num_slots
-                   : NULL;
+    // Cross-token caching disabled: buf_multi_expert_data[] GPU buffer slots
+    // are shared across all 60 layers, so data cached for layer N is overwritten
+    // by layers N+1..59 within the same token. Always pread fresh data.
+    int *cache = NULL;
     bool slot_used[OROME_EXPERT_CACHE_SLOTS] = {false};
     int cache_hits = 0;
 
