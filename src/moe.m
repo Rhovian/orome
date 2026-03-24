@@ -164,13 +164,9 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
                                           QuantType quant, bool *expert_is_2bit) {
     if (!ctx || !ctx->queue) return -1;
 
-    dispatch_group_t group = dispatch_group_create();
-    dispatch_queue_attr_t attr =
-        dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_CONCURRENT,
-                                                QOS_CLASS_USER_INITIATED, 0);
-    dispatch_queue_t queue = dispatch_queue_create("orome.expert-pread", attr);
     ExpertReadTask tasks[OROME_MAX_ACTIVE];
     memset(tasks, 0, sizeof(tasks));
+    ExpertReadTask *task_ptr = tasks;  // block captures pointer, not VLA
 
     for (int k = 0; k < K; k++) {
         const ExpertLayout *elayout = NULL;
@@ -190,11 +186,10 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
         tasks[k].result = -1;
     }
 
-    for (int k = 0; k < K; k++) {
-        dispatch_group_async_f(group, queue, &tasks[k], expert_pread_task);
-    }
+    // dispatch_apply: batched parallel pread — less overhead than dispatch_group+async_f
+    dispatch_apply((size_t)K, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                   ^(size_t k) { expert_pread_task(&task_ptr[k]); });
 
-    dispatch_group_wait(group, DISPATCH_TIME_FOREVER);
     for (int k = 0; k < K; k++) {
         if (tasks[k].result != (ssize_t)tasks[k].size) {
             fprintf(stderr,
