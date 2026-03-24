@@ -202,9 +202,9 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
                                ? ctx->buf_expert_layer_cache[layer_idx] : nil;
     size_t slot_bytes = ctx->expert_cache_slot_bytes;
 
-    int num_slots = layer_buf ? K : K;  // K slots in both paths
+    int num_slots = layer_buf ? ef->num_cache_slots : K;
     int *cache = layer_buf ? &ef->buf_cached_ids[layer_idx * ef->num_cache_slots] : NULL;
-    bool slot_used[OROME_MAX_ACTIVE] = {false};
+    bool slot_used[OROME_MAX_ACTIVE + 4] = {false};  // up to K+4 slots
     int cache_hits = 0;
 
     // Pass 1: find cache hits — expert already in a buffer slot from previous token
@@ -221,19 +221,28 @@ static int pread_experts_into_gpu_buffers(MetalCtx *ctx, const ModelConfig *cfg,
         }
     }
 
-    // Pass 2: assign cache misses to unused buffer slots
-    int next_free = 0;
+    // Pass 2: assign cache misses to unused buffer slots.
+    // Prefer empty (-1) slots first to preserve older cached data in extra slots.
     for (int k = 0; k < K; k++) {
         if (slot_map[k] >= 0) continue;  // cache hit
-        while (next_free < num_slots && slot_used[next_free]) next_free++;
-        if (next_free >= num_slots) {
+        // First pass: find an empty slot (never been filled)
+        int found = -1;
+        for (int s = 0; s < num_slots; s++) {
+            if (!slot_used[s] && cache && cache[s] == -1) { found = s; break; }
+        }
+        // Second pass: find any unused slot (evict stale data)
+        if (found < 0) {
+            for (int s = 0; s < num_slots; s++) {
+                if (!slot_used[s]) { found = s; break; }
+            }
+        }
+        if (found < 0) {
             fprintf(stderr, "ERROR: no free buffer slot for expert %d layer %d\n",
                     expert_indices[k], layer_idx);
             return -1;
         }
-        slot_map[k] = next_free;
-        slot_used[next_free] = true;
-        next_free++;
+        slot_map[k] = found;
+        slot_used[found] = true;
     }
 
     // Determine quantization and prepare pread tasks for misses only
@@ -665,8 +674,9 @@ ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
         }
     }
 
-    // Expert buffer cache: K slots per layer (matches per-layer GPU buffer layout)
-    int cache_slots = cfg->num_experts_per_tok;
+    // Expert buffer cache: K+2 slots per layer for cross-token expert persistence.
+    // Extra slots retain experts from older tokens that may repeat.
+    int cache_slots = cfg->num_experts_per_tok + 2;
     ef->num_cache_slots = cache_slots;
     ef->buf_cached_ids = malloc(cfg->num_layers * cache_slots * sizeof(int));
     for (int i = 0; i < cfg->num_layers * cache_slots; i++)

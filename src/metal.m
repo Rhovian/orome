@@ -333,8 +333,8 @@ void metal_set_expert_weights(MetalCtx *ctx, ExpertFiles *ef, const ModelConfig 
             slot_bytes = (max_es + 16383) & ~((size_t)16383);
         }
         ctx->expert_cache_slot_bytes = slot_bytes;
-        int K = cfg->num_experts_per_tok;
-        size_t per_layer = (size_t)K * slot_bytes;
+        int cache_K = cfg->num_experts_per_tok + 2;  // extra slots for cross-token persistence
+        size_t per_layer = (size_t)cache_K * slot_bytes;
         ctx->buf_expert_layer_cache = (__strong id<MTLBuffer> *)calloc(n, sizeof(id<MTLBuffer>));
         size_t total_alloc = 0;
         int alloc_count = 0;
@@ -345,7 +345,7 @@ void metal_set_expert_weights(MetalCtx *ctx, ExpertFiles *ef, const ModelConfig 
             if (ctx->buf_expert_layer_cache[i]) { total_alloc += per_layer; alloc_count++; }
         }
         printf("[metal] Per-layer expert cache: %d layers × %d slots × %.2f MB = %.0f MB\n",
-               alloc_count, K, (float)slot_bytes / 1048576.0f, (float)total_alloc / 1048576.0f);
+               alloc_count, cache_K, (float)slot_bytes / 1048576.0f, (float)total_alloc / 1048576.0f);
     }
 }
 
