@@ -725,6 +725,13 @@ int engine_step(Engine *eng, int token_id) {
                          && eng->ef->gpu_resident_safe);
     if (gpu_resident) {
         memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
+        if (tcache && eng->pos == 0) {
+            float *check = (float *)[ctx->buf_moe_hidden contents];
+            fprintf(stderr, "[gguf] gpu_resident=%d buf_moe_hidden[0..3] = [%.6f %.6f %.6f %.6f]\n",
+                    gpu_resident, check[0], check[1], check[2], check[3]);
+        }
+    } else if (tcache && eng->pos == 0) {
+        fprintf(stderr, "[gguf] WARNING: gpu_resident=false, hidden NOT uploaded to GPU!\n");
     }
 
     // Per-layer command buffers with compute copy (no blit encoder transition).
@@ -733,6 +740,7 @@ int engine_step(Engine *eng, int token_id) {
     // fwd_enc = nil means per-layer CBs will be used
 
     for (int layer = 0; layer < cfg->num_layers; layer++) {
+        if (tcache && eng->pos == 0 && layer == 0) fprintf(stderr, "[gguf] LAYER 0 type=%d\n", cfg->layer_types[0]);
         int n_experts = cfg->num_experts;
         int S = cfg->shared_intermediate;
         int effective_k = thermal_k_effective(&eng->thermal, eng->active_experts);
@@ -849,8 +857,36 @@ int engine_step(Engine *eng, int token_id) {
             // QKV → buf_conv_input, Z → buf_linear_output, alpha → buf_linear_decay, beta → buf_linear_beta
             if (tcache) {
                 const LayerTensorCache *lt = &tcache[layer];
+                if (eng->pos == 0 && layer == 0) {
+                    // Check norm weight
+                    float *norm_w = (float *)((uint8_t *)[tcache[layer].input_norm.buffer contents] + tcache[layer].input_norm.offset);
+                    fprintf(stderr, "[gguf] layer 0 norm_w[0..3] = [%.6f %.6f %.6f %.6f]\n",
+                            norm_w[0], norm_w[1], norm_w[2], norm_w[3]);
+                    // CPU reference: dequant Q8_0 row 0 and dot with input
+                    uint8_t *qkv_data = (uint8_t *)[lt->lin.qkv.buffer contents] + lt->lin.qkv.offset;
+                    float *inp = (float *)[ctx->buf_input contents];
+                    // Q8_0: 2048/32 = 64 blocks per row, 34 bytes each
+                    float cpu_dot = 0;
+                    for (int blk = 0; blk < 64; blk++) {
+                        uint8_t *block = qkv_data + blk * 34;
+                        uint16_t d_raw = block[0] | ((uint16_t)block[1] << 8);
+                        // fp16 to float
+                        uint32_t sign = (d_raw >> 15) & 1;
+                        uint32_t exp = (d_raw >> 10) & 0x1F;
+                        uint32_t mant = d_raw & 0x3FF;
+                        float d;
+                        if (exp == 0) d = 0.0f;
+                        else { uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13); memcpy(&d, &f32, 4); }
+                        int8_t *qs = (int8_t *)(block + 2);
+                        for (int j = 0; j < 32; j++) {
+                            cpu_dot += d * (float)qs[j] * inp[blk * 32 + j];
+                        }
+                    }
+                    fprintf(stderr, "[gguf] layer 0 CPU QKV[0] = %.6f (input[0]=%.6f)\n", cpu_dot, inp[0]);
+                }
                 format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->lin.qkv,
                     ctx->buf_input, 0, ctx->buf_conv_input, 0);
+
                 format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->lin.z,
                     ctx->buf_input, 0, ctx->buf_linear_output, 0);
                 format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->lin.a,

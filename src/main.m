@@ -161,12 +161,35 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[main] GGUF layer detection: %d full + %d linear\n",
                     cfg.num_full_attn_layers, cfg.num_linear_layers);
 
-            // Linear attention params (Qwen3.5 GatedDeltaNet defaults)
-            cfg.linear_num_v_heads = 64;
-            cfg.linear_num_k_heads = 16;
+            // Linear attention params — infer from GGUF tensor shapes
             cfg.linear_key_dim = 128;
             cfg.linear_value_dim = 128;
             cfg.partial_rotary = 0.25;
+            // attn_qkv output dim = v_heads*(key+value) + k_heads*key
+            // For Qwen3.5: qkv_dim = v_heads*256 + k_heads*128
+            // We know k_heads from metadata (num_kv_heads for linear layers can differ)
+            // Infer from attn_qkv tensor shape
+            {
+                char tname[128];
+                // Find first linear attention layer
+                for (int i = 0; i < cfg.num_layers; i++) {
+                    if (cfg.layer_types[i] == ATTN_LINEAR) {
+                        snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.weight", i);
+                        GGUFTensorInfo *qkv_ti = gguf_find_tensor(gf, tname);
+                        if (qkv_ti && qkv_ti->n_dims >= 2) {
+                            int qkv_dim = (int)qkv_ti->dims[1]; // ne1 = output dim
+                            // conv_dim = 2 * k_heads * key_dim + v_heads * value_dim
+                            // For Qwen3.5: qkv_dim = 2*16*128 + v_heads*128
+                            cfg.linear_num_k_heads = 16; // fixed for Qwen3.5
+                            cfg.linear_num_v_heads = (qkv_dim - 2 * cfg.linear_num_k_heads * cfg.linear_key_dim)
+                                                   / cfg.linear_value_dim;
+                            fprintf(stderr, "[main] GGUF linear attn: qkv_dim=%d v_heads=%d k_heads=%d\n",
+                                    qkv_dim, cfg.linear_num_v_heads, cfg.linear_num_k_heads);
+                        }
+                        break;
+                    }
+                }
+            }
 
             // EOS tokens (Qwen3.5)
             cfg.eos_tokens[0] = 248046;
@@ -176,9 +199,16 @@ int main(int argc, char **argv) {
 
             if (active_k > 0) cfg.num_experts_per_tok = active_k;
 
-            // Set full_attn_interval so init_derived doesn't overwrite layer type counts
+            // Set full_attn_interval and offset so init_derived generates correct layer types
             if (cfg.num_full_attn_layers > 0) {
                 cfg.full_attn_interval = cfg.num_layers / cfg.num_full_attn_layers;
+                // Find the first full attention layer to determine offset
+                for (int i = 0; i < cfg.num_layers; i++) {
+                    if (cfg.layer_types[i] == ATTN_FULL) {
+                        cfg.full_attn_offset = i % cfg.full_attn_interval;
+                        break;
+                    }
+                }
             }
             model_config_init_derived(&cfg);
 
