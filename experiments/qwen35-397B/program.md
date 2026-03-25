@@ -40,23 +40,43 @@ To verify correctness: run `./orome --model /Users/j/models/Qwen3.5-397B-A17B-4b
 
 Once the model produces correct output, switch to the optimization axes below.
 
-## Key Optimization Axes (priority order)
+## Phase 1: SSD/pread optimization [COMPLETE — diminishing returns]
 
-1. **I/O instrumentation and profiling** — Before optimizing, understand the system. Per-layer pread timing, page cache hit rates, memory pressure, and expert routing frequency instrumentation is implemented (see `io_instrumentation_plan.md`). Run it, collect data, and let the data drive decisions. Every blind optimization attempted so far (mlock, prefetch, read-ahead tuning, pipelining) has regressed performance.
+Phase 1 ran 46 experiments optimizing the pread I/O path. Results: 4.08 → 7.87 tok/s (+93%). The last 4 experiments were all within noise or regression. The pread path is at its ceiling.
 
-2. **Data-driven memory strategy** — The machine has ~70 GB of RAM that could help, but naive approaches fail. Partial mlock (19 layers) regressed to 3.61 tok/s by starving the OS page cache. The right strategy depends on instrumentation data:
-   - If SSD-bandwidth-saturated: reduce bytes read (tiered quantization, K reduction)
-   - If page cache underperforming: work WITH the cache (selective madvise for hot experts, not mlock)
-   - If high layer variance: per-layer I/O scheduling for cold layers only
-   - **Do NOT mlock partial expert sets.** This is proven harmful.
+**What worked**: 2-bit quantization (-44% I/O bytes), per-layer expert cache (K+2 slots, ~40% hit rate), concurrent GPU dispatch.
 
-3. **Expert cache optimization** — Per-layer GPU buffer cache with K+2 slots is the current best (7.87 tok/s, ~40% hit rate). Further gains possible from better eviction, but memory pressure is the constraint — K+4 regressed from page cache starvation. Any cache expansion must be tested against page cache impact.
+**Current bottleneck breakdown** at 7.87 tok/s (~127 ms/tok):
+- I/O: ~80ms (63%) — 360 preads/tok, 75% page cache, 25% SSD
+- Compute: ~47ms (37%) — attention + MoE GPU + lm_head (breakdown unknown)
 
-4. **Tiered quantization** — 2-bit for cold experts, 4-bit for hot. Infrastructure exists (hot_mask, tiered_quant, layer_fds_2bit) and 2-bit expert files are available. Only pursue if instrumentation shows SSD bandwidth is the bottleneck.
+**Memory budget is balanced**: ~83 GB page cache covers 69% of 120.8 GB 2-bit experts. The ~37 GB gap causes the 25% SSD miss rate. K+4 cache proved that shifting even 450 MB from page cache to app cache regresses. No free memory to reclaim.
 
-5. **Output correctness (guard rail)** — Model outputs correctly at 7.87 tok/s. Use `--profile-experts` for NaN checks if any code change is suspected of breaking numerics. Not an active optimization axis.
+**Expert routing frequency is input-dependent** and we lack representative workload data for statistical significance. Static hot expert sets would overfit to profiling prompts. The adaptive K+2 cache already captures temporal locality without this problem.
 
-6. **GPU dispatch efficiency** — Already working and confirmed not the bottleneck for 397B. The 35B optimizations (batched dispatch, fused experts) carry over. Only revisit if instrumentation reveals compute-bound layers.
+## Phase 2: Compute optimization + tiered quantization [ACTIVE]
+
+### Key Optimization Axes (priority order)
+
+1. **Attention optimization** — Profiling fix is in place (commit ffc2034). The real compute split at steady state (~127ms/tok):
+   - MoE I/O (pread): ~80ms (63%) — already at ceiling
+   - Attention: ~37ms (29%) — 15 full + 45 linear attention layers
+   - MoE GPU compute: ~20ms (estimated: MoE total minus I/O)
+   - lm_head + other: ~10ms
+
+   Attention is the largest compute component. A 30% improvement saves ~11ms → ~8.5 tok/s. Worth exploring but unlikely to be transformative. Possible approaches: kernel fusion within attention layers, reduced-precision attention state, or architectural shortcuts for linear attention (GatedDeltaNet). Do NOT spend more than 2-3 experiments before moving to tiered quant.
+
+2. **Tiered quantization** — Hot experts at 4-bit, cold at 2-bit. Infrastructure exists (hot_mask, tiered_quant, layer_fds_2bit). This is a quality play, not a speed play — output quality may improve with minimal I/O impact since hot experts are already in page cache. Requires generating a hot expert mask from routing frequency data. Input-dependent concern applies, but a diverse profiling corpus can identify structurally hot experts (ones active regardless of domain).
+
+3. **Output correctness (guard rail)** — Model outputs correctly at 7.87 tok/s. Use `--profile-experts` for NaN checks if any code change is suspected of breaking numerics.
+
+### What NOT to pursue (and why)
+
+- **Further I/O scheduling**: 46 experiments exhausted this. Every pipelining, prefetch, and scheduling approach regressed from overhead or contention.
+- **Expert cache expansion**: K+2 is the sweet spot. K+3 within noise, K+4 regressed from page cache pressure.
+- **GPU dispatch optimization**: Batched kernels, GPU combine, -O3 all within noise. GPU dispatch is not the bottleneck.
+- **Partial mlock or mmap**: Proven harmful in multiple experiments. The OS page cache with pread is the best I/O strategy for this memory/data ratio.
+- **Static expert frequency analysis without representative workload**: Input-dependent routing makes offline profiling unreliable at this stage.
 
 ## Lessons Learned (do NOT repeat these)
 
