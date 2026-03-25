@@ -62,9 +62,11 @@ int main(int argc, char **argv) {
             {"profile-experts", no_argument, 0, 'E'},
             {"serve",   required_argument, 0, 'S'},
             {"timing",  no_argument,       0, 'T'},
+            {"gguf-info", no_argument,     0, 'I'},
             {"help",    no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
+        int gguf_info = 0;
 
         int c;
         while ((c = getopt_long(argc, argv, "m:p:t:k:2K:P:G:H:ES:Th", long_options, NULL)) != -1) {
@@ -81,14 +83,24 @@ int main(int argc, char **argv) {
                 case 'E': profile_experts = 1; break;
                 case 'S': serve_port = atoi(optarg); break;
                 case 'T': timing = 1; break;
+                case 'I': gguf_info = 1; break;
 
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
             }
         }
 
-        if (!prompt_text && serve_port == 0) {
+        if (!prompt_text && serve_port == 0 && !gguf_info) {
             prompt_text = "Hello, what is";
+        }
+
+        // ---- GGUF info mode (parse and dump, no inference) ----
+        if (gguf_info && model_dir) {
+            GGUFFile *gf = gguf_open(model_dir);
+            if (!gf) { fprintf(stderr, "Failed to open GGUF: %s\n", model_dir); return 1; }
+            gguf_print_summary(gf);
+            gguf_close(gf);
+            return 0;
         }
 
         // ---- Load model config ----

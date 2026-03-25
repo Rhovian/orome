@@ -382,10 +382,6 @@ GGUFFile *gguf_open(const char *path) {
         free(key);
     }
 
-    fprintf(stderr, "[gguf] arch=%s layers=%d hidden=%d experts=%d K=%d intermediate=%d\n",
-            gf->arch, gf->num_layers, gf->hidden_dim,
-            gf->num_experts, gf->num_experts_per_tok, gf->moe_intermediate);
-
     // Parse tensor info
     // Reset hash table for new file
     if (s_gguf_ht) { free(s_gguf_ht); s_gguf_ht = NULL; }
@@ -408,6 +404,26 @@ GGUFFile *gguf_open(const char *path) {
             gguf_ht_insert(ti->name, i);
         }
     }
+
+    // Infer moe_intermediate from tensor shapes if not in metadata
+    if (gf->moe_intermediate == 0) {
+        for (uint64_t i = 0; i < tensor_count; i++) {
+            if (gf->tensors[i].name && strstr(gf->tensors[i].name, "ffn_gate_exps")) {
+                for (uint32_t d = 0; d < gf->tensors[i].n_dims; d++) {
+                    uint64_t dim = gf->tensors[i].dims[d];
+                    if (dim != (uint64_t)gf->hidden_dim && dim != (uint64_t)gf->num_experts) {
+                        gf->moe_intermediate = (int)dim;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    fprintf(stderr, "[gguf] arch=%s layers=%d hidden=%d experts=%d K=%d intermediate=%d\n",
+            gf->arch, gf->num_layers, gf->hidden_dim,
+            gf->num_experts, gf->num_experts_per_tok, gf->moe_intermediate);
 
     // Compute data_offset: current position, aligned up to alignment
     size_t align = gf->alignment;
