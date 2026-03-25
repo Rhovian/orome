@@ -1061,6 +1061,18 @@ int engine_step(Engine *eng, int token_id) {
                 && !moe_get_profile_experts();
             bool gguf_experts = (tcache != NULL) && !layer_fused;
 
+            // Debug: dump hidden states at each stage for layer 0
+            if (tcache && eng->pos == 0 && layer == 0) {
+                [enc endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+                float *mh = (float *)[ctx->buf_moe_hidden contents];
+                float *bi = (float *)[ctx->buf_input contents];
+                float *bo = (float *)[ctx->buf_output contents];
+                fprintf(stderr, "[stage] L0 pre-expert: moe_hidden=[%.4f %.4f] input=[%.4f %.4f] output(routing)=[%.4f %.4f %.4f]\n",
+                        mh[0], mh[1], bi[0], bi[1], bo[0], bo[1], bo[2]);
+                cmd = [ctx->queue commandBuffer];
+                enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            }
+
             if (gguf_experts) {
                 // GGUF expert path: CPU routing readback + GPU expert forward
                 [enc endEncoding];
@@ -1094,8 +1106,8 @@ int engine_step(Engine *eng, int token_id) {
                 int S = cfg->shared_intermediate;
                 ExpertLayerRef elr = format_resolve_expert_layer(eng->fp, layer, H, M, n_experts);
 
-                // Upload hidden state to GPU for expert forward
-                memcpy([ctx->buf_input contents], eng->hidden, H * sizeof(float));
+                // buf_input already has the post-norm hidden state from the attention path
+                // (the routing gate used it). Don't overwrite with pre-norm eng->hidden.
 
                 // GPU expert forward: per-expert gate → up → swiglu → down
                 id<MTLCommandBuffer> ecmd = [ctx->queue commandBuffer];
@@ -1193,6 +1205,11 @@ int engine_step(Engine *eng, int token_id) {
                 }
 
 
+                // Debug: check post-expert hidden
+                if (eng->pos == 0 && layer == 0) {
+                    fprintf(stderr, "[stage] L0 post-expert: hidden=[%.4f %.4f] (residual was [%.4f %.4f])\n",
+                            eng->hidden[0], eng->hidden[1], eng->residual[0], eng->residual[1]);
+                }
                 // Upload combined result back to GPU for next layer's attention
                 memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
 
