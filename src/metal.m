@@ -138,10 +138,9 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->batch_expert_mv_q4k = make_pipeline(ctx, @"batch_expert_matvec_q4k");
     ctx->batch_expert_down_q4k = make_pipeline(ctx, @"batch_expert_down_q4k");
     ctx->matvec_f32 = make_pipeline(ctx, @"matvec_f32");
-    // Q5_K, Q6_K, F16 kernels: TODO — add when needed
-    ctx->matvec_q5k = NULL;
-    ctx->matvec_q6k = NULL;
-    ctx->matvec_f16 = NULL;
+    ctx->matvec_q5k = make_pipeline(ctx, @"dequant_matvec_q5k");
+    ctx->matvec_q6k = make_pipeline(ctx, @"dequant_matvec_q6k");
+    ctx->matvec_f16 = NULL; // TODO when needed
 
     if (!ctx->matvec_4bit || !ctx->norm_sum_sq || !ctx->norm_apply) {
         fprintf(stderr, "ERROR: Required Metal pipelines missing\n");

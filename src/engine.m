@@ -1597,10 +1597,10 @@ int engine_step(Engine *eng, int token_id) {
     t0 = now_ms();
     if (gpu_resident) {
         uint8_t *base = (uint8_t *)[ctx->buf_weights contents];
-        uint16_t *final_norm_w = weights_tensor_ptr(eng->wf, "model.norm.weight");
-        uint32_t *lm_w = weights_tensor_ptr(eng->wf, "lm_head.weight");
-        uint16_t *lm_s = weights_tensor_ptr(eng->wf, "lm_head.scales");
-        uint16_t *lm_b = weights_tensor_ptr(eng->wf, "lm_head.biases");
+        uint16_t *final_norm_w = tcache ? NULL : weights_tensor_ptr(eng->wf, "model.norm.weight");
+        uint32_t *lm_w = tcache ? NULL : weights_tensor_ptr(eng->wf, "lm_head.weight");
+        uint16_t *lm_s = tcache ? NULL : weights_tensor_ptr(eng->wf, "lm_head.scales");
+        uint16_t *lm_b = tcache ? NULL : weights_tensor_ptr(eng->wf, "lm_head.biases");
 
         // Use shared forward-pass encoder if available
         id<MTLCommandBuffer> cmd = nil;
@@ -1656,6 +1656,8 @@ int engine_step(Engine *eng, int token_id) {
         }
 
         // LM head matvec: buf_input → buf_output
+        if (tcache) fprintf(stderr, "[gguf] lm_head dispatch (fmt=%d od=%u id=%u)...\n",
+                           eng->globals.lm_head.format, eng->globals.lm_head.out_dim, eng->globals.lm_head.in_dim);
         if (tcache) {
             format_dispatch_matvec(enc, ctx, (TensorRef *)&eng->globals.lm_head,
                 ctx->buf_input, 0, ctx->buf_output, 0);

@@ -2030,6 +2030,155 @@ kernel void dequant_matvec_q8_0(
 }
 
 // ============================================================================
+// ============================================================================
+// GGUF Q5_K dequant matvec
+//
+// Q5_K super-block: 256 weights in 176 bytes
+//   [0..1]   float16 d (super-block scale)
+//   [2..3]   float16 dmin (super-block min)
+//   [4..15]  12 bytes: packed 6-bit sub-block scales + mins (same as Q4_K)
+//   [16..47] 32 bytes: 256 high bits (1 per weight, packed)
+//   [48..175] 128 bytes: 256 x low 4 bits (packed as nibbles)
+//
+// Dequant: value = d * sc[sb] * q - dmin * m[sb]
+//   where q = low4 | (high1 << 4), giving 5-bit value (0..31)
+// ============================================================================
+
+kernel void dequant_matvec_q5k(
+    device const uint8_t*  data       [[buffer(0)]],
+    device const float*    x          [[buffer(1)]],
+    device float*          out        [[buffer(2)]],
+    constant uint&         out_dim    [[buffer(3)]],
+    constant uint&         in_dim     [[buffer(4)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    if (row >= out_dim) return;
+
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = half(x[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_superblocks = in_dim / 256;
+    uint bytes_per_row = num_superblocks * 176;
+    device const uint8_t* row_data = data + row * bytes_per_row;
+
+    float acc = 0.0f;
+
+    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
+        device const uint8_t* sb = row_data + sb_idx * 176;
+
+        float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
+        float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
+
+        // Unpack sub-block scales and mins (same packing as Q4_K)
+        float sc[8], mn[8];
+        unpack_q4k_scales(sb + 4, sc, mn, 8);
+
+        // High bits: 32 bytes at offset 16 (256 bits = 1 per weight)
+        device const uint8_t* qh = sb + 16;
+        // Low nibbles: 128 bytes at offset 48
+        device const uint8_t* ql = sb + 48;
+
+        uint x_base = sb_idx * 256;
+
+        for (uint sub = 0; sub < 8; sub++) {
+            float sub_sc = d * sc[sub];
+            float sub_mn = dmin * mn[sub];
+            uint sub_base = sub * 32;
+
+            for (uint j = 0; j < 32; j++) {
+                uint idx = sub_base + j;
+                uint8_t q_lo = (ql[idx / 2] >> (4 * (idx % 2))) & 0xF;
+                uint8_t q_hi = (qh[idx / 8] >> (idx % 8)) & 1;
+                float q5 = float(q_lo | (q_hi << 4));
+                acc += (sub_sc * q5 - sub_mn) * float(x_shared[x_base + idx]);
+            }
+        }
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
+// GGUF Q6_K dequant matvec
+//
+// Q6_K super-block: 256 weights in 210 bytes
+//   [0..127]   128 bytes: 256 x low 4 bits (packed as nibbles)
+//   [128..191]  64 bytes: 256 x high 2 bits (packed, 4 per byte)
+//   [192..207]  16 bytes: 16 x int8 scales (one per 16 weights)
+//   [208..209]   2 bytes: float16 d (super-block scale)
+//
+// Dequant: value = d * sc[j/16] * (q_lo | (q_hi << 4) - 32)
+// where q is reconstructed as 6-bit value (0..63), centered at 32
+// ============================================================================
+
+kernel void dequant_matvec_q6k(
+    device const uint8_t*  data       [[buffer(0)]],
+    device const float*    x          [[buffer(1)]],
+    device float*          out        [[buffer(2)]],
+    constant uint&         out_dim    [[buffer(3)]],
+    constant uint&         in_dim     [[buffer(4)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    if (row >= out_dim) return;
+
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = half(x[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_superblocks = in_dim / 256;
+    uint bytes_per_row = num_superblocks * 210;
+    device const uint8_t* row_data = data + row * bytes_per_row;
+
+    float acc = 0.0f;
+
+    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
+        device const uint8_t* sb = row_data + sb_idx * 210;
+
+        // Low nibbles: 128 bytes at offset 0
+        device const uint8_t* ql = sb;
+        // High 2-bits: 64 bytes at offset 128
+        device const uint8_t* qh = sb + 128;
+        // Scales: 16 int8 at offset 192
+        device const int8_t* scales = (device const int8_t*)(sb + 192);
+        // Super-block scale: fp16 at offset 208
+        float d = float(as_type<half>(ushort(ushort(sb[208]) | (ushort(sb[209]) << 8))));
+
+        uint x_base = sb_idx * 256;
+
+        for (uint j = 0; j < 256; j++) {
+            // Reconstruct 6-bit value from low 4 bits + high 2 bits
+            uint8_t q_lo = (ql[j / 2] >> (4 * (j % 2))) & 0xF;
+            uint8_t q_hi = (qh[j / 4] >> (2 * (j % 4))) & 0x3;
+            int q6 = (int)(q_lo | (q_hi << 4)) - 32;
+            float sc = (float)scales[j / 16];
+            acc += d * sc * (float)q6 * float(x_shared[x_base + j]);
+        }
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
 // Batched Q4_K expert matvec (gate/up projections)
 // Same dispatch pattern as batch_expert_matvec_4bit but reads Q4_K format.
 // offsets[expert].w_off points to the start of Q4_K data for that expert.
