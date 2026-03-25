@@ -526,12 +526,29 @@ static bool gpu_forward_pread_experts(MetalCtx *ctx, const ModelConfig *cfg,
 
     [enc endEncoding];
     [cmd commit];
+
+    double t_wait_start = g_profile_experts ? now_ms() : 0;
     [cmd waitUntilCompleted];
+    double t_wait_end = g_profile_experts ? now_ms() : 0;
 
     for (int k = 0; k < K; k++) {
         memcpy(expert_out[k], [ctx->buf_multi_expert_out[k] contents], H * sizeof(float));
     }
     memcpy(shared_out, [ctx->buf_shared_out contents], H * sizeof(float));
+
+    // Accumulate GPU expert wait time for profiling
+    static double s_gpu_wait_total = 0;
+    static int s_gpu_wait_count = 0;
+    if (g_profile_experts) {
+        s_gpu_wait_total += t_wait_end - t_wait_start;
+        s_gpu_wait_count++;
+        if (s_gpu_wait_count % 600 == 0) {  // every 10 tokens (60 layers each)
+            fprintf(stderr, "[moe-gpu-wait] avg=%.3fms total=%.1fms (%d calls)\n",
+                    s_gpu_wait_total / s_gpu_wait_count, s_gpu_wait_total, s_gpu_wait_count);
+            s_gpu_wait_total = 0;
+            s_gpu_wait_count = 0;
+        }
+    }
 
     return true;
 }
