@@ -66,9 +66,9 @@ Each step depends on the previous. Pipelining (overlap layer N's pread with laye
 
 ### Key Optimization Axes (priority order)
 
-1. **Attention optimization (~35ms, 28%)** — Attention is the largest compute component. A 30% improvement saves ~10ms → ~8.5 tok/s. Possible approaches: kernel fusion within attention layers, reduced-precision attention state, or architectural shortcuts for linear attention (GatedDeltaNet). Do NOT spend more than 2-3 experiments before moving on.
+1. **CMD merge (~32ms MoE GPU, 25%)** — Combine the GPU expert forward command buffer with the next layer's attention command buffer into a single CMD. Currently each of 60 layers does a separate commit/wait for expert forward. Merging saves ~60 commit/wait cycles and lets the GPU pipeline expert compute into the next layer's attention without a CPU round-trip. This is the only untried approach on the compute side. Expected: 1-5ms savings from eliminating dispatch overhead.
 
-2. **MoE GPU compute optimization (~32ms, 25%)** — GPU expert wait is 0.53ms/layer × 60 = 31.6ms. The fused 2-bit gate+up+SwiGLU kernel crashed (all-NaN, row 47). Batched expert kernels were within noise (row 43). Possible approaches: merged command buffers (combine expert forward + next layer's attention into one CMD, saving ~60 commit/wait cycles), or half-precision activations for GPU buffers.
+2. **Attention optimization (~35ms, 28%)** — Attention is the largest compute component. A 30% improvement saves ~10ms → ~8.5 tok/s. Possible approaches: kernel fusion within attention layers, reduced-precision attention state, or architectural shortcuts for linear attention (GatedDeltaNet). Do NOT spend more than 2-3 experiments before moving on.
 
 3. **Tiered quantization** — First attempt regressed (6.83 tok/s, row 49) because cache slots grew to 6.75 MB (4-bit sized) → 4860 MB total, causing page cache pressure. Fix: mixed-size cache management (2-bit slots for cold, separate 4-bit buffers for hot). This is primarily a quality play, not a speed play.
 
