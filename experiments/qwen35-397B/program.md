@@ -86,6 +86,7 @@ Each step depends on the previous. Pipelining (overlap layer N's pread with laye
 - **Sub-2-bit quantization**: Degrades quality too much.
 - **Partial mlock or mmap**: Proven harmful in multiple experiments. The OS page cache with pread is the best I/O strategy for this memory/data ratio.
 - **Static expert frequency analysis without representative workload**: Input-dependent routing makes offline profiling unreliable at this stage.
+- **Naive expert prefetch heuristics**: 5 attempts all regressed (rows 4, 10, 37, 41, 46). However, a *learned* pre-attention expert prediction model (trained to predict routing from hidden state before attention) has been demonstrated externally at 93-97% accuracy on NVIDIA GB10, enabling async prefetch during the ~35ms attention window. Our heuristics failed because prediction accuracy was too low — wasted bandwidth on wrong experts. A learned predictor is a research project (collect routing training data, train small model, integrate async prefetch) but could break the serial dependency chain if accuracy exceeds ~90%. Consider after simpler optimizations are exhausted.
 
 ## Lessons Learned (do NOT repeat these)
 

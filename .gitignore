@@ -37,6 +37,8 @@ uv.lock
 diag*.txt
 tracing_plan.md
 *.trace.json
+profile_out.txt
+profile_stderr.txt
 
 # macOS
 .DS_Store
