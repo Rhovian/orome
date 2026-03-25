@@ -739,7 +739,8 @@ int engine_step(Engine *eng, int token_id) {
                 uint num_tgs = ((uint)H + 255) / 256;
                 [enc setComputePipelineState:ctx->norm_apply_partial];
                 [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-                [enc setBuffer:ctx->buf_weights offset:lw->input_norm_w atIndex:1];
+                [enc setBuffer:tcache ? tcache[layer].input_norm.buffer : ctx->buf_weights
+                   offset:tcache ? tcache[layer].input_norm.offset : lw->input_norm_w atIndex:1];
                 [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
                 [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
                 { uint d = (uint)H; float e = cfg->rms_norm_eps;
@@ -761,7 +762,8 @@ int engine_step(Engine *eng, int token_id) {
 
                 [enc setComputePipelineState:ctx->norm_apply];
                 [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-                [enc setBuffer:ctx->buf_weights offset:lw->input_norm_w atIndex:1];
+                [enc setBuffer:tcache ? tcache[layer].input_norm.buffer : ctx->buf_weights
+                   offset:tcache ? tcache[layer].input_norm.offset : lw->input_norm_w atIndex:1];
                 [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
                 [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
                 { uint d = (uint)H; float e = cfg->rms_norm_eps;
@@ -876,7 +878,9 @@ int engine_step(Engine *eng, int token_id) {
             [enc setComputePipelineState:ctx->gated_rms_norm];
             [enc setBuffer:ctx->buf_linear_v offset:0 atIndex:0];       // values
             [enc setBuffer:ctx->buf_linear_output offset:0 atIndex:1];  // z
-            [enc setBuffer:ctx->buf_weights offset:lw->lin.o_norm_w atIndex:2];
+            [enc setBuffer:tcache ? tcache[layer].lin.o_norm.buffer : ctx->buf_weights
+                   offset:tcache ? tcache[layer].lin.o_norm.offset : lw->lin.o_norm_w
+                  atIndex:2];
             [enc setBuffer:ctx->buf_linear_q offset:0 atIndex:3];       // output (reuse buf_linear_q)
             { uint vd = (uint)value_dim; float e = cfg->rms_norm_eps;
               [enc setBytes:&vd length:sizeof(uint) atIndex:4];
@@ -886,16 +890,21 @@ int engine_step(Engine *eng, int token_id) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase H: O projection (attn_out in buf_linear_q → buf_h_mid) ---
-            { GpuMatvecJob o_job = {
-                .w_buf = ctx->buf_weights, .w_off = lw->lin.o_w,
-                .s_buf = ctx->buf_weights, .s_off = lw->lin.o_s,
-                .b_buf = ctx->buf_weights, .b_off = lw->lin.o_b,
-                .in_buf = ctx->buf_linear_q, .in_off = 0,
-                .out_buf = ctx->buf_h_mid, .out_off = 0,
-                .out_ptr = NULL, .out_dim = H, .in_dim = total_value,
-                .group_size = cfg->group_size, .is_2bit = false
-            };
-            gpu_encode_matvec_job(enc, ctx, &o_job); }
+            if (tcache) {
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&tcache[layer].lin.o,
+                    ctx->buf_linear_q, 0, ctx->buf_h_mid, 0);
+            } else {
+                GpuMatvecJob o_job = {
+                    .w_buf = ctx->buf_weights, .w_off = lw->lin.o_w,
+                    .s_buf = ctx->buf_weights, .s_off = lw->lin.o_s,
+                    .b_buf = ctx->buf_weights, .b_off = lw->lin.o_b,
+                    .in_buf = ctx->buf_linear_q, .in_off = 0,
+                    .out_buf = ctx->buf_h_mid, .out_off = 0,
+                    .out_ptr = NULL, .out_dim = H, .in_dim = total_value,
+                    .group_size = cfg->group_size, .is_2bit = false
+                };
+                gpu_encode_matvec_job(enc, ctx, &o_job);
+            }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase I+J: Fused residual add + sum_sq → buf_moe_hidden ---
@@ -913,7 +922,8 @@ int engine_step(Engine *eng, int token_id) {
             // Post-attention RMS norm with partial sums → buf_input
             [enc setComputePipelineState:ctx->norm_apply_partial];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_weights offset:lw->post_norm_w atIndex:1];
+            [enc setBuffer:tcache ? tcache[layer].post_norm.buffer : ctx->buf_weights
+                   offset:tcache ? tcache[layer].post_norm.offset : lw->post_norm_w atIndex:1];
             [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
             [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
             { uint d = (uint)H; float e = cfg->rms_norm_eps;
@@ -928,34 +938,46 @@ int engine_step(Engine *eng, int token_id) {
 
             // --- Phase K: MoE routing + shared expert projections ---
             size_t sgg_off = n_experts * sizeof(float);
-            GpuMatvecJob routing_jobs[4] = {
-                { .w_buf = ctx->buf_weights, .w_off = lw->gate_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->gate_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->gate_b,
-                  .out_buf = ctx->buf_output, .out_off = 0,
-                  .out_ptr = NULL, .out_dim = n_experts, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = lw->sg_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->sg_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->sg_b,
-                  .out_buf = ctx->buf_shared_gate, .out_off = 0,
-                  .out_ptr = NULL, .out_dim = S, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = lw->su_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->su_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->su_b,
-                  .out_buf = ctx->buf_shared_up, .out_off = 0,
-                  .out_ptr = NULL, .out_dim = S, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = lw->sgg_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->sgg_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->sgg_b,
-                  .out_buf = ctx->buf_output, .out_off = sgg_off,
-                  .out_ptr = NULL, .out_dim = 1, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-            };
-            for (int j = 0; j < 4; j++)
-                gpu_encode_matvec_job(enc, ctx, &routing_jobs[j]);
+            if (tcache) {
+                const LayerTensorCache *lt = &tcache[layer];
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->routing_gate,
+                    ctx->buf_input, 0, ctx->buf_output, 0);
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_gate,
+                    ctx->buf_input, 0, ctx->buf_shared_gate, 0);
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_up,
+                    ctx->buf_input, 0, ctx->buf_shared_up, 0);
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_expert_gate,
+                    ctx->buf_input, 0, ctx->buf_output, sgg_off);
+            } else {
+                GpuMatvecJob routing_jobs[4] = {
+                    { .w_buf = ctx->buf_weights, .w_off = lw->gate_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->gate_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->gate_b,
+                      .out_buf = ctx->buf_output, .out_off = 0,
+                      .out_ptr = NULL, .out_dim = n_experts, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                    { .w_buf = ctx->buf_weights, .w_off = lw->sg_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->sg_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->sg_b,
+                      .out_buf = ctx->buf_shared_gate, .out_off = 0,
+                      .out_ptr = NULL, .out_dim = S, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                    { .w_buf = ctx->buf_weights, .w_off = lw->su_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->su_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->su_b,
+                      .out_buf = ctx->buf_shared_up, .out_off = 0,
+                      .out_ptr = NULL, .out_dim = S, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                    { .w_buf = ctx->buf_weights, .w_off = lw->sgg_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->sgg_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->sgg_b,
+                      .out_buf = ctx->buf_output, .out_off = sgg_off,
+                      .out_ptr = NULL, .out_dim = 1, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                };
+                for (int j = 0; j < 4; j++)
+                    gpu_encode_matvec_job(enc, ctx, &routing_jobs[j]);
+            }
 
             // Per-layer fused path: use fused experts when layer has Metal buffer
             bool layer_fused = ctx->softmax_topk && ctx->batch_expert_mv_dyn
@@ -1073,7 +1095,8 @@ int engine_step(Engine *eng, int token_id) {
                 uint num_tgs = ((uint)H + 255) / 256;
                 [enc setComputePipelineState:ctx->norm_apply_partial];
                 [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-                [enc setBuffer:ctx->buf_weights offset:lw->input_norm_w atIndex:1];
+                [enc setBuffer:tcache ? tcache[layer].input_norm.buffer : ctx->buf_weights
+                   offset:tcache ? tcache[layer].input_norm.offset : lw->input_norm_w atIndex:1];
                 [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
                 [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
                 { uint d = (uint)H; float e = cfg->rms_norm_eps;
@@ -1095,7 +1118,8 @@ int engine_step(Engine *eng, int token_id) {
 
                 [enc setComputePipelineState:ctx->norm_apply];
                 [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-                [enc setBuffer:ctx->buf_weights offset:lw->input_norm_w atIndex:1];
+                [enc setBuffer:tcache ? tcache[layer].input_norm.buffer : ctx->buf_weights
+                   offset:tcache ? tcache[layer].input_norm.offset : lw->input_norm_w atIndex:1];
                 [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
                 [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
                 { uint d = (uint)H; float e = cfg->rms_norm_eps;
@@ -1107,31 +1131,38 @@ int engine_step(Engine *eng, int token_id) {
             }
 
             // --- Phase B: Q/K/V projections ---
-            // Q → buf_attn_output (n_heads*hd floats)
-            // K → buf_conv_output (reuse, kv_dim = 512 floats)
-            // V → buf_conv_input (reuse, kv_dim = 512 floats)
-            GpuMatvecJob qkv_jobs[3] = {
-                { .w_buf = ctx->buf_weights, .w_off = lw->full.q_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->full.q_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->full.q_b,
-                  .out_buf = ctx->buf_attn_output, .out_off = 0,
-                  .out_ptr = NULL, .out_dim = n_heads * hd * 2, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = lw->full.k_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->full.k_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->full.k_b,
-                  .out_buf = ctx->buf_conv_output, .out_off = 0,
-                  .out_ptr = NULL, .out_dim = n_kv * hd, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = lw->full.v_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->full.v_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->full.v_b,
-                  .out_buf = ctx->buf_conv_input, .out_off = 0,
-                  .out_ptr = NULL, .out_dim = n_kv * hd, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-            };
-            for (int j = 0; j < 3; j++)
-                gpu_encode_matvec_job(enc, ctx, &qkv_jobs[j]);
+            if (tcache) {
+                const LayerTensorCache *lt = &tcache[layer];
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->full.q,
+                    ctx->buf_input, 0, ctx->buf_attn_output, 0);
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->full.k,
+                    ctx->buf_input, 0, ctx->buf_conv_output, 0);
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->full.v,
+                    ctx->buf_input, 0, ctx->buf_conv_input, 0);
+            } else {
+                GpuMatvecJob qkv_jobs[3] = {
+                    { .w_buf = ctx->buf_weights, .w_off = lw->full.q_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->full.q_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->full.q_b,
+                      .out_buf = ctx->buf_attn_output, .out_off = 0,
+                      .out_ptr = NULL, .out_dim = n_heads * hd * 2, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                    { .w_buf = ctx->buf_weights, .w_off = lw->full.k_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->full.k_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->full.k_b,
+                      .out_buf = ctx->buf_conv_output, .out_off = 0,
+                      .out_ptr = NULL, .out_dim = n_kv * hd, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                    { .w_buf = ctx->buf_weights, .w_off = lw->full.v_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->full.v_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->full.v_b,
+                      .out_buf = ctx->buf_conv_input, .out_off = 0,
+                      .out_ptr = NULL, .out_dim = n_kv * hd, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                };
+                for (int j = 0; j < 3; j++)
+                    gpu_encode_matvec_job(enc, ctx, &qkv_jobs[j]);
+            }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase B2: De-interleave Q+gate ---
@@ -1163,8 +1194,10 @@ int engine_step(Engine *eng, int token_id) {
             [enc setComputePipelineState:ctx->rms_norm_qk_w];
             [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];  // Q
             [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:1];  // K
-            [enc setBuffer:ctx->buf_weights offset:lw->full.qnorm_w atIndex:2];
-            [enc setBuffer:ctx->buf_weights offset:lw->full.knorm_w atIndex:3];
+            [enc setBuffer:tcache ? tcache[layer].full.q_norm.buffer : ctx->buf_weights
+                   offset:tcache ? tcache[layer].full.q_norm.offset : lw->full.qnorm_w atIndex:2];
+            [enc setBuffer:tcache ? tcache[layer].full.k_norm.buffer : ctx->buf_weights
+                   offset:tcache ? tcache[layer].full.k_norm.offset : lw->full.knorm_w atIndex:3];
             { uint hd_val = (uint)hd, nq = (uint)n_heads, nkv = (uint)n_kv;
               float inv_s = 1.0f / sqrtf((float)hd);
               [enc setBytes:&hd_val length:sizeof(uint) atIndex:4];
@@ -1267,16 +1300,21 @@ int engine_step(Engine *eng, int token_id) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase I: O-proj (buf_attn_output → buf_h_mid) ---
-            { GpuMatvecJob o_job = {
-                .w_buf = ctx->buf_weights, .w_off = lw->full.o_w,
-                .s_buf = ctx->buf_weights, .s_off = lw->full.o_s,
-                .b_buf = ctx->buf_weights, .b_off = lw->full.o_b,
-                .in_buf = ctx->buf_attn_output, .in_off = 0,
-                .out_buf = ctx->buf_h_mid, .out_off = 0,
-                .out_ptr = NULL, .out_dim = H, .in_dim = n_heads * hd,
-                .group_size = cfg->group_size, .is_2bit = false
-            };
-            gpu_encode_matvec_job(enc, ctx, &o_job); }
+            if (tcache) {
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&tcache[layer].full.o,
+                    ctx->buf_attn_output, 0, ctx->buf_h_mid, 0);
+            } else {
+                GpuMatvecJob o_job = {
+                    .w_buf = ctx->buf_weights, .w_off = lw->full.o_w,
+                    .s_buf = ctx->buf_weights, .s_off = lw->full.o_s,
+                    .b_buf = ctx->buf_weights, .b_off = lw->full.o_b,
+                    .in_buf = ctx->buf_attn_output, .in_off = 0,
+                    .out_buf = ctx->buf_h_mid, .out_off = 0,
+                    .out_ptr = NULL, .out_dim = H, .in_dim = n_heads * hd,
+                    .group_size = cfg->group_size, .is_2bit = false
+                };
+                gpu_encode_matvec_job(enc, ctx, &o_job);
+            }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase J+K: Fused residual add + sum_sq → buf_moe_hidden ---
@@ -1294,7 +1332,8 @@ int engine_step(Engine *eng, int token_id) {
             // Post-attention RMS norm with partial sums → buf_input
             [enc setComputePipelineState:ctx->norm_apply_partial];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_weights offset:lw->post_norm_w atIndex:1];
+            [enc setBuffer:tcache ? tcache[layer].post_norm.buffer : ctx->buf_weights
+                   offset:tcache ? tcache[layer].post_norm.offset : lw->post_norm_w atIndex:1];
             [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
             [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
             { uint d = (uint)H; float e = cfg->rms_norm_eps;
@@ -1309,34 +1348,46 @@ int engine_step(Engine *eng, int token_id) {
 
             // --- Phase L: MoE routing + shared expert projections ---
             size_t sgg_off = n_experts * sizeof(float);
-            GpuMatvecJob routing_jobs[4] = {
-                { .w_buf = ctx->buf_weights, .w_off = lw->gate_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->gate_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->gate_b,
-                  .out_buf = ctx->buf_output, .out_off = 0,
-                  .out_ptr = NULL, .out_dim = n_experts, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = lw->sg_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->sg_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->sg_b,
-                  .out_buf = ctx->buf_shared_gate, .out_off = 0,
-                  .out_ptr = NULL, .out_dim = S, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = lw->su_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->su_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->su_b,
-                  .out_buf = ctx->buf_shared_up, .out_off = 0,
-                  .out_ptr = NULL, .out_dim = S, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = lw->sgg_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->sgg_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->sgg_b,
-                  .out_buf = ctx->buf_output, .out_off = sgg_off,
-                  .out_ptr = NULL, .out_dim = 1, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-            };
-            for (int j = 0; j < 4; j++)
-                gpu_encode_matvec_job(enc, ctx, &routing_jobs[j]);
+            if (tcache) {
+                const LayerTensorCache *lt = &tcache[layer];
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->routing_gate,
+                    ctx->buf_input, 0, ctx->buf_output, 0);
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_gate,
+                    ctx->buf_input, 0, ctx->buf_shared_gate, 0);
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_up,
+                    ctx->buf_input, 0, ctx->buf_shared_up, 0);
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_expert_gate,
+                    ctx->buf_input, 0, ctx->buf_output, sgg_off);
+            } else {
+                GpuMatvecJob routing_jobs[4] = {
+                    { .w_buf = ctx->buf_weights, .w_off = lw->gate_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->gate_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->gate_b,
+                      .out_buf = ctx->buf_output, .out_off = 0,
+                      .out_ptr = NULL, .out_dim = n_experts, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                    { .w_buf = ctx->buf_weights, .w_off = lw->sg_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->sg_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->sg_b,
+                      .out_buf = ctx->buf_shared_gate, .out_off = 0,
+                      .out_ptr = NULL, .out_dim = S, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                    { .w_buf = ctx->buf_weights, .w_off = lw->su_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->su_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->su_b,
+                      .out_buf = ctx->buf_shared_up, .out_off = 0,
+                      .out_ptr = NULL, .out_dim = S, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                    { .w_buf = ctx->buf_weights, .w_off = lw->sgg_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->sgg_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->sgg_b,
+                      .out_buf = ctx->buf_output, .out_off = sgg_off,
+                      .out_ptr = NULL, .out_dim = 1, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                };
+                for (int j = 0; j < 4; j++)
+                    gpu_encode_matvec_job(enc, ctx, &routing_jobs[j]);
+            }
 
             // Per-layer fused path: use fused experts when layer has Metal buffer
             bool layer_fused_fa = ctx->softmax_topk && ctx->batch_expert_mv_dyn
@@ -1465,7 +1516,9 @@ int engine_step(Engine *eng, int token_id) {
             uint num_tgs = ((uint)H + 255) / 256;
             [enc setComputePipelineState:ctx->norm_apply_partial];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)final_norm_w - base atIndex:1];
+            [enc setBuffer:tcache ? eng->globals.final_norm.buffer : ctx->buf_weights
+                   offset:tcache ? eng->globals.final_norm.offset : (size_t)((uint8_t *)final_norm_w - base)
+                  atIndex:1];
             [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
             [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
             { uint d = (uint)H; float e = cfg->rms_norm_eps;
@@ -1487,7 +1540,9 @@ int engine_step(Engine *eng, int token_id) {
 
             [enc setComputePipelineState:ctx->norm_apply];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_weights offset:(uint8_t *)final_norm_w - base atIndex:1];
+            [enc setBuffer:tcache ? eng->globals.final_norm.buffer : ctx->buf_weights
+                   offset:tcache ? eng->globals.final_norm.offset : (size_t)((uint8_t *)final_norm_w - base)
+                  atIndex:1];
             [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:2];
             [enc setBuffer:ctx->buf_input offset:0 atIndex:3];
             { uint d = (uint)H; float e = cfg->rms_norm_eps;
@@ -1499,16 +1554,21 @@ int engine_step(Engine *eng, int token_id) {
         }
 
         // LM head matvec: buf_input → buf_output
-        GpuMatvecJob lm_job = {
-            .w_buf = ctx->buf_weights, .w_off = (uint8_t *)lm_w - base,
-            .s_buf = ctx->buf_weights, .s_off = (uint8_t *)lm_s - base,
-            .b_buf = ctx->buf_weights, .b_off = (uint8_t *)lm_b - base,
-            .in_buf = ctx->buf_input, .in_off = 0,
-            .out_buf = ctx->buf_output, .out_off = 0,
-            .out_ptr = NULL, .out_dim = cfg->vocab_size, .in_dim = H,
-            .group_size = cfg->group_size, .is_2bit = false
-        };
-        gpu_encode_matvec_job(enc, ctx, &lm_job);
+        if (tcache) {
+            format_dispatch_matvec(enc, ctx, (TensorRef *)&eng->globals.lm_head,
+                ctx->buf_input, 0, ctx->buf_output, 0);
+        } else {
+            GpuMatvecJob lm_job = {
+                .w_buf = ctx->buf_weights, .w_off = (uint8_t *)lm_w - base,
+                .s_buf = ctx->buf_weights, .s_off = (uint8_t *)lm_s - base,
+                .b_buf = ctx->buf_weights, .b_off = (uint8_t *)lm_b - base,
+                .in_buf = ctx->buf_input, .in_off = 0,
+                .out_buf = ctx->buf_output, .out_off = 0,
+                .out_ptr = NULL, .out_dim = cfg->vocab_size, .in_dim = H,
+                .group_size = cfg->group_size, .is_2bit = false
+            };
+            gpu_encode_matvec_job(enc, ctx, &lm_job);
+        }
 
         // GPU argmax: find max index without copying 993KB logits to CPU
         if (ctx->argmax && ctx->buf_argmax_result) {
