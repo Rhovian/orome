@@ -637,6 +637,7 @@ int engine_step(Engine *eng, int token_id) {
     double t0, t1;
     MetalCtx *ctx = eng->ctx;
     LayerWeightCache *wcache = (LayerWeightCache *)eng->weight_cache;
+    LayerTensorCache *tcache = eng->tensor_cache;
 
     // Static scratch for gate scores readback
     static float *s_fused_gate_scores = NULL;
@@ -773,35 +774,46 @@ int engine_step(Engine *eng, int token_id) {
 
             // --- Phase B: 4 projections from buf_input ---
             // QKV → buf_conv_input, Z → buf_linear_output, alpha → buf_linear_decay, beta → buf_linear_beta
-            // (reuse buf_linear_output for Z since delta_net hasn't run yet)
-            GpuMatvecJob proj_jobs[4] = {
-                { .w_buf = ctx->buf_weights, .w_off = lw->lin.qkv_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->lin.qkv_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->lin.qkv_b,
-                  .out_buf = ctx->buf_conv_input, .out_off = 0,
-                  .out_ptr = NULL, .out_dim = conv_dim, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = lw->lin.z_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->lin.z_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->lin.z_b,
-                  .out_buf = ctx->buf_linear_output, .out_off = 0,
-                  .out_ptr = NULL, .out_dim = total_value, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = lw->lin.a_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->lin.a_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->lin.a_b,
-                  .out_buf = ctx->buf_linear_decay, .out_off = 0,
-                  .out_ptr = NULL, .out_dim = n_v_heads, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-                { .w_buf = ctx->buf_weights, .w_off = lw->lin.b_w,
-                  .s_buf = ctx->buf_weights, .s_off = lw->lin.b_s,
-                  .b_buf = ctx->buf_weights, .b_off = lw->lin.b_b,
-                  .out_buf = ctx->buf_linear_beta, .out_off = 0,
-                  .out_ptr = NULL, .out_dim = n_v_heads, .in_dim = H,
-                  .group_size = cfg->group_size, .is_2bit = false },
-            };
-            for (int j = 0; j < 4; j++)
-                gpu_encode_matvec_job(enc, ctx, &proj_jobs[j]);
+            if (tcache) {
+                const LayerTensorCache *lt = &tcache[layer];
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->lin.qkv,
+                    ctx->buf_input, 0, ctx->buf_conv_input, 0);
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->lin.z,
+                    ctx->buf_input, 0, ctx->buf_linear_output, 0);
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->lin.a,
+                    ctx->buf_input, 0, ctx->buf_linear_decay, 0);
+                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->lin.b,
+                    ctx->buf_input, 0, ctx->buf_linear_beta, 0);
+            } else {
+                GpuMatvecJob proj_jobs[4] = {
+                    { .w_buf = ctx->buf_weights, .w_off = lw->lin.qkv_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->lin.qkv_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->lin.qkv_b,
+                      .out_buf = ctx->buf_conv_input, .out_off = 0,
+                      .out_ptr = NULL, .out_dim = conv_dim, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                    { .w_buf = ctx->buf_weights, .w_off = lw->lin.z_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->lin.z_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->lin.z_b,
+                      .out_buf = ctx->buf_linear_output, .out_off = 0,
+                      .out_ptr = NULL, .out_dim = total_value, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                    { .w_buf = ctx->buf_weights, .w_off = lw->lin.a_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->lin.a_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->lin.a_b,
+                      .out_buf = ctx->buf_linear_decay, .out_off = 0,
+                      .out_ptr = NULL, .out_dim = n_v_heads, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                    { .w_buf = ctx->buf_weights, .w_off = lw->lin.b_w,
+                      .s_buf = ctx->buf_weights, .s_off = lw->lin.b_s,
+                      .b_buf = ctx->buf_weights, .b_off = lw->lin.b_b,
+                      .out_buf = ctx->buf_linear_beta, .out_off = 0,
+                      .out_ptr = NULL, .out_dim = n_v_heads, .in_dim = H,
+                      .group_size = cfg->group_size, .is_2bit = false },
+                };
+                for (int j = 0; j < 4; j++)
+                    gpu_encode_matvec_job(enc, ctx, &proj_jobs[j]);
+            }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase C: Conv1d step ---
