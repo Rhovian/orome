@@ -1,43 +1,53 @@
 # Orome
 
-Multi-model MoE inference engine for Apple Silicon, built with Obj-C and Metal.
+MoE inference engine for Apple Silicon. Runs Qwen3.5 models (35B and 397B) on a single Mac Studio using Metal GPU compute and SSD streaming.
 
-Bootstrapped from [flash-moe](../flash-moe/) (MacBook Air M4, 16GB) and autonomously optimized via an autoresearch-style experiment loop.
+**35B-A3B**: 62.53 tok/s — all experts GPU-resident, pure dispatch optimization.
+**397B-A17B**: 7.87 tok/s — 120 GB of experts streamed from SSD through the OS page cache, ~1.3 GB read per token.
 
-## Hardware Target
+## Hardware
 
-- **Machine**: Mac Studio (M2 Max, 2023)
-- **Chip**: 12-core CPU (8P + 4E), 38-core GPU
-- **Memory**: 96 GB unified (~400 GB/s bandwidth)
-- **Storage**: SSD (Apple Fabric)
+Mac Studio (2023): M2 Max, 38 GPU cores, 96 GB unified memory, NVMe SSD.
 
 ## Quick Start
 
 ```bash
-# 1. Download model weights
-hf download Qwen/Qwen3.5-35B-A3B --local-dir ~/models/Qwen3.5-35B-A3B
-
-# 2. Extract weights for the engine
-uv run tools/extract_weights.py --model ~/models/Qwen3.5-35B-A3B --output .
-uv run tools/repack_experts.py --model ~/models/Qwen3.5-35B-A3B --output packed_experts
-uv run tools/export_tokenizer.py --model ~/models/Qwen3.5-35B-A3B --output vocab.bin
-
-# 3. Build
+# Build
 make
 
-# 4. Run inference
-./orome --prompt "Hello" --tokens 20 --k 8
+# Run inference
+./orome --model /path/to/model --prompt "Hello" --tokens 100
 
-# 5. Benchmark
-uv run tools/benchmark.py --trials 3
+# Serve (OpenAI-compatible API)
+make serve MODEL=/path/to/model
+
+# Chat (terminal client)
+make chat
 ```
 
-## Project Structure
+For 2-bit expert quantization (397B):
+```bash
+uv run tools/repack_experts_2bit.py --model /path/to/model --output packed_experts_2bit
+./orome --model /path/to/model --prompt "Hello" --tokens 100 --2bit
+```
+
+## How It Works
+
+### Models That Fit in RAM (35B)
+
+All expert weights are mlock'd into physical memory and wrapped as Metal shared buffers. The GPU reads directly from unified memory. The forward pass is a fused Metal pipeline — norm, projections, attention, routing, expert forward, and combine are batched into per-layer command buffers with concurrent dispatch. One GPU round-trip per layer, ~40 total per token.
+
+### Models That Don't Fit (397B)
+
+Expert weights live on SSD as packed binary files (one per layer). Each token triggers ~360 pread calls to load the active experts. The OS page cache serves ~90% of reads in <1ms; the remaining 10% hit SSD at 1-5ms. A per-layer expert cache (K+2 Metal shared buffers, 2.7 GB) tracks recently-used experts and skips the pread entirely on cache hit (~40% hit rate).
+
+The serial dependency chain — attention → routing → I/O → expert compute — cannot be pipelined because expert identity is unknown until attention completes. This chain sets the performance floor.
+
+## Architecture
 
 ```
 include/orome.h        — Shared types, ModelConfig, interfaces
 src/
-  main.m               — CLI entry point
   engine.m             — Forward pass orchestration
   metal.m              — Metal GPU context & dispatch
   attention.m          — Full (GQA) + linear (GatedDeltaNet) attention
@@ -47,20 +57,22 @@ src/
   tokenizer.m          — BPE encode/decode
   server.m             — HTTP/SSE server (OpenAI-compatible)
   shaders.metal        — Metal GPU kernels
-vendor/                — Vendored third-party (tokenizer.h, linenoise)
-tools/                 — Python tooling (weight extraction, benchmarks, viz)
+tools/                 — Weight extraction, benchmarking, chat client
 ```
 
-## Multi-Model
+The engine is parameterized by `ModelConfig` — no hardcoded dimensions. Swap between 35B and 397B via config, not code.
 
-The engine is parameterized by `ModelConfig` — no hardcoded model dimensions. Swap between Qwen3.5-35B and 397B (or future models) via config, not code. Config is loaded from HF `config.json` or falls back to built-in presets.
+## Optimization Campaigns
 
-## Autonomous Optimization
+Two models, two completely different bottlenecks, two different optimization stories:
+
+- **[Qwen3.5-35B-A3B](docs/qwen-35b-a3b.md)** — GPU dispatch campaign. 1.04 → 62.53 tok/s (60x). Everything fits in RAM; the entire story is reducing GPU synchronization overhead.
+- **[Qwen3.5-397B-A17B](docs/qwen-397b-a17b.md)** — I/O streaming campaign. 4.08 → 7.87 tok/s (+93%). Experts don't fit in RAM; 49 experiments proving that pread + page cache + modest application cache is the optimal I/O strategy, and that the serial dependency chain sets a hard ceiling.
+
+## Autonomous Research
 
 ```bash
-./run_experiments.sh
+./run_experiments.sh qwen35-397B --sessions 3
 ```
 
-Launches Claude Code sessions in a loop. Each session reads `status.md` for handoff context, runs experiments (modify source, build, benchmark), logs to `results.tsv`, writes status back. See `program.md` for the full protocol.
-
-Visualize results: `uv run tools/progress.py`
+Launches Claude Code sessions that autonomously run experiments: modify source, build, benchmark, log results, commit or revert. Each session reads `status.md` for handoff, follows `program.md` for protocol, appends to `results.tsv`. 122 experiments logged across both campaigns.
