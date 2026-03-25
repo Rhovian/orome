@@ -872,14 +872,18 @@ int engine_step(Engine *eng, int token_id) {
                     memcpy(eng->residual, eng->hidden, H * sizeof(float));
                 }
 
+                double t0_moe = now_ms();
                 moe_forward_routed(eng->wf, ctx, cfg, layer, eng->hidden, eng->h_post,
                                    s_fused_gate_scores, shared_gate_score,
                                    eng->ef, effective_k, eng->quant,
                                    gpu_resident);
+                double moe_ms = now_ms() - t0_moe;
+                t_moe_total += moe_ms;
             }
 
             t1 = now_ms();
             t_attn_total += t1 - t0;
+            // Note: t_attn_total includes moe time; true attn = t_attn_total - t_moe_total
 
             linear_idx++;
             continue;
@@ -1245,10 +1249,13 @@ int engine_step(Engine *eng, int token_id) {
                     memcpy(eng->residual, eng->hidden, H * sizeof(float));
                 }
 
+                double t0_moe = now_ms();
                 moe_forward_routed(eng->wf, ctx, cfg, layer, eng->hidden, eng->h_post,
                                    s_fused_gate_scores, shared_gate_score,
                                    eng->ef, effective_k, eng->quant,
                                    gpu_resident);
+                double moe_ms = now_ms() - t0_moe;
+                t_moe_total += moe_ms;
             }
 
             t1 = now_ms();
@@ -1435,8 +1442,9 @@ int engine_step(Engine *eng, int token_id) {
     // Print profile every 10 tokens
     if (profile_count % 10 == 0) {
         double inv = 1.0 / profile_count;
+        double attn_only = t_attn_total - t_moe_total;
         fprintf(stderr, "[profile] avg/tok: attn=%.1fms moe=%.1fms norm=%.2fms lmhead=%.1fms\n",
-                t_attn_total * inv, t_moe_total * inv, t_norm_total * inv, t_lmhead_total * inv);
+                attn_only * inv, t_moe_total * inv, t_norm_total * inv, t_lmhead_total * inv);
         if (eng->ef && moe_get_profile_experts()) moe_print_layer_stats(eng->ef, true);
     }
 
