@@ -132,6 +132,16 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->deinterleave_qgate = make_pipeline(ctx, @"deinterleave_qgate");
     ctx->copy_tmp_to_buf = make_pipeline(ctx, @"copy_tmp_to_buf");
 
+    // GGUF format pipelines
+    ctx->matvec_q4k = make_pipeline(ctx, @"dequant_matvec_q4k");
+    ctx->matvec_q8_0 = make_pipeline(ctx, @"dequant_matvec_q8_0");
+    ctx->batch_expert_mv_q4k = make_pipeline(ctx, @"batch_expert_matvec_q4k");
+    ctx->batch_expert_down_q4k = make_pipeline(ctx, @"batch_expert_down_q4k");
+    // Q5_K, Q6_K, F16 kernels: TODO — add when needed
+    ctx->matvec_q5k = NULL;
+    ctx->matvec_q6k = NULL;
+    ctx->matvec_f16 = NULL;
+
     if (!ctx->matvec_4bit || !ctx->norm_sum_sq || !ctx->norm_apply) {
         fprintf(stderr, "ERROR: Required Metal pipelines missing\n");
         metal_free(ctx);

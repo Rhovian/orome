@@ -18,6 +18,10 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+// Forward declarations
+typedef struct GGUFFile GGUFFile;
+typedef struct GGUFTensorInfo GGUFTensorInfo;
+
 // ============================================================================
 // Limits (allocation upper bounds, not model-specific)
 // ============================================================================
@@ -240,6 +244,15 @@ typedef struct {
     id<MTLComputePipelineState> deinterleave_qgate;
     id<MTLComputePipelineState> copy_tmp_to_buf;
 
+    // GGUF format pipelines
+    id<MTLComputePipelineState> matvec_q4k;
+    id<MTLComputePipelineState> matvec_q5k;
+    id<MTLComputePipelineState> matvec_q8_0;
+    id<MTLComputePipelineState> matvec_q6k;
+    id<MTLComputePipelineState> matvec_f16;
+    id<MTLComputePipelineState> batch_expert_mv_q4k;
+    id<MTLComputePipelineState> batch_expert_down_q4k;
+
     // Shared buffers (allocated based on ModelConfig)
     id<MTLBuffer> buf_input;
     id<MTLBuffer> buf_output;
@@ -316,7 +329,76 @@ void metal_set_weights(MetalCtx *ctx, WeightFile *wf);
 void metal_free(MetalCtx *ctx);
 
 // ============================================================================
-// GPU matvec dispatch
+// Weight format abstraction
+// ============================================================================
+
+typedef enum {
+    QFMT_OROME_4BIT,    // legacy: packed uint32 W + BF16 scales + BF16 biases
+    QFMT_OROME_2BIT,    // legacy: packed uint32 W (2-bit) + BF16 scales + BF16 biases
+    QFMT_GGUF_Q4_0,     // GGUF: 32 weights + fp16 scale per block
+    QFMT_GGUF_Q4_K,     // GGUF: 256 weights in 144-byte super-block
+    QFMT_GGUF_Q5_K,     // GGUF: 256 weights in 176-byte super-block
+    QFMT_GGUF_Q6_K,     // GGUF: 256 weights in 210-byte super-block
+    QFMT_GGUF_Q8_0,     // GGUF: 32 int8 weights + fp16 scale per block
+    QFMT_F16,           // unquantized float16
+    QFMT_BF16,          // unquantized bfloat16
+    QFMT_F32,           // unquantized float32
+} QuantFormat;
+
+// A fully-resolved reference to a quantized weight tensor, ready for GPU dispatch.
+// The engine doesn't need to know the underlying file format — it just dispatches.
+typedef struct {
+    id<MTLBuffer> buffer;       // Metal buffer containing the data
+    size_t offset;              // byte offset within buffer
+    size_t scale_offset;        // for legacy format: separate scale buffer offset
+    size_t bias_offset;         // for legacy format: separate bias buffer offset
+    id<MTLComputePipelineState> pipeline;  // which dequant kernel to use
+    QuantFormat format;
+    uint32_t out_dim;
+    uint32_t in_dim;
+    uint32_t group_size;        // for legacy format only
+} TensorRef;
+
+// Per-projection info within an ExpertLayerRef
+typedef struct {
+    size_t offset;              // byte offset to start of 3D tensor in buffer
+    size_t expert_stride;       // bytes between consecutive experts
+    QuantFormat format;
+    id<MTLComputePipelineState> pipeline;
+    uint32_t out_dim, in_dim;
+} ExpertProjRef;
+
+// All expert weight references for one layer, handles mixed quant
+typedef struct {
+    id<MTLBuffer> buffer;       // single Metal buffer (GGUF mmap or legacy layer)
+    uint32_t num_experts;
+    ExpertProjRef gate, up, down;
+    ExpertProjRef shared_gate, shared_up, shared_down;
+} ExpertLayerRef;
+
+// Opaque provider that resolves tensor names to dispatch-ready refs
+typedef struct {
+    GGUFFile *gguf;             // non-NULL for GGUF models
+    MetalCtx *ctx;
+    id<MTLBuffer> model_buf;    // Metal buffer wrapping the model data
+} FormatProvider;
+
+FormatProvider   *format_provider_open_gguf(GGUFFile *gf, MetalCtx *ctx);
+void              format_provider_close(FormatProvider *fp);
+TensorRef         format_resolve_tensor(FormatProvider *fp, const char *name,
+                                         uint32_t out_dim, uint32_t in_dim);
+ExpertLayerRef    format_resolve_expert_layer(FormatProvider *fp, int layer_idx,
+                                              uint32_t hidden_dim, uint32_t intermediate,
+                                              uint32_t num_experts);
+void              format_dispatch_matvec(id<MTLComputeCommandEncoder> enc,
+                                         MetalCtx *ctx, TensorRef *ref,
+                                         id<MTLBuffer> in_buf, size_t in_off,
+                                         id<MTLBuffer> out_buf, size_t out_off);
+id<MTLComputePipelineState> format_pipeline_for(MetalCtx *ctx, QuantFormat fmt);
+QuantFormat       format_from_ggml_type(uint32_t ggml_type);
+
+// ============================================================================
+// GPU matvec dispatch (legacy — used by existing engine code)
 // ============================================================================
 
 typedef struct {
@@ -593,15 +675,15 @@ void serve_loop(Engine *eng, Vocabulary *vocab, int port);
 // GGUF file format support
 // ============================================================================
 
-typedef struct {
+struct GGUFTensorInfo {
     char *name;
     uint32_t n_dims;
     uint64_t dims[4];
     uint32_t type;          // GGML quantization type
     uint64_t offset;        // relative to data section start
-} GGUFTensorInfo;
+};
 
-typedef struct {
+struct GGUFFile {
     int fd;
     void *mmap_base;
     size_t file_size;
@@ -615,7 +697,7 @@ typedef struct {
     int num_attn_heads, num_kv_heads, moe_intermediate;
     float rope_theta;
     int vocab_size;
-} GGUFFile;
+};
 
 GGUFFile       *gguf_open(const char *path);
 void            gguf_close(GGUFFile *gf);
