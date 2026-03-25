@@ -1886,7 +1886,7 @@ kernel void matvec_f32(
     device const float* w_row = W + row * in_dim;
     float acc = 0.0f;
     for (uint col = simd_lane; col < in_dim; col += 32) {
-        acc += w_row[col] * float(x_shared[col]);
+        acc += w_row[col] * x[col];
     }
     float sum = simd_sum(acc);
     if (simd_lane == 0) {
@@ -1930,9 +1930,9 @@ inline void unpack_q4k_scales(device const uint8_t* sc_data,
 }
 
 kernel void dequant_matvec_q4k(
-    device const uint8_t*  data       [[buffer(0)]],  // Q4_K tensor data
-    device const float*    x          [[buffer(1)]],  // input vector
-    device float*          out        [[buffer(2)]],  // output vector
+    device const uint8_t*  data       [[buffer(0)]],
+    device const float*    x          [[buffer(1)]],
+    device float*          out        [[buffer(2)]],
     constant uint&         out_dim    [[buffer(3)]],
     constant uint&         in_dim     [[buffer(4)]],
     uint tgid   [[threadgroup_position_in_grid]],
@@ -1944,17 +1944,8 @@ kernel void dequant_matvec_q4k(
     uint row = tgid * ROWS_PER_TG + simd_group;
     if (row >= out_dim) return;
 
-    // Load input into shared memory
-    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Q4_K: 256 weights per super-block, 144 bytes per super-block
     uint num_superblocks = in_dim / 256;
     uint bytes_per_row = num_superblocks * 144;
-
     device const uint8_t* row_data = data + row * bytes_per_row;
 
     float acc = 0.0f;
@@ -1963,35 +1954,25 @@ kernel void dequant_matvec_q4k(
     for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
         device const uint8_t* sb = row_data + sb_idx * 144;
 
-        // Read super-block header
         float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
         float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
 
-        // Unpack sub-block scales and mins
         float sc[8], mn[8];
         unpack_q4k_scales(sb + 4, sc, mn, 8);
 
-        // Quantized weights start at offset 16
         device const uint8_t* qs = sb + 16;
-
         uint x_base = sb_idx * 256;
 
-        // Process 8 sub-blocks of 32 weights each
         for (uint sub = 0; sub < 8; sub++) {
             float sub_sc = d * sc[sub];
             float sub_mn = dmin * mn[sub];
-
-            device const uint8_t* qsub = qs + sub * 16;  // 32 nibbles = 16 bytes
+            device const uint8_t* qsub = qs + sub * 16;
 
             for (uint j = 0; j < 16; j++) {
                 uint8_t byte = qsub[j];
                 uint xi = x_base + sub * 32 + j * 2;
-
-                float q_lo = float(byte & 0xF);
-                float q_hi = float(byte >> 4);
-
-                acc += (sub_sc * q_lo - sub_mn) * float(x_shared[xi]);
-                acc += (sub_sc * q_hi - sub_mn) * float(x_shared[xi + 1]);
+                acc += (sub_sc * float(byte & 0xF) - sub_mn) * x[xi];
+                acc += (sub_sc * float(byte >> 4) - sub_mn) * x[xi + 1];
             }
         }
     }
@@ -2051,7 +2032,7 @@ kernel void dequant_matvec_q8_0(
 
         float local_acc = 0.0f;
         for (uint j = 0; j < 32; j++) {
-            local_acc += d * float(qs[j]) * float(x_shared[x_base + j]);
+            local_acc += d * float(qs[j]) * x[x_base + j];
         }
         acc += local_acc;
     }
@@ -2131,7 +2112,7 @@ kernel void dequant_matvec_q5k(
                 uint8_t q_lo = (ql[idx / 2] >> (4 * (idx % 2))) & 0xF;
                 uint8_t q_hi = (qh[idx / 8] >> (idx % 8)) & 1;
                 float q5 = float(q_lo | (q_hi << 4));
-                acc += (sub_sc * q5 - sub_mn) * float(x_shared[x_base + idx]);
+                acc += (sub_sc * q5 - sub_mn) * x[x_base + idx];
             }
         }
     }
@@ -2202,7 +2183,7 @@ kernel void dequant_matvec_q6k(
             uint8_t q_hi = (qh[j / 4] >> (2 * (j % 4))) & 0x3;
             int q6 = (int)(q_lo | (q_hi << 4)) - 32;
             float sc = (float)scales[j / 16];
-            acc += d * sc * (float)q6 * float(x_shared[x_base + j]);
+            acc += d * sc * (float)q6 * x[x_base + j];
         }
     }
 
@@ -2273,8 +2254,8 @@ kernel void batch_expert_matvec_q4k(
             for (uint j = 0; j < 16; j++) {
                 uint8_t byte = qsub[j];
                 uint xi = x_base + sub * 32 + j * 2;
-                acc += (sub_sc * float(byte & 0xF) - sub_mn) * float(x_shared[xi]);
-                acc += (sub_sc * float(byte >> 4) - sub_mn) * float(x_shared[xi + 1]);
+                acc += (sub_sc * float(byte & 0xF) - sub_mn) * x[xi];
+                acc += (sub_sc * float(byte >> 4) - sub_mn) * x[xi + 1];
             }
         }
     }
@@ -2341,8 +2322,8 @@ kernel void batch_expert_down_q4k(
             for (uint j = 0; j < 16; j++) {
                 uint8_t byte = qsub[j];
                 uint xi = x_base + sub * 32 + j * 2;
-                acc += (sub_sc * float(byte & 0xF) - sub_mn) * float(x_shared[xi]);
-                acc += (sub_sc * float(byte >> 4) - sub_mn) * float(x_shared[xi + 1]);
+                acc += (sub_sc * float(byte & 0xF) - sub_mn) * ex[xi];
+                acc += (sub_sc * float(byte >> 4) - sub_mn) * ex[xi + 1];
             }
         }
     }

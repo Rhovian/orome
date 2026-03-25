@@ -1191,6 +1191,16 @@ int engine_step(Engine *eng, int token_id) {
                     eng->hidden[j] = eng->residual[j] + expert_sum + sigmoid_sg * shared_out[j];
                 }
 
+                // Debug: check expert output
+                if (eng->pos == 0 && layer == 0) {
+                    fprintf(stderr, "[gguf-dbg] L0 hidden after combine: [%.6f %.6f %.6f %.6f]\n",
+                            eng->hidden[0], eng->hidden[1], eng->hidden[2], eng->hidden[3]);
+                    float *eo = (float *)[ctx->buf_multi_expert_out[0] contents];
+                    int nans = 0; for (int j = 0; j < H; j++) if (isnan(eo[j])) nans++;
+                    fprintf(stderr, "[gguf-dbg] L0 expert_out[0]: nans=%d first=[%.6f %.6f %.6f %.6f]\n",
+                            nans, eo[0], eo[1], eo[2], eo[3]);
+                }
+
                 // Upload combined result back to GPU for next layer's attention
                 memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
 

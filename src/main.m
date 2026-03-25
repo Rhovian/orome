@@ -375,6 +375,10 @@ int main(int argc, char **argv) {
             // Generate
             double gen_start = now_ms();
             int generated = 0;
+            if (is_gguf) {
+                fprintf(stderr, "[gguf] first predicted token: %d '%s' (eos=%d)\n",
+                        next_token, tokenizer_decode(next_token), is_eos_token(&cfg, next_token));
+            }
             for (int i = 0; i < max_tokens; i++) {
                 if (is_eos_token(&cfg, next_token)) break;
 

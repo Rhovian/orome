@@ -303,13 +303,15 @@ static TensorRef gguf_ref(GGUFFile *gf, id<MTLBuffer> buf, MetalCtx *ctx,
     };
 }
 
-// Helper: GGUF raw tensor (F32 norms, biases — not matvec'd, just need pointer)
-// For GGUF, norms are F32 but our kernels expect BF16. Convert at load time.
-static TensorRef gguf_raw(GGUFFile *gf, id<MTLBuffer> buf, id<MTLDevice> device, const char *name) {
+// Helper: GGUF raw tensor.
+// If convert_bf16=true: converts F32 to BF16 (for norm weights read by BF16 kernels).
+// If convert_bf16=false: keeps as-is (for F32 data used as matvec or direct float reads).
+static TensorRef gguf_raw(GGUFFile *gf, id<MTLBuffer> buf, id<MTLDevice> device,
+                           const char *name, bool convert_bf16) {
     GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
     if (!ti) return (TensorRef){0};
 
-    if (ti->type == 0) { // F32 — convert to BF16 for kernel compatibility
+    if (ti->type == 0 && convert_bf16) { // F32 — convert to BF16 for kernel compatibility
         size_t num_elements = 1;
         for (uint32_t d = 0; d < ti->n_dims; d++) num_elements *= ti->dims[d];
         size_t bf16_size = num_elements * sizeof(uint16_t);
@@ -413,7 +415,8 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
     char name[128];
 
     #define G_REF(tname, od, id) gguf_ref(gf, buf, ctx, (tname), (od), (id))
-    #define G_RAW(tname) gguf_raw(gf, buf, ctx->device, (tname))
+    #define G_RAW(tname) gguf_raw(gf, buf, ctx->device, (tname), true)
+    #define G_RAW_F32(tname) gguf_raw(gf, buf, ctx->device, (tname), false)
 
     // Global tensors
     if (globals) {
@@ -442,7 +445,7 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
         snprintf(name, sizeof(name), "blk.%d.ffn_down_shexp.weight", i);
         c->shared_down = G_REF(name, H, M);
         snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp_shexp.weight", i);
-        c->shared_expert_gate = G_RAW(name);
+        c->shared_expert_gate = G_RAW_F32(name); // scalar gate, dispatched as F32 matvec
 
         if (cfg->layer_types[i] == ATTN_LINEAR) {
             int conv_dim = cfg->linear_num_v_heads * (cfg->linear_key_dim + cfg->linear_value_dim)
@@ -461,11 +464,11 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
             // GGUF may not have a separate output projection for GatedDeltaNet
             c->lin.o = (TensorRef){0};
             snprintf(name, sizeof(name), "blk.%d.ssm_conv1d.weight", i);
-            c->lin.conv = G_RAW(name);
+            c->lin.conv = G_RAW(name);       // conv1d kernel expects BF16
             snprintf(name, sizeof(name), "blk.%d.ssm_a", i);
-            c->lin.A_log = G_RAW(name);
+            c->lin.A_log = G_RAW_F32(name);  // decay_beta kernel expects F32
             snprintf(name, sizeof(name), "blk.%d.ssm_dt.bias", i);
-            c->lin.dt_bias = G_RAW(name);
+            c->lin.dt_bias = G_RAW(name);     // decay_beta kernel expects BF16
             c->lin.o_norm = (TensorRef){0}; // may not exist
         } else {
             int n_heads = cfg->num_attn_heads;
