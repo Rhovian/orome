@@ -589,4 +589,40 @@ bool          is_eos_token(const ModelConfig *cfg, int token_id);
 
 void serve_loop(Engine *eng, Vocabulary *vocab, int port);
 
+// ============================================================================
+// GGUF file format support
+// ============================================================================
+
+typedef struct {
+    char *name;
+    uint32_t n_dims;
+    uint64_t dims[4];
+    uint32_t type;          // GGML quantization type
+    uint64_t offset;        // relative to data section start
+} GGUFTensorInfo;
+
+typedef struct {
+    int fd;
+    void *mmap_base;
+    size_t file_size;
+    size_t data_offset;     // absolute offset where tensor data begins
+    GGUFTensorInfo *tensors;
+    uint64_t num_tensors;
+    uint32_t alignment;
+    // Extracted model config from metadata
+    char arch[32];
+    int num_layers, hidden_dim, num_experts, num_experts_per_tok;
+    int num_attn_heads, num_kv_heads, moe_intermediate;
+    float rope_theta;
+    int vocab_size;
+} GGUFFile;
+
+GGUFFile       *gguf_open(const char *path);
+void            gguf_close(GGUFFile *gf);
+GGUFTensorInfo *gguf_find_tensor(GGUFFile *gf, const char *name);
+void           *gguf_tensor_data(GGUFFile *gf, GGUFTensorInfo *ti);
+size_t          gguf_tensor_size(GGUFTensorInfo *ti);
+const char     *ggml_type_name(uint32_t type);
+void            gguf_print_summary(GGUFFile *gf);
+
 #endif // OROME_H
