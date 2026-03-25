@@ -103,64 +103,210 @@ int main(int argc, char **argv) {
             return 0;
         }
 
-        // ---- Load model config ----
+        // ---- Detect GGUF vs legacy format ----
+        bool is_gguf = model_dir && (strstr(model_dir, ".gguf") != NULL);
+
         ModelConfig cfg;
-        if (model_dir && model_config_load(&cfg, model_dir) == 0) {
-            printf("[main] Config loaded from %s\n", model_dir);
+        MetalCtx *ctx = NULL;
+        WeightFile *wf = NULL;
+        ExpertFiles *ef = NULL;
+        Vocabulary *vocab = NULL;
+        GGUFFile *gf = NULL;
+        FormatProvider *fp = NULL;
+        Engine *eng = NULL;
+
+        if (is_gguf) {
+            // ==== GGUF loading path ====
+            gf = gguf_open(model_dir);
+            if (!gf) { fprintf(stderr, "ERROR: Cannot open GGUF: %s\n", model_dir); return 1; }
+
+            // Build config from GGUF metadata
+            memset(&cfg, 0, sizeof(cfg));
+            snprintf(cfg.name, sizeof(cfg.name), "%s", gf->arch);
+            cfg.hidden_dim = gf->hidden_dim;
+            cfg.num_layers = gf->num_layers;
+            cfg.num_experts = gf->num_experts;
+            cfg.num_experts_per_tok = gf->num_experts_per_tok;
+            cfg.moe_intermediate = gf->moe_intermediate;
+            cfg.vocab_size = gf->vocab_size;
+            cfg.group_size = 64; // not used for GGUF but needed for struct
+
+            // Attention config — detect from GGUF metadata
+            cfg.num_attn_heads = gf->num_attn_heads;
+            cfg.num_kv_heads = gf->num_kv_heads;
+            cfg.rope_theta = gf->rope_theta > 0 ? gf->rope_theta : 1000000.0f;
+
+            // Qwen3.5 head dimensions
+            if (cfg.num_attn_heads > 0) {
+                cfg.head_dim = cfg.hidden_dim * 2 / cfg.num_attn_heads; // GQA: Q heads use 2x hidden
+            }
+            if (cfg.head_dim == 0) cfg.head_dim = 256; // fallback
+
+            // Detect layer types from GGUF tensors
+            cfg.layer_types = calloc(cfg.num_layers, sizeof(AttnLayerType));
+            cfg.num_full_attn_layers = 0;
+            cfg.num_linear_layers = 0;
+            char tname[128];
+            for (int i = 0; i < cfg.num_layers; i++) {
+                snprintf(tname, sizeof(tname), "blk.%d.attn_q.weight", i);
+                GGUFTensorInfo *ti = gguf_find_tensor(gf, tname);
+                if (ti) {
+                    cfg.layer_types[i] = ATTN_FULL;
+                    cfg.num_full_attn_layers++;
+                } else {
+                    cfg.layer_types[i] = ATTN_LINEAR;
+                    cfg.num_linear_layers++;
+                }
+            }
+            fprintf(stderr, "[main] GGUF layer detection: %d full + %d linear\n",
+                    cfg.num_full_attn_layers, cfg.num_linear_layers);
+
+            // Linear attention params (Qwen3.5 GatedDeltaNet defaults)
+            cfg.linear_num_v_heads = 64;
+            cfg.linear_num_k_heads = 16;
+            cfg.linear_key_dim = 128;
+            cfg.linear_value_dim = 128;
+            cfg.partial_rotary = 0.25;
+
+            // EOS tokens (Qwen3.5)
+            cfg.eos_tokens[0] = 248046;
+            cfg.eos_tokens[1] = 248044;
+            cfg.eos_tokens[2] = -1;
+            cfg.think_end_token = 248069;
+
+            if (active_k > 0) cfg.num_experts_per_tok = active_k;
+
+            // Set full_attn_interval so init_derived doesn't overwrite layer type counts
+            if (cfg.num_full_attn_layers > 0) {
+                cfg.full_attn_interval = cfg.num_layers / cfg.num_full_attn_layers;
+            }
+            model_config_init_derived(&cfg);
+
+            fprintf(stderr, "[main] GGUF config: %s, %d layers (%d full + %d linear), "
+                    "hidden=%d, experts=%d, K=%d\n",
+                    cfg.name, cfg.num_layers, cfg.num_full_attn_layers,
+                    cfg.num_linear_layers, cfg.hidden_dim, cfg.num_experts,
+                    cfg.num_experts_per_tok);
+
+            // Initialize Metal
+            ctx = metal_setup(&cfg);
+            if (!ctx) {
+                fprintf(stderr, "ERROR: Metal required for GGUF inference\n");
+                return 1;
+            }
+
+            // Create format provider (wraps GGUF mmap as Metal buffer)
+            fp = format_provider_open_gguf(gf, ctx);
+            if (!fp) {
+                fprintf(stderr, "ERROR: Failed to create format provider\n");
+                return 1;
+            }
+
+            // For GGUF, we create a minimal WeightFile that points to the GGUF mmap.
+            // The weight_cache will use GGUF offsets directly.
+            wf = calloc(1, sizeof(WeightFile));
+            wf->data = gf->mmap_base;
+            wf->size = gf->file_size;
+
+            // Wrap GGUF mmap as Metal weights buffer
+            metal_set_weights(ctx, wf);
+
+            // Expert files: for GGUF, experts are embedded in the file
+            // Create a minimal ExpertFiles for GPU-resident mode
+            ef = calloc(1, sizeof(ExpertFiles));
+            ef->all_resident = true;
+            ef->gpu_resident_safe = true;
+            ef->pread_mode = false;
+
+            // Load tokenizer (try model directory, then fallback paths)
+            // GGUF embeds vocab but we use our external tokenizer for now
+            // Strip .gguf filename to get directory
+            char tok_dir[512];
+            strncpy(tok_dir, model_dir, sizeof(tok_dir));
+            char *last_slash = strrchr(tok_dir, '/');
+            if (last_slash) *last_slash = '\0';
+            if (tokenizer_init(tok_dir) != 0) {
+                // Try the legacy 35B model dir for tokenizer
+                tokenizer_init("/Users/j/models/Qwen3.5-35B-A3B-4bit");
+            }
+
+            char vocab_path[512];
+            snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.bin",
+                     "/Users/j/models/Qwen3.5-35B-A3B-4bit");
+            vocab = vocab_load(vocab_path);
+
+            fprintf(stderr, "[main] GGUF: creating engine...\n");
+            // Create engine with GGUF weight cache
+            QuantType quant = QUANT_4BIT; // GGUF handles its own quantization
+            eng = engine_create(&cfg, wf, ctx, ef, quant,
+                                active_k > 0 ? active_k : 0);
+            eng->fp = fp;
+            eng->gf = gf;
+
+            // Build GGUF weight cache (replaces the legacy build_weight_cache)
+            extern void *build_weight_cache_gguf_ext(GGUFFile *gf, const ModelConfig *cfg);
+            eng->weight_cache = build_weight_cache_gguf_ext(gf, &cfg);
+
         } else {
-            printf("[main] Using default Qwen3.5-35B config\n");
-            model_config_qwen35_35b(&cfg);
+            // ==== Legacy loading path ====
+
+            // ---- Load model config ----
+            if (model_dir && model_config_load(&cfg, model_dir) == 0) {
+                printf("[main] Config loaded from %s\n", model_dir);
+            } else {
+                printf("[main] Using default Qwen3.5-35B config\n");
+                model_config_qwen35_35b(&cfg);
+            }
+
+            if (active_k > 0) cfg.num_experts_per_tok = active_k;
+
+            // ---- Initialize Metal ----
+            ctx = metal_setup(&cfg);
+            if (!ctx) {
+                fprintf(stderr, "WARNING: Metal unavailable, running CPU-only\n");
+            }
+
+            // ---- Load weights ----
+            char weights_path[512], manifest_path[512], vocab_path[512];
+            if (model_dir) {
+                snprintf(weights_path, sizeof(weights_path), "%s/model_weights.bin", model_dir);
+                snprintf(manifest_path, sizeof(manifest_path), "%s/model_weights.json", model_dir);
+                snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.bin", model_dir);
+            } else {
+                strncpy(weights_path, "model_weights.bin", sizeof(weights_path));
+                strncpy(manifest_path, "model_weights.json", sizeof(manifest_path));
+                strncpy(vocab_path, "vocab.bin", sizeof(vocab_path));
+            }
+
+            wf = weights_open(weights_path, manifest_path);
+            if (!wf) {
+                fprintf(stderr, "ERROR: Cannot load weights from %s\n", weights_path);
+                return 1;
+            }
+
+            if (ctx) metal_set_weights(ctx, wf);
+
+            // ---- Detect layer types from actual weights ----
+            model_config_detect_layers(&cfg, wf);
+
+            // ---- Load tokenizer ----
+            if (tokenizer_init(model_dir) != 0) {
+                fprintf(stderr, "WARNING: Tokenizer not loaded, decode will show token IDs\n");
+            }
+
+            vocab = vocab_load(vocab_path);
+
+            // ---- Open expert files ----
+            ef = expert_files_open(&cfg, model_dir ? model_dir : ".", hot_mask_path);
+
+            // ---- Wrap expert layer data as Metal buffers ----
+            if (ctx) metal_set_expert_weights(ctx, ef, &cfg);
+
+            // ---- Create engine ----
+            QuantType quant = use_2bit ? QUANT_2BIT : QUANT_4BIT;
+            eng = engine_create(&cfg, wf, ctx, ef, quant,
+                                active_k > 0 ? active_k : 0);
         }
-
-        if (active_k > 0) cfg.num_experts_per_tok = active_k;
-
-        // ---- Initialize Metal ----
-        MetalCtx *ctx = metal_setup(&cfg);
-        if (!ctx) {
-            fprintf(stderr, "WARNING: Metal unavailable, running CPU-only\n");
-        }
-
-        // ---- Load weights ----
-        // Try to find weight files
-        char weights_path[512], manifest_path[512], vocab_path[512];
-        if (model_dir) {
-            snprintf(weights_path, sizeof(weights_path), "%s/model_weights.bin", model_dir);
-            snprintf(manifest_path, sizeof(manifest_path), "%s/model_weights.json", model_dir);
-            snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.bin", model_dir);
-        } else {
-            strncpy(weights_path, "model_weights.bin", sizeof(weights_path));
-            strncpy(manifest_path, "model_weights.json", sizeof(manifest_path));
-            strncpy(vocab_path, "vocab.bin", sizeof(vocab_path));
-        }
-
-        WeightFile *wf = weights_open(weights_path, manifest_path);
-        if (!wf) {
-            fprintf(stderr, "ERROR: Cannot load weights from %s\n", weights_path);
-            return 1;
-        }
-
-        if (ctx) metal_set_weights(ctx, wf);
-
-        // ---- Detect layer types from actual weights ----
-        model_config_detect_layers(&cfg, wf);
-
-        // ---- Load tokenizer ----
-        if (tokenizer_init(model_dir) != 0) {
-            fprintf(stderr, "WARNING: Tokenizer not loaded, decode will show token IDs\n");
-        }
-
-        Vocabulary *vocab = vocab_load(vocab_path);
-
-        // ---- Open expert files ----
-        ExpertFiles *ef = expert_files_open(&cfg, model_dir ? model_dir : ".", hot_mask_path);
-
-        // ---- Wrap expert layer data as Metal buffers ----
-        if (ctx) metal_set_expert_weights(ctx, ef, &cfg);
-
-        // ---- Create engine ----
-        QuantType quant = use_2bit ? QUANT_2BIT : QUANT_4BIT;
-        Engine *eng = engine_create(&cfg, wf, ctx, ef, quant,
-                                    active_k > 0 ? active_k : 0);
         if (thermal_k > 0) {
             eng->thermal.enabled = true;
             eng->thermal.hot_k = thermal_k;

@@ -405,6 +405,22 @@ GGUFFile *gguf_open(const char *path) {
         }
     }
 
+    // Infer vocab_size from embedding tensor shape if not in metadata
+    if (gf->vocab_size == 0) {
+        for (uint64_t i = 0; i < tensor_count; i++) {
+            if (gf->tensors[i].name && strcmp(gf->tensors[i].name, "token_embd.weight") == 0) {
+                // Shape is [hidden_dim, vocab_size]
+                for (uint32_t d = 0; d < gf->tensors[i].n_dims; d++) {
+                    if (gf->tensors[i].dims[d] != (uint64_t)gf->hidden_dim) {
+                        gf->vocab_size = (int)gf->tensors[i].dims[d];
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     // Infer moe_intermediate from tensor shapes if not in metadata
     if (gf->moe_intermediate == 0) {
         for (uint64_t i = 0; i < tensor_count; i++) {
@@ -421,9 +437,9 @@ GGUFFile *gguf_open(const char *path) {
         }
     }
 
-    fprintf(stderr, "[gguf] arch=%s layers=%d hidden=%d experts=%d K=%d intermediate=%d\n",
+    fprintf(stderr, "[gguf] arch=%s layers=%d hidden=%d experts=%d K=%d intermediate=%d vocab=%d\n",
             gf->arch, gf->num_layers, gf->hidden_dim,
-            gf->num_experts, gf->num_experts_per_tok, gf->moe_intermediate);
+            gf->num_experts, gf->num_experts_per_tok, gf->moe_intermediate, gf->vocab_size);
 
     // Compute data_offset: current position, aligned up to alignment
     size_t align = gf->alignment;

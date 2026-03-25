@@ -45,6 +45,116 @@ typedef struct {
     };
 } LayerWeightCache;
 
+// GGUF weight cache builder — maps GGUF tensor names to offsets within the mmap'd buffer
+static LayerWeightCache *build_weight_cache_gguf_impl(GGUFFile *gf, const ModelConfig *cfg,
+                                                   size_t *out_embed_off, size_t *out_lmhead_off,
+                                                   size_t *out_norm_off) {
+    LayerWeightCache *cache = calloc(cfg->num_layers, sizeof(LayerWeightCache));
+
+    // Helper: resolve a GGUF tensor to its absolute file offset
+    #define GGUF_OFF(name) ({ \
+        GGUFTensorInfo *_ti = gguf_find_tensor(gf, (name)); \
+        _ti ? (gf->data_offset + _ti->offset) : 0; \
+    })
+
+    // Global tensors
+    if (out_embed_off)  *out_embed_off  = GGUF_OFF("token_embd.weight");
+    if (out_lmhead_off) *out_lmhead_off = GGUF_OFF("output.weight");
+    if (out_norm_off)   *out_norm_off   = GGUF_OFF("output_norm.weight");
+
+    char name[128];
+    for (int i = 0; i < cfg->num_layers; i++) {
+        LayerWeightCache *c = &cache[i];
+
+        // Norms (F32, used directly — not matvec'd)
+        snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", i);
+        c->input_norm_w = GGUF_OFF(name);
+        snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", i);
+        c->post_norm_w = GGUF_OFF(name);
+
+        // MoE routing gate (F32)
+        snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp.weight", i);
+        c->gate_w = GGUF_OFF(name);
+        c->gate_s = 0; c->gate_b = 0; // no separate scales for GGUF
+
+        // Shared expert gate (scalar gate, F32)
+        snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp_shexp.weight", i);
+        c->sgg_w = GGUF_OFF(name);
+        c->sgg_s = 0; c->sgg_b = 0;
+
+        // Shared expert projections
+        snprintf(name, sizeof(name), "blk.%d.ffn_gate_shexp.weight", i);
+        c->sg_w = GGUF_OFF(name);
+        c->sg_s = 0; c->sg_b = 0;
+        snprintf(name, sizeof(name), "blk.%d.ffn_up_shexp.weight", i);
+        c->su_w = GGUF_OFF(name);
+        c->su_s = 0; c->su_b = 0;
+        snprintf(name, sizeof(name), "blk.%d.ffn_down_shexp.weight", i);
+        c->sd_w = GGUF_OFF(name);
+        c->sd_s = 0; c->sd_b = 0;
+
+        if (cfg->layer_types[i] == ATTN_LINEAR) {
+            // Linear attention (GatedDeltaNet / SSM-style)
+            snprintf(name, sizeof(name), "blk.%d.attn_qkv.weight", i);
+            c->lin.qkv_w = GGUF_OFF(name);
+            c->lin.qkv_s = 0; c->lin.qkv_b = 0;
+
+            // Z gate (attn_gate in GGUF = in_proj_z in our code)
+            snprintf(name, sizeof(name), "blk.%d.attn_gate.weight", i);
+            c->lin.z_w = GGUF_OFF(name);
+            c->lin.z_s = 0; c->lin.z_b = 0;
+
+            // SSM parameters
+            snprintf(name, sizeof(name), "blk.%d.ssm_alpha.weight", i);
+            c->lin.a_w = GGUF_OFF(name);
+            c->lin.a_s = 0; c->lin.a_b = 0;
+            snprintf(name, sizeof(name), "blk.%d.ssm_beta.weight", i);
+            c->lin.b_w = GGUF_OFF(name);
+            c->lin.b_s = 0; c->lin.b_b = 0;
+
+            snprintf(name, sizeof(name), "blk.%d.ssm_conv1d.weight", i);
+            c->lin.conv_w = GGUF_OFF(name);
+            snprintf(name, sizeof(name), "blk.%d.ssm_a", i);
+            c->lin.A_log = GGUF_OFF(name);
+            snprintf(name, sizeof(name), "blk.%d.ssm_dt.bias", i);
+            c->lin.dt_bias = GGUF_OFF(name);
+
+            // Output norm (if present)
+            // Note: GGUF may not have a separate o_norm for linear attention
+            c->lin.o_norm_w = 0;
+
+            // Output projection — GGUF may not have a separate one for GatedDeltaNet
+            c->lin.o_w = 0; c->lin.o_s = 0; c->lin.o_b = 0;
+        } else {
+            // Full attention (GQA)
+            snprintf(name, sizeof(name), "blk.%d.attn_q.weight", i);
+            c->full.q_w = GGUF_OFF(name);
+            c->full.q_s = 0; c->full.q_b = 0;
+            snprintf(name, sizeof(name), "blk.%d.attn_k.weight", i);
+            c->full.k_w = GGUF_OFF(name);
+            c->full.k_s = 0; c->full.k_b = 0;
+            snprintf(name, sizeof(name), "blk.%d.attn_v.weight", i);
+            c->full.v_w = GGUF_OFF(name);
+            c->full.v_s = 0; c->full.v_b = 0;
+            snprintf(name, sizeof(name), "blk.%d.attn_q_norm.weight", i);
+            c->full.qnorm_w = GGUF_OFF(name);
+            snprintf(name, sizeof(name), "blk.%d.attn_k_norm.weight", i);
+            c->full.knorm_w = GGUF_OFF(name);
+            snprintf(name, sizeof(name), "blk.%d.attn_output.weight", i);
+            c->full.o_w = GGUF_OFF(name);
+            c->full.o_s = 0; c->full.o_b = 0;
+        }
+    }
+    #undef GGUF_OFF
+    return cache;
+}
+
+// External entry point for main.m
+void *build_weight_cache_gguf_ext(GGUFFile *gf, const ModelConfig *cfg) {
+    size_t e, l, n;
+    return build_weight_cache_gguf_impl(gf, cfg, &e, &l, &n);
+}
+
 static LayerWeightCache *build_weight_cache(WeightFile *wf, const ModelConfig *cfg) {
     LayerWeightCache *cache = calloc(cfg->num_layers, sizeof(LayerWeightCache));
     uint8_t *base = (uint8_t *)wf->data;
@@ -175,7 +285,11 @@ Engine *engine_create(ModelConfig *cfg, WeightFile *wf, MetalCtx *ctx,
     }
 
     eng->pos = 0;
-    eng->weight_cache = build_weight_cache(wf, cfg);
+    // Weight cache is built in engine_create for legacy format.
+    // For GGUF, main.m sets eng->gf and we rebuild the cache below.
+    if (wf->manifest) {
+        eng->weight_cache = build_weight_cache(wf, cfg);
+    }
     return eng;
 }
 

@@ -630,6 +630,10 @@ typedef struct {
 
     // Precomputed weight offsets (opaque, owned by engine.m)
     void *weight_cache;
+
+    // GGUF format support (NULL for legacy format)
+    FormatProvider *fp;
+    GGUFFile *gf;
 } Engine;
 
 Engine *engine_create(ModelConfig *cfg, WeightFile *wf, MetalCtx *ctx,
