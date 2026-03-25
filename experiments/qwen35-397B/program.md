@@ -47,10 +47,18 @@ Phase 1 ran 46 experiments optimizing the pread I/O path. Results: 4.08 → 7.87
 **What worked**: 2-bit quantization (-44% I/O bytes), per-layer expert cache (K+2 slots, ~40% hit rate), concurrent GPU dispatch.
 
 **Current bottleneck breakdown** at 7.87 tok/s (~127 ms/tok):
-- I/O: ~80ms (63%) — 360 preads/tok, 75% page cache, 25% SSD
-- Compute: ~47ms (37%) — attention + MoE GPU + lm_head (breakdown unknown)
+- MoE I/O (pread): ~56ms (44%) — 90% page cache hits, 10% SSD misses
+- Attention (GPU): ~35ms (28%) — 15 full + 45 linear attention layers
+- MoE GPU (expert forward): ~32ms (25%) — GPU expert wait avg 0.53ms/layer (31.6ms total for 60 layers)
+- LM head + other: ~4ms (3%)
 
-**Memory budget is balanced**: ~83 GB page cache covers 69% of 120.8 GB 2-bit experts. The ~37 GB gap causes the 25% SSD miss rate. K+4 cache proved that shifting even 450 MB from page cache to app cache regresses. No free memory to reclaim.
+**Serial dependency chain per layer prevents I/O-compute overlap**:
+```
+GPU attention → routing readback → pread I/O → GPU expert forward → CPU combine
+```
+Each step depends on the previous. Pipelining (overlap layer N's pread with layer N-1's GPU) requires knowing routing before attention completes, which is impossible.
+
+**Memory budget is balanced**: ~83 GB page cache covers 69% of 120.8 GB 2-bit experts. The ~38 GB gap causes the 10% SSD miss rate. K+4 cache proved that shifting even 450 MB from page cache to app cache regresses. No free memory to reclaim.
 
 **Expert routing frequency is input-dependent** and we lack representative workload data for statistical significance. Static hot expert sets would overfit to profiling prompts. The adaptive K+2 cache already captures temporal locality without this problem.
 
@@ -58,23 +66,24 @@ Phase 1 ran 46 experiments optimizing the pread I/O path. Results: 4.08 → 7.87
 
 ### Key Optimization Axes (priority order)
 
-1. **Attention optimization** — Profiling fix is in place (commit ffc2034). The real compute split at steady state (~127ms/tok):
-   - MoE I/O (pread): ~80ms (63%) — already at ceiling
-   - Attention: ~37ms (29%) — 15 full + 45 linear attention layers
-   - MoE GPU compute: ~20ms (estimated: MoE total minus I/O)
-   - lm_head + other: ~10ms
+1. **Attention optimization (~35ms, 28%)** — Attention is the largest compute component. A 30% improvement saves ~10ms → ~8.5 tok/s. Possible approaches: kernel fusion within attention layers, reduced-precision attention state, or architectural shortcuts for linear attention (GatedDeltaNet). Do NOT spend more than 2-3 experiments before moving on.
 
-   Attention is the largest compute component. A 30% improvement saves ~11ms → ~8.5 tok/s. Worth exploring but unlikely to be transformative. Possible approaches: kernel fusion within attention layers, reduced-precision attention state, or architectural shortcuts for linear attention (GatedDeltaNet). Do NOT spend more than 2-3 experiments before moving to tiered quant.
+2. **MoE GPU compute optimization (~32ms, 25%)** — GPU expert wait is 0.53ms/layer × 60 = 31.6ms. The fused 2-bit gate+up+SwiGLU kernel crashed (all-NaN, row 47). Batched expert kernels were within noise (row 43). Possible approaches: merged command buffers (combine expert forward + next layer's attention into one CMD, saving ~60 commit/wait cycles), or half-precision activations for GPU buffers.
 
-2. **Tiered quantization** — Hot experts at 4-bit, cold at 2-bit. Infrastructure exists (hot_mask, tiered_quant, layer_fds_2bit). This is a quality play, not a speed play — output quality may improve with minimal I/O impact since hot experts are already in page cache. Requires generating a hot expert mask from routing frequency data. Input-dependent concern applies, but a diverse profiling corpus can identify structurally hot experts (ones active regardless of domain).
+3. **Tiered quantization** — First attempt regressed (6.83 tok/s, row 49) because cache slots grew to 6.75 MB (4-bit sized) → 4860 MB total, causing page cache pressure. Fix: mixed-size cache management (2-bit slots for cold, separate 4-bit buffers for hot). This is primarily a quality play, not a speed play.
 
-3. **Output correctness (guard rail)** — Model outputs correctly at 7.87 tok/s. Use `--profile-experts` for NaN checks if any code change is suspected of breaking numerics.
+4. **Token-level batching** — Process 2 tokens simultaneously through the layer loop. Expert data loaded once, used for both tokens. Expected: significant improvement if routing overlap is high. Risk: massive code change (attention, MoE routing, buffer management all need batch support). Consider only after simpler approaches are exhausted.
+
+5. **Output correctness (guard rail)** — Model outputs correctly at 7.87 tok/s. Use `--profile-experts` for NaN checks if any code change is suspected of breaking numerics.
 
 ### What NOT to pursue (and why)
 
 - **Further I/O scheduling**: 46 experiments exhausted this. Every pipelining, prefetch, and scheduling approach regressed from overhead or contention.
 - **Expert cache expansion**: K+2 is the sweet spot. K+3 within noise, K+4 regressed from page cache pressure.
-- **GPU dispatch optimization**: Batched kernels, GPU combine, -O3 all within noise. GPU dispatch is not the bottleneck.
+- **GPU dispatch optimization**: Batched kernels, GPU combine, -O3, GPU norm+LM head+argmax all within noise. GPU dispatch is not the bottleneck.
+- **Fused 2-bit gate+up+SwiGLU kernel**: Crashed with all-NaN. Even if fixed, GPU dispatch overhead is proven within noise.
+- **Tiered quantization with uniform cache slots**: Regressed (6.83 tok/s). Must use mixed-size cache if revisiting.
+- **Sub-2-bit quantization**: Degrades quality too much.
 - **Partial mlock or mmap**: Proven harmful in multiple experiments. The OS page cache with pread is the best I/O strategy for this memory/data ratio.
 - **Static expert frequency analysis without representative workload**: Input-dependent routing makes offline profiling unreliable at this stage.
 
@@ -97,6 +106,9 @@ Phase 1 ran 46 experiments optimizing the pread I/O path. Results: 4.08 → 7.87
 - **GPU combine for pread path**: extra barrier+kernel negated readback savings (7.64 tok/s). Within noise.
 - **-O3 compiler optimization**: within noise of -O2 (7.89 tok/s). CPU code paths not bottleneck.
 - **Pipelined pread+GPU via MTLSharedEvent**: 2-encoder+event overhead (>0.5ms/layer) negated any overlap savings (6.98 tok/s).
+- **Fused 2-bit gate+up+SwiGLU kernel**: All-NaN output at layer 0. The kernel's 2-bit unpacking loop may have incorrect offset computation when reading from per-layer cache buffers. GPU dispatch overhead was already proven not to be the bottleneck (rows 43, 44, 45).
+- **GPU norm+LM head+argmax for pread path**: Correct but within noise (~0.5ms savings out of 127ms). The 993KB logits readback + CPU argmax is negligible.
+- **Tiered quantization with uniform cache sizing**: Cache slots sized for 4-bit (6.75 MB each) doubled cache from 2700 MB to 4860 MB, starving page cache. Tiered quant requires mixed-size cache management to be viable.
 
 ## Codebase Structure
 
