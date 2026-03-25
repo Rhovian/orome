@@ -1824,3 +1824,313 @@ kernel void copy_tmp_to_buf(
     if (tid >= count) return;
     buf[tid] = tmp[tid];
 }
+
+// ============================================================================
+// GGUF Q4_K dequant matvec
+//
+// Q4_K super-block: 256 weights in 144 bytes
+//   [0..1]   float16 d     (super-block scale)
+//   [2..3]   float16 dmin  (super-block min)
+//   [4..15]  12 bytes: packed 6-bit scales + mins for 8 sub-blocks
+//   [16..143] 128 bytes: 256 x 4-bit quantized weights
+//
+// Dequant: value = d * sc[sb] * q - dmin * m[sb]
+//   where sb = sub-block index (0..7), q = 4-bit value (0..15)
+//   sc[sb] and m[sb] are 6-bit values unpacked from the 12-byte block
+// ============================================================================
+
+// Unpack 6-bit sub-block scales and mins from the 12-byte packed region.
+// The packing is: scales[0..3] in low 6 bits of bytes 0..3,
+//                 scales[4..7] in low 4 bits of bytes 8..9 | high 2 bits of bytes 0..3,
+//                 mins[0..3] in low 6 bits of bytes 4..7,
+//                 mins[4..7] in low 4 bits of bytes 10..11 | high 2 bits of bytes 4..7.
+inline void unpack_q4k_scales(device const uint8_t* sc_data,
+                               thread float* sc, thread float* mn, int count) {
+    // First 4 scales and mins: lower 6 bits of bytes 0..3 and 4..7
+    for (int i = 0; i < 4 && i < count; i++) {
+        sc[i] = float(sc_data[i] & 63);
+        mn[i] = float(sc_data[i + 4] & 63);
+    }
+    // Next 4 scales and mins: combine high bits
+    for (int i = 0; i < 4 && i + 4 < count; i++) {
+        sc[i + 4] = float(((sc_data[8 + i/2] >> (4 * (i % 2))) & 0xF)
+                  | ((sc_data[i] >> 6) << 4));
+        mn[i + 4] = float(((sc_data[10 + i/2] >> (4 * (i % 2))) & 0xF)
+                  | ((sc_data[i + 4] >> 6) << 4));
+    }
+}
+
+kernel void dequant_matvec_q4k(
+    device const uint8_t*  data       [[buffer(0)]],  // Q4_K tensor data
+    device const float*    x          [[buffer(1)]],  // input vector
+    device float*          out        [[buffer(2)]],  // output vector
+    constant uint&         out_dim    [[buffer(3)]],
+    constant uint&         in_dim     [[buffer(4)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    if (row >= out_dim) return;
+
+    // Load input into shared memory
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = half(x[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Q4_K: 256 weights per super-block, 144 bytes per super-block
+    uint num_superblocks = in_dim / 256;
+    uint bytes_per_row = num_superblocks * 144;
+
+    device const uint8_t* row_data = data + row * bytes_per_row;
+
+    float acc = 0.0f;
+
+    // Each SIMD lane processes a subset of super-blocks
+    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
+        device const uint8_t* sb = row_data + sb_idx * 144;
+
+        // Read super-block header
+        float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
+        float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
+
+        // Unpack sub-block scales and mins
+        float sc[8], mn[8];
+        unpack_q4k_scales(sb + 4, sc, mn, 8);
+
+        // Quantized weights start at offset 16
+        device const uint8_t* qs = sb + 16;
+
+        uint x_base = sb_idx * 256;
+
+        // Process 8 sub-blocks of 32 weights each
+        for (uint sub = 0; sub < 8; sub++) {
+            float sub_sc = d * sc[sub];
+            float sub_mn = dmin * mn[sub];
+
+            device const uint8_t* qsub = qs + sub * 16;  // 32 nibbles = 16 bytes
+
+            for (uint j = 0; j < 16; j++) {
+                uint8_t byte = qsub[j];
+                uint xi = x_base + sub * 32 + j * 2;
+
+                float q_lo = float(byte & 0xF);
+                float q_hi = float(byte >> 4);
+
+                acc += (sub_sc * q_lo - sub_mn) * float(x_shared[xi]);
+                acc += (sub_sc * q_hi - sub_mn) * float(x_shared[xi + 1]);
+            }
+        }
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
+// GGUF Q8_0 dequant matvec
+//
+// Q8_0 block: 32 weights in 34 bytes
+//   [0..1]   float16 d (scale)
+//   [2..33]  32 x int8 quantized weights
+//
+// Dequant: value = d * q
+// ============================================================================
+
+kernel void dequant_matvec_q8_0(
+    device const uint8_t*  data       [[buffer(0)]],
+    device const float*    x          [[buffer(1)]],
+    device float*          out        [[buffer(2)]],
+    constant uint&         out_dim    [[buffer(3)]],
+    constant uint&         in_dim     [[buffer(4)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    if (row >= out_dim) return;
+
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = half(x[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Q8_0: 32 weights per block, 34 bytes per block
+    uint num_blocks = in_dim / 32;
+    uint bytes_per_row = num_blocks * 34;
+
+    device const uint8_t* row_data = data + row * bytes_per_row;
+
+    float acc = 0.0f;
+
+    for (uint blk = simd_lane; blk < num_blocks; blk += 32) {
+        device const uint8_t* block = row_data + blk * 34;
+
+        float d = float(as_type<half>(ushort(ushort(block[0]) | (ushort(block[1]) << 8))));
+        device const int8_t* qs = (device const int8_t*)(block + 2);
+
+        uint x_base = blk * 32;
+
+        float local_acc = 0.0f;
+        for (uint j = 0; j < 32; j++) {
+            local_acc += d * float(qs[j]) * float(x_shared[x_base + j]);
+        }
+        acc += local_acc;
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
+// Batched Q4_K expert matvec (gate/up projections)
+// Same dispatch pattern as batch_expert_matvec_4bit but reads Q4_K format.
+// offsets[expert].w_off points to the start of Q4_K data for that expert.
+// ============================================================================
+
+struct ExpertQ4KOffsets {
+    uint data_off;  // byte offset to Q4_K data within layer buffer
+};
+
+kernel void batch_expert_matvec_q4k(
+    device const uint8_t*       layer_data  [[buffer(0)]],
+    device const float*         x           [[buffer(1)]],
+    device float*               out         [[buffer(2)]],
+    constant ExpertQ4KOffsets*   offsets     [[buffer(3)]],
+    constant uint&              out_dim     [[buffer(4)]],
+    constant uint&              in_dim      [[buffer(5)]],
+    constant uint&              num_row_tgs [[buffer(6)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint expert = tgid / num_row_tgs;
+    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
+    if (row >= out_dim) return;
+
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = half(x[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_superblocks = in_dim / 256;
+    uint bytes_per_row = num_superblocks * 144;
+
+    device const uint8_t* expert_data = layer_data + offsets[expert].data_off;
+    device const uint8_t* row_data = expert_data + row * bytes_per_row;
+
+    float acc = 0.0f;
+
+    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
+        device const uint8_t* sb = row_data + sb_idx * 144;
+
+        float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
+        float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
+
+        float sc[8], mn[8];
+        unpack_q4k_scales(sb + 4, sc, mn, 8);
+
+        device const uint8_t* qs = sb + 16;
+        uint x_base = sb_idx * 256;
+
+        for (uint sub = 0; sub < 8; sub++) {
+            float sub_sc = d * sc[sub];
+            float sub_mn = dmin * mn[sub];
+            device const uint8_t* qsub = qs + sub * 16;
+
+            for (uint j = 0; j < 16; j++) {
+                uint8_t byte = qsub[j];
+                uint xi = x_base + sub * 32 + j * 2;
+                acc += (sub_sc * float(byte & 0xF) - sub_mn) * float(x_shared[xi]);
+                acc += (sub_sc * float(byte >> 4) - sub_mn) * float(x_shared[xi + 1]);
+            }
+        }
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[expert * out_dim + row] = sum;
+    }
+}
+
+// Batched Q4_K expert down projection (per-expert input)
+kernel void batch_expert_down_q4k(
+    device const uint8_t*       layer_data  [[buffer(0)]],
+    device const float*         x           [[buffer(1)]],  // packed [K * in_dim]
+    device float*               out         [[buffer(2)]],  // packed [K * out_dim]
+    constant ExpertQ4KOffsets*   offsets     [[buffer(3)]],
+    constant uint&              out_dim     [[buffer(4)]],
+    constant uint&              in_dim      [[buffer(5)]],
+    constant uint&              num_row_tgs [[buffer(6)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint expert = tgid / num_row_tgs;
+    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
+    if (row >= out_dim) return;
+
+    // Per-expert input
+    device const float* ex = x + expert * in_dim;
+
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = half(ex[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_superblocks = in_dim / 256;
+    uint bytes_per_row = num_superblocks * 144;
+
+    device const uint8_t* expert_data = layer_data + offsets[expert].data_off;
+    device const uint8_t* row_data = expert_data + row * bytes_per_row;
+
+    float acc = 0.0f;
+
+    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
+        device const uint8_t* sb = row_data + sb_idx * 144;
+
+        float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
+        float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
+
+        float sc[8], mn[8];
+        unpack_q4k_scales(sb + 4, sc, mn, 8);
+
+        device const uint8_t* qs = sb + 16;
+        uint x_base = sb_idx * 256;
+
+        for (uint sub = 0; sub < 8; sub++) {
+            float sub_sc = d * sc[sub];
+            float sub_mn = dmin * mn[sub];
+            device const uint8_t* qsub = qs + sub * 16;
+
+            for (uint j = 0; j < 16; j++) {
+                uint8_t byte = qsub[j];
+                uint xi = x_base + sub * 32 + j * 2;
+                acc += (sub_sc * float(byte & 0xF) - sub_mn) * float(x_shared[xi]);
+                acc += (sub_sc * float(byte >> 4) - sub_mn) * float(x_shared[xi + 1]);
+            }
+        }
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[expert * out_dim + row] = sum;
+    }
+}
