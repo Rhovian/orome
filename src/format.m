@@ -461,15 +461,43 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
             c->lin.a = G_REF(name, n_v, H);
             snprintf(name, sizeof(name), "blk.%d.ssm_beta.weight", i);
             c->lin.b = G_REF(name, n_v, H);
-            // GGUF may not have a separate output projection for GatedDeltaNet
-            c->lin.o = (TensorRef){0};
+            // Output projection (ssm_out in GGUF)
+            snprintf(name, sizeof(name), "blk.%d.ssm_out.weight", i);
+            c->lin.o = G_REF(name, H, total_value);
+            // Conv1d weights: GGUF stores [kernel_size, conv_dim] F32
+            // Our kernel expects [conv_dim * kernel_size] BF16 (channel-major)
+            // Need transpose + F32→BF16 conversion
             snprintf(name, sizeof(name), "blk.%d.ssm_conv1d.weight", i);
-            c->lin.conv = G_RAW(name);       // conv1d kernel expects BF16
+            {
+                GGUFTensorInfo *conv_ti = gguf_find_tensor(gf, name);
+                if (conv_ti && conv_ti->type == 0 && conv_ti->n_dims == 2) {
+                    int kernel_size = (int)conv_ti->dims[0]; // ne0 = 4 (contiguous)
+                    int cdim = (int)conv_ti->dims[1];        // ne1 = 8192
+                    size_t bf16_size = kernel_size * cdim * sizeof(uint16_t);
+                    id<MTLBuffer> conv_buf = [ctx->device newBufferWithLength:bf16_size
+                                                                     options:MTLResourceStorageModeShared];
+                    float *src = (float *)((uint8_t *)[buf contents] + gf->data_offset + conv_ti->offset);
+                    uint16_t *dst = (uint16_t *)[conv_buf contents];
+                    // Transpose [kernel_size, conv_dim] → [conv_dim, kernel_size] and convert F32→BF16
+                    for (int ch = 0; ch < cdim; ch++) {
+                        for (int k = 0; k < kernel_size; k++) {
+                            float val = src[k * cdim + ch]; // GGUF: row k, col ch
+                            uint32_t f32; memcpy(&f32, &val, 4);
+                            dst[ch * kernel_size + k] = (uint16_t)(f32 >> 16);
+                        }
+                    }
+                    c->lin.conv = (TensorRef){ .buffer = conv_buf, .offset = 0, .format = QFMT_BF16 };
+                } else {
+                    c->lin.conv = G_RAW(name);
+                }
+            }
             snprintf(name, sizeof(name), "blk.%d.ssm_a", i);
             c->lin.A_log = G_RAW_F32(name);  // decay_beta kernel expects F32
             snprintf(name, sizeof(name), "blk.%d.ssm_dt.bias", i);
             c->lin.dt_bias = G_RAW(name);     // decay_beta kernel expects BF16
-            c->lin.o_norm = (TensorRef){0}; // may not exist
+            // Output norm (ssm_norm in GGUF)
+            snprintf(name, sizeof(name), "blk.%d.ssm_norm.weight", i);
+            c->lin.o_norm = G_RAW(name);     // gated_rms_norm expects BF16
         } else {
             int n_heads = cfg->num_attn_heads;
             int n_kv = cfg->num_kv_heads;
