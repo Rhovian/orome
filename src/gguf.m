@@ -533,8 +533,8 @@ void gguf_print_summary(GGUFFile *gf) {
             expert_tensors, attn_tensors, other_tensors);
 
     // Print first few tensor names for debugging
-    fprintf(stderr, "[gguf] First 10 tensors:\n");
-    for (uint64_t i = 0; i < gf->num_tensors && i < 10; i++) {
+    fprintf(stderr, "[gguf] First 20 tensors:\n");
+    for (uint64_t i = 0; i < gf->num_tensors && i < 20; i++) {
         GGUFTensorInfo *ti = &gf->tensors[i];
         fprintf(stderr, "[gguf]   [%llu] %s  type=%s  dims=[", i, ti->name, ggml_type_name(ti->type));
         for (uint32_t d = 0; d < ti->n_dims; d++) {

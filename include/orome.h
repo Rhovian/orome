@@ -402,9 +402,9 @@ QuantFormat       format_from_ggml_type(uint32_t ggml_type);
 // ============================================================================
 
 typedef struct {
-    id<MTLBuffer> w_buf;    size_t w_off;
-    id<MTLBuffer> s_buf;    size_t s_off;
-    id<MTLBuffer> b_buf;    size_t b_off;
+    id<MTLBuffer> w_buf;    size_t w_off;   // weight data (or single GGUF data buffer)
+    id<MTLBuffer> s_buf;    size_t s_off;   // scales (legacy only)
+    id<MTLBuffer> b_buf;    size_t b_off;   // biases (legacy only)
     id<MTLBuffer> in_buf;   size_t in_off;  // input buffer (NULL → ctx->buf_input)
     id<MTLBuffer> out_buf;  size_t out_off;
     float *out_ptr;         // CPU pointer for readback (or NULL)
@@ -412,6 +412,7 @@ typedef struct {
     int in_dim;
     int group_size;
     bool is_2bit;
+    QuantFormat format;     // QFMT_OROME_4BIT (default/0) for legacy
 } GpuMatvecJob;
 
 // Batch multiple matvecs in one command buffer. Returns after GPU completion.

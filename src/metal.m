@@ -379,16 +379,40 @@ void metal_free(MetalCtx *ctx) {
 void gpu_encode_matvec_job(id<MTLComputeCommandEncoder> enc,
                            MetalCtx *ctx,
                            GpuMatvecJob *job) {
-    // Use 2-row kernel for 4-bit matvecs (halves TG count)
+    NSUInteger rows_per_tg = ROWS_PER_TG;
+
+    // GGUF formats: single interleaved data buffer, different kernel signature
+    if (job->format == QFMT_GGUF_Q4_K || job->format == QFMT_GGUF_Q5_K ||
+        job->format == QFMT_GGUF_Q8_0 || job->format == QFMT_GGUF_Q6_K) {
+        id<MTLComputePipelineState> pipe = format_pipeline_for(ctx, job->format);
+        if (!pipe) return;
+
+        [enc setComputePipelineState:pipe];
+        [enc setBuffer:job->w_buf offset:job->w_off atIndex:0];  // single data buffer
+        id<MTLBuffer> in_buf = job->in_buf ? job->in_buf : ctx->buf_input;
+        [enc setBuffer:in_buf offset:job->in_off atIndex:1];
+        [enc setBuffer:job->out_buf offset:job->out_off atIndex:2];
+        uint out_dim = (uint)job->out_dim;
+        uint in_dim = (uint)job->in_dim;
+        [enc setBytes:&out_dim length:sizeof(uint) atIndex:3];
+        [enc setBytes:&in_dim  length:sizeof(uint) atIndex:4];
+
+        NSUInteger tg_size = ROWS_PER_TG * 32;
+        NSUInteger num_tgs = (out_dim + rows_per_tg - 1) / rows_per_tg;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+        return;
+    }
+
+    // Legacy format: 3 separate buffer regions (W, scales, biases)
     bool use_2row = !job->is_2bit && ctx->matvec_4bit_2row;
     id<MTLComputePipelineState> pipe;
-    NSUInteger rows_per_tg;
     if (job->is_2bit) {
         pipe = ctx->matvec_2bit;
         rows_per_tg = ROWS_PER_TG;
     } else if (use_2row) {
         pipe = ctx->matvec_4bit_2row;
-        rows_per_tg = ROWS_PER_TG * 2;  // 32 effective rows per TG (2 rows/simdgroup)
+        rows_per_tg = ROWS_PER_TG * 2;
     } else {
         pipe = ctx->matvec_4bit;
         rows_per_tg = ROWS_PER_TG;
@@ -410,7 +434,7 @@ void gpu_encode_matvec_job(id<MTLComputeCommandEncoder> enc,
     [enc setBytes:&in_dim  length:sizeof(uint) atIndex:6];
     [enc setBytes:&gs      length:sizeof(uint) atIndex:7];
 
-    NSUInteger tg_size = ROWS_PER_TG * 32;  // thread count stays at 512
+    NSUInteger tg_size = ROWS_PER_TG * 32;
     NSUInteger num_tgs = ((uint)job->out_dim + rows_per_tg - 1) / rows_per_tg;
     [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
