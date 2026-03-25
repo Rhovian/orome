@@ -512,6 +512,39 @@ kernel void rms_norm_apply_bf16(
     out[tid] = x[tid] * rms * w;
 }
 
+// RMS norm apply with F32 weights (for GGUF models)
+kernel void rms_norm_apply_f32(
+    device const float*    x       [[buffer(0)]],
+    device const float*    weight  [[buffer(1)]],
+    device const float*    sum_sq  [[buffer(2)]],
+    device float*          out     [[buffer(3)]],
+    constant uint&         dim     [[buffer(4)]],
+    constant float&        eps     [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= dim) return;
+    float rms = rsqrt(sum_sq[0] / float(dim) + eps);
+    out[tid] = x[tid] * rms * weight[tid];
+}
+
+// RMS norm apply partial with F32 weights (for GGUF models)
+kernel void rms_norm_apply_partial_f32(
+    device const float*    x          [[buffer(0)]],
+    device const float*    weight     [[buffer(1)]],
+    device const float*    partial_sq [[buffer(2)]],
+    device float*          out        [[buffer(3)]],
+    constant uint&         dim        [[buffer(4)]],
+    constant float&        eps        [[buffer(5)]],
+    constant uint&         num_parts  [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= dim) return;
+    float total_sq = 0;
+    for (uint i = 0; i < num_parts; i++) total_sq += partial_sq[i];
+    float rms = rsqrt(total_sq / float(dim) + eps);
+    out[tid] = x[tid] * rms * weight[tid];
+}
+
 // ============================================================================
 // Kernel 5: Residual add
 // ============================================================================

@@ -304,9 +304,28 @@ static TensorRef gguf_ref(GGUFFile *gf, id<MTLBuffer> buf, MetalCtx *ctx,
 }
 
 // Helper: GGUF raw tensor (F32 norms, biases — not matvec'd, just need pointer)
-static TensorRef gguf_raw(GGUFFile *gf, id<MTLBuffer> buf, const char *name) {
+// For GGUF, norms are F32 but our kernels expect BF16. Convert at load time.
+static TensorRef gguf_raw(GGUFFile *gf, id<MTLBuffer> buf, id<MTLDevice> device, const char *name) {
     GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
     if (!ti) return (TensorRef){0};
+
+    if (ti->type == 0) { // F32 — convert to BF16 for kernel compatibility
+        size_t num_elements = 1;
+        for (uint32_t d = 0; d < ti->n_dims; d++) num_elements *= ti->dims[d];
+        size_t bf16_size = num_elements * sizeof(uint16_t);
+
+        id<MTLBuffer> bf16_buf = [device newBufferWithLength:bf16_size
+                                                     options:MTLResourceStorageModeShared];
+        float *src = (float *)((uint8_t *)[buf contents] + gf->data_offset + ti->offset);
+        uint16_t *dst = (uint16_t *)[bf16_buf contents];
+        for (size_t i = 0; i < num_elements; i++) {
+            uint32_t f32;
+            memcpy(&f32, &src[i], 4);
+            dst[i] = (uint16_t)(f32 >> 16); // F32 → BF16 truncation
+        }
+        return (TensorRef){ .buffer = bf16_buf, .offset = 0, .format = QFMT_BF16 };
+    }
+
     return (TensorRef){ .buffer = buf, .offset = gf->data_offset + ti->offset, .format = QFMT_F32 };
 }
 
@@ -394,7 +413,7 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
     char name[128];
 
     #define G_REF(tname, od, id) gguf_ref(gf, buf, ctx, (tname), (od), (id))
-    #define G_RAW(tname) gguf_raw(gf, buf, (tname))
+    #define G_RAW(tname) gguf_raw(gf, buf, ctx->device, (tname))
 
     // Global tensors
     if (globals) {

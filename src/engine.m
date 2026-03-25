@@ -725,13 +725,6 @@ int engine_step(Engine *eng, int token_id) {
                          && eng->ef->gpu_resident_safe);
     if (gpu_resident) {
         memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
-        if (tcache && eng->pos == 0) {
-            float *check = (float *)[ctx->buf_moe_hidden contents];
-            fprintf(stderr, "[gguf] gpu_resident=%d buf_moe_hidden[0..3] = [%.6f %.6f %.6f %.6f]\n",
-                    gpu_resident, check[0], check[1], check[2], check[3]);
-        }
-    } else if (tcache && eng->pos == 0) {
-        fprintf(stderr, "[gguf] WARNING: gpu_resident=false, hidden NOT uploaded to GPU!\n");
     }
 
     // Per-layer command buffers with compute copy (no blit encoder transition).
@@ -740,7 +733,6 @@ int engine_step(Engine *eng, int token_id) {
     // fwd_enc = nil means per-layer CBs will be used
 
     for (int layer = 0; layer < cfg->num_layers; layer++) {
-        if (tcache && eng->pos == 0 && layer == 0) fprintf(stderr, "[gguf] LAYER 0 type=%d\n", cfg->layer_types[0]);
         int n_experts = cfg->num_experts;
         int S = cfg->shared_intermediate;
         int effective_k = thermal_k_effective(&eng->thermal, eng->active_experts);
@@ -857,33 +849,6 @@ int engine_step(Engine *eng, int token_id) {
             // QKV → buf_conv_input, Z → buf_linear_output, alpha → buf_linear_decay, beta → buf_linear_beta
             if (tcache) {
                 const LayerTensorCache *lt = &tcache[layer];
-                if (eng->pos == 0 && layer == 0) {
-                    // Check norm weight
-                    float *norm_w = (float *)((uint8_t *)[tcache[layer].input_norm.buffer contents] + tcache[layer].input_norm.offset);
-                    fprintf(stderr, "[gguf] layer 0 norm_w[0..3] = [%.6f %.6f %.6f %.6f]\n",
-                            norm_w[0], norm_w[1], norm_w[2], norm_w[3]);
-                    // CPU reference: dequant Q8_0 row 0 and dot with input
-                    uint8_t *qkv_data = (uint8_t *)[lt->lin.qkv.buffer contents] + lt->lin.qkv.offset;
-                    float *inp = (float *)[ctx->buf_input contents];
-                    // Q8_0: 2048/32 = 64 blocks per row, 34 bytes each
-                    float cpu_dot = 0;
-                    for (int blk = 0; blk < 64; blk++) {
-                        uint8_t *block = qkv_data + blk * 34;
-                        uint16_t d_raw = block[0] | ((uint16_t)block[1] << 8);
-                        // fp16 to float
-                        uint32_t sign = (d_raw >> 15) & 1;
-                        uint32_t exp = (d_raw >> 10) & 0x1F;
-                        uint32_t mant = d_raw & 0x3FF;
-                        float d;
-                        if (exp == 0) d = 0.0f;
-                        else { uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13); memcpy(&d, &f32, 4); }
-                        int8_t *qs = (int8_t *)(block + 2);
-                        for (int j = 0; j < 32; j++) {
-                            cpu_dot += d * (float)qs[j] * inp[blk * 32 + j];
-                        }
-                    }
-                    fprintf(stderr, "[gguf] layer 0 CPU QKV[0] = %.6f (input[0]=%.6f)\n", cpu_dot, inp[0]);
-                }
                 format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->lin.qkv,
                     ctx->buf_input, 0, ctx->buf_conv_input, 0);
 
@@ -1113,45 +1078,6 @@ int engine_step(Engine *eng, int token_id) {
                 memcpy(eng->hidden, [ctx->buf_moe_hidden contents], H * sizeof(float));
                 memcpy(eng->residual, eng->hidden, H * sizeof(float));
 
-                if (eng->pos == 0 && layer < 2) {
-                    int nans = 0; for (int j = 0; j < H; j++) if (isnan(eng->hidden[j])) nans++;
-                    fprintf(stderr, "[gguf] layer %d PRE-expert hidden: nans=%d first4=[%.6f %.6f %.6f %.6f]\n",
-                            layer, nans, eng->hidden[0], eng->hidden[1], eng->hidden[2], eng->hidden[3]);
-                }
-
-                // Debug: check routing gate TensorRef
-                if (eng->pos == 0 && layer < 2) {
-                    const LayerTensorCache *lt_dbg = &tcache[layer];
-                    fprintf(stderr, "[gguf] layer %d routing_gate: fmt=%d off=%zu od=%u id=%u buf=%p\n",
-                            layer, lt_dbg->routing_gate.format, lt_dbg->routing_gate.offset,
-                            lt_dbg->routing_gate.out_dim, lt_dbg->routing_gate.in_dim,
-                            (__bridge void *)lt_dbg->routing_gate.buffer);
-                }
-                // Debug: verify routing gate data via CPU
-                if (eng->pos == 0 && layer < 2) {
-                    const LayerTensorCache *lt_chk = &tcache[layer];
-                    float *gate_data = (float *)((uint8_t *)[lt_chk->routing_gate.buffer contents] + lt_chk->routing_gate.offset);
-                    fprintf(stderr, "[gguf] layer %d routing gate data first4: [%.6f %.6f %.6f %.6f]\n",
-                            layer, gate_data[0], gate_data[1], gate_data[2], gate_data[3]);
-                    // CPU matvec: routing_out[0] = sum(gate[0,j] * input[j])
-                    float *inp = (float *)[ctx->buf_input contents];
-                    fprintf(stderr, "[gguf] layer %d buf_input first4: [%.6f %.6f %.6f %.6f]\n",
-                            layer, inp[0], inp[1], inp[2], inp[3]);
-                    float dot = 0; for (int j = 0; j < H; j++) dot += gate_data[j] * inp[j];
-                    fprintf(stderr, "[gguf] layer %d CPU routing[0] = %.6f\n", layer, dot);
-                }
-                // Debug: check routing scores before softmax
-                if (eng->pos == 0 && layer < 2) {
-                    float mn = s_fused_gate_scores[0], mx = s_fused_gate_scores[0];
-                    int nz = 0;
-                    for (int j = 0; j < n_experts; j++) {
-                        if (s_fused_gate_scores[j] < mn) mn = s_fused_gate_scores[j];
-                        if (s_fused_gate_scores[j] > mx) mx = s_fused_gate_scores[j];
-                        if (s_fused_gate_scores[j] == 0.0f) nz++;
-                    }
-                    fprintf(stderr, "[gguf] layer %d routing scores: min=%.4f max=%.4f zeros=%d/%d\n",
-                            layer, mn, mx, nz, n_experts);
-                }
 
                 // CPU softmax + topK routing
                 cpu_softmax(s_fused_gate_scores, n_experts);
@@ -1183,13 +1109,6 @@ int engine_step(Engine *eng, int token_id) {
                     size_t gate_off = elr.gate.offset + (size_t)eidx * elr.gate.expert_stride;
                     size_t up_off = elr.up.offset + (size_t)eidx * elr.up.expert_stride;
 
-                    if (eng->pos == 0 && layer == 1 && k == 0) {
-                        // Verify Q4_K data at computed offset
-                        uint8_t *raw = (uint8_t *)[elr.buffer contents] + gate_off;
-                        uint16_t d_raw = raw[0] | ((uint16_t)raw[1] << 8);
-                        fprintf(stderr, "[gguf] expert %d gate_off=%zu stride=%zu d_raw=0x%04x first_bytes=[%02x %02x %02x %02x]\n",
-                                eidx, gate_off, elr.gate.expert_stride, d_raw, raw[0], raw[1], raw[2], raw[3]);
-                    }
 
                     // Gate projection → buf_multi_expert_gate[k]
                     TensorRef gate_ref = {
@@ -1260,30 +1179,6 @@ int engine_step(Engine *eng, int token_id) {
                 [ecmd commit];
                 [ecmd waitUntilCompleted];
 
-                // Debug: check intermediate expert buffers for NaN
-                if (eng->pos == 0 && layer < 2) {
-                    // Check gate output (post-SwiGLU activation, in buf_multi_expert_gate[k])
-                    for (int k = 0; k < 1; k++) {
-                        float *gout = (float *)[ctx->buf_multi_expert_gate[k] contents];
-                        int gnans = 0; for (int j = 0; j < M; j++) if (isnan(gout[j])) gnans++;
-                        fprintf(stderr, "[gguf] layer %d gate_act[%d]: nans=%d/%d first=[%.4f %.4f %.4f %.4f]\n",
-                                layer, k, gnans, M, gout[0], gout[1], gout[2], gout[3]);
-                    }
-                }
-                // Debug: check expert outputs for NaN
-                if (eng->pos == 0 && layer < 2) {
-                    for (int k = 0; k < effective_k; k++) {
-                        float *eout = (float *)[ctx->buf_multi_expert_out[k] contents];
-                        int nans = 0; for (int j = 0; j < H; j++) if (isnan(eout[j])) nans++;
-                        if (nans > 0 || k == 0) fprintf(stderr, "[gguf] layer %d expert_out[%d]: nans=%d first=[%.4f %.4f]\n",
-                                layer, k, nans, eout[0], eout[1]);
-                    }
-                    float *sout = (float *)[ctx->buf_shared_out contents];
-                    int snans = 0; for (int j = 0; j < H; j++) if (isnan(sout[j])) snans++;
-                    fprintf(stderr, "[gguf] layer %d shared_out: nans=%d first=[%.4f %.4f]\n",
-                            layer, snans, sout[0], sout[1]);
-                }
-
                 // CPU combine: hidden = residual + sum(expert_weights[k] * expert_out[k]) + shared_gate * shared_out
                 float sigmoid_sg = 1.0f / (1.0f + expf(-shared_gate_score));
                 float *shared_out = (float *)[ctx->buf_shared_out contents];
@@ -1296,16 +1191,12 @@ int engine_step(Engine *eng, int token_id) {
                     eng->hidden[j] = eng->residual[j] + expert_sum + sigmoid_sg * shared_out[j];
                 }
 
+                // Upload combined result back to GPU for next layer's attention
+                memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
+
                 double moe_ms = now_ms() - t0_moe;
                 t_moe_total += moe_ms;
 
-                if (eng->pos == 0 && layer < 2) {
-                    float mn = eng->hidden[0], mx = eng->hidden[0];
-                    for (int j = 1; j < H; j++) { if (eng->hidden[j] < mn) mn = eng->hidden[j]; if (eng->hidden[j] > mx) mx = eng->hidden[j]; }
-                    int nans = 0; for (int j = 0; j < H; j++) if (isnan(eng->hidden[j])) nans++;
-                    fprintf(stderr, "[gguf] layer %d hidden: min=%.4f max=%.4f nans=%d first4=[%.4f %.4f %.4f %.4f]\n",
-                            layer, mn, mx, nans, eng->hidden[0], eng->hidden[1], eng->hidden[2], eng->hidden[3]);
-                }
             } else if (gpu_resident && layer_fused) {
                 // Fully GPU-resident: no readback between layers
                 encode_fused_experts(enc, ctx, cfg, layer,
@@ -1880,8 +1771,6 @@ int engine_step(Engine *eng, int token_id) {
         }
 
         // LM head matvec: buf_input → buf_output
-        if (tcache) fprintf(stderr, "[gguf] lm_head dispatch (fmt=%d od=%u id=%u)...\n",
-                           eng->globals.lm_head.format, eng->globals.lm_head.out_dim, eng->globals.lm_head.in_dim);
         if (tcache) {
             format_dispatch_matvec(enc, ctx, (TensorRef *)&eng->globals.lm_head,
                 ctx->buf_input, 0, ctx->buf_output, 0);
