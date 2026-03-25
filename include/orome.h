@@ -376,6 +376,7 @@ void cpu_softmax(float *x, int len);
 float cpu_sigmoid(float x);
 void cpu_swiglu(const float *gate, const float *up, float *out, int dim);
 int cpu_argmax(const float *x, int len);
+int cpu_sample_topk(const float *logits, int vocab_size, int top_k, float temperature);
 void cpu_topk(const float *scores, int n, int k, int *indices, float *weights);
 void cpu_normalize_weights(float *weights, int K);
 
@@ -539,6 +540,10 @@ typedef struct {
     QuantType quant;
     int active_experts;     // runtime K (may differ from cfg default)
     ThermalKState thermal;
+
+
+
+
 
     // Precomputed weight offsets (opaque, owned by engine.m)
     void *weight_cache;

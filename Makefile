@@ -43,3 +43,12 @@ run: $(OROME_TARGET)
 
 bench: $(OROME_TARGET)
 	uv run tools/benchmark.py --trials 3
+
+MODEL ?= /Users/j/models/Qwen3.5-35B-A3B-4bit
+PORT ?= 8080
+
+serve: $(OROME_TARGET)
+	./$(OROME_TARGET) --model $(MODEL) --serve $(PORT)
+
+chat:
+	@python3 tools/chat.py --port $(PORT)

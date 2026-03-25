@@ -202,6 +202,10 @@ void engine_free(Engine *eng) {
     free(eng);
 }
 
+// Profiling accumulators (reset in engine_reset)
+static double t_attn_total = 0, t_moe_total = 0, t_norm_total = 0, t_lmhead_total = 0;
+static int profile_count = 0;
+
 void engine_reset(Engine *eng) {
     eng->pos = 0;
     thermal_k_reset(&eng->thermal);
@@ -218,6 +222,9 @@ void engine_reset(Engine *eng) {
         memset(eng->linear_states[i]->conv_state, 0, conv_size * sizeof(float));
         memset(eng->linear_states[i]->ssm_state, 0, ssm_size * sizeof(float));
     }
+    // Reset profile accumulators so they don't bleed across requests
+    t_attn_total = 0; t_moe_total = 0; t_norm_total = 0; t_lmhead_total = 0;
+    profile_count = 0;
 }
 
 // ============================================================================
@@ -486,9 +493,7 @@ static void encode_fused_experts(id<MTLComputeCommandEncoder> enc,
 // Forward pass: one token
 // ============================================================================
 
-// Profiling accumulators (reset externally if needed)
-static double t_attn_total = 0, t_moe_total = 0, t_norm_total = 0, t_lmhead_total = 0;
-static int profile_count = 0;
+// (profiling accumulators declared earlier, near engine_reset)
 
 int engine_step(Engine *eng, int token_id) {
     ModelConfig *cfg = eng->cfg;

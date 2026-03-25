@@ -2,10 +2,16 @@
  * server.m — HTTP/SSE server (OpenAI-compatible API).
  *
  * Implements:
- *   POST /v1/chat/completions — streaming inference
+ *   POST /v1/chat/completions — streaming inference with multi-turn chat
  *   GET  /v1/models           — model list
  *   GET  /health              — health check
+ *
+ * Chat completions parses the full OpenAI messages array and formats it
+ * with Qwen chat template (<|im_start|>role\ncontent<|im_end|>).
+ * Each request resets the engine and re-prefills the entire conversation.
  */
+
+#import <Foundation/Foundation.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +36,7 @@ static void http_write_str(int fd, const char *str) {
 }
 
 static char *read_http_request(int fd, size_t *out_len) {
-    size_t cap = 8192, len = 0;
+    size_t cap = 65536, len = 0;
     char *buf = malloc(cap);
     while (len < cap - 1) {
         ssize_t n = read(fd, buf + len, cap - len - 1);
@@ -45,8 +51,12 @@ static char *read_http_request(int fd, size_t *out_len) {
                 int body_len = atoi(cl + 15);
                 char *body_start = strstr(buf, "\r\n\r\n") + 4;
                 int header_len = (int)(body_start - buf);
-                int total = header_len + body_len;
-                while ((int)len < total && len < cap - 1) {
+                size_t total = (size_t)header_len + body_len;
+                if (total >= cap) {
+                    cap = total + 1;
+                    buf = realloc(buf, cap);
+                }
+                while (len < total && len < cap - 1) {
                     ssize_t n2 = read(fd, buf + len, cap - len - 1);
                     if (n2 <= 0) break;
                     len += n2;
@@ -93,6 +103,22 @@ static void sse_send_done(int fd, const char *req_id) {
              "data: [DONE]\n\n",
              req_id);
     http_write_str(fd, chunk);
+}
+
+// ============================================================================
+// Sampling helper — runs engine_step then samples from logits
+// ============================================================================
+
+static int sample_next(Engine *eng, int token_id, float temperature, int top_k) {
+    engine_step(eng, token_id);
+    // Read logits directly from GPU shared buffer (no copy on unified memory)
+    const float *logits;
+    if (eng->ctx && eng->ctx->buf_output) {
+        logits = (const float *)[eng->ctx->buf_output contents];
+    } else {
+        logits = eng->logits;
+    }
+    return cpu_sample_topk(logits, eng->cfg->vocab_size, top_k, temperature);
 }
 
 // ============================================================================
@@ -182,27 +208,52 @@ void serve_loop(Engine *eng, Vocabulary *vocab, int port) {
 
         // POST /v1/chat/completions
         if (strcmp(path, "/v1/chat/completions") == 0 && strcmp(method, "POST") == 0) {
-            // Extract message content (simple: find last "content" value)
-            char *content = strstr(req, "\"content\"");
-            char prompt[4096] = "Hello";
-            if (content) {
-                char *start = strchr(content + 9, '"');
-                if (start) {
-                    start++;
-                    char *end = strchr(start, '"');
-                    if (end) {
-                        int len = (int)(end - start);
-                        if (len > 4095) len = 4095;
-                        memcpy(prompt, start, len);
-                        prompt[len] = '\0';
+            @autoreleasepool {
+            // Parse JSON body
+            char *body_start = strstr(req, "\r\n\r\n");
+            char *prompt = NULL;
+            int max_tokens = 256;
+            float temperature = 0.6f;
+            int top_k = 20;
+
+            if (body_start) {
+                body_start += 4;
+                NSData *body_data = [NSData dataWithBytes:body_start
+                                                   length:req_len - (body_start - req)];
+                NSDictionary *json = [NSJSONSerialization JSONObjectWithData:body_data
+                                                                    options:0 error:nil];
+                if (json) {
+                    NSNumber *mt = json[@"max_tokens"];
+                    if (mt) max_tokens = [mt intValue];
+                    NSNumber *temp = json[@"temperature"];
+                    if (temp) temperature = [temp floatValue];
+
+                    // Build chat-templated prompt from messages array
+                    NSArray *messages = json[@"messages"];
+                    if ([messages isKindOfClass:[NSArray class]] && messages.count > 0) {
+                        NSMutableString *chat = [NSMutableString new];
+                        for (NSDictionary *msg in messages) {
+                            NSString *role = msg[@"role"];
+                            NSString *content = msg[@"content"];
+                            if (!role || !content) continue;
+                            // For assistant messages, wrap in think block if not present
+                            if ([role isEqualToString:@"assistant"]
+                                && ![content hasPrefix:@"<think>"]) {
+                                [chat appendFormat:@"<|im_start|>assistant\n<think>\n</think>\n%@<|im_end|>\n",
+                                 content];
+                            } else {
+                                [chat appendFormat:@"<|im_start|>%@\n%@<|im_end|>\n",
+                                 role, content];
+                            }
+                        }
+                        // Add assistant turn prefix for generation
+                        [chat appendString:@"<|im_start|>assistant\n"];
+                        prompt = strdup([chat UTF8String]);
                     }
                 }
             }
 
-            // Extract max_tokens
-            int max_tokens = 256;
-            char *mt = strstr(req, "\"max_tokens\"");
-            if (mt) max_tokens = atoi(mt + 13);
+            if (!prompt) prompt = strdup("<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n");
 
             // SSE headers
             http_write_str(client_fd,
@@ -212,9 +263,10 @@ void serve_loop(Engine *eng, Vocabulary *vocab, int port) {
                 "Access-Control-Allow-Origin: *\r\n"
                 "Connection: keep-alive\r\n\r\n");
 
-            // Tokenize and prefill
+            // Tokenize and prefill full conversation (greedy — no sampling)
             engine_reset(eng);
             PromptTokens *pt = tokenizer_encode(prompt);
+            free(prompt);
             int next_token = 0;
             if (pt) {
                 for (int i = 0; i < pt->count; i++) {
@@ -223,18 +275,52 @@ void serve_loop(Engine *eng, Vocabulary *vocab, int port) {
                 prompt_tokens_free(pt);
             }
 
-            // Generate
+            // Re-sample the first token after prefill
+            if (temperature > 0) {
+                const float *logits = (eng->ctx && eng->ctx->buf_output)
+                    ? (const float *)[eng->ctx->buf_output contents]
+                    : eng->logits;
+                next_token = cpu_sample_topk(logits, eng->cfg->vocab_size,
+                                             top_k, temperature);
+            }
+
+            // Generate — detect and filter think blocks dynamically
             char req_id[32];
             snprintf(req_id, sizeof(req_id), "cmpl-%d", (int)eng->pos);
+            int think_start_token = 248068;  // <think>
+            int think_end_token = eng->cfg->think_end_token;  // </think> = 248069
+            bool in_think = false;
             for (int i = 0; i < max_tokens; i++) {
                 if (is_eos_token(eng->cfg, next_token)) break;
 
-                const char *text = tokenizer_decode(next_token);
-                sse_send_delta(client_fd, text, req_id);
+                if (next_token == think_start_token) {
+                    in_think = true;
+                    next_token = sample_next(eng, next_token, temperature, top_k);
+                    continue;
+                }
+                if (next_token == think_end_token) {
+                    in_think = false;
+                    next_token = sample_next(eng, next_token, temperature, top_k);
+                    // Skip newline after </think>
+                    if (!is_eos_token(eng->cfg, next_token)) {
+                        const char *t = tokenizer_decode(next_token);
+                        if (t[0] == '\n' && t[1] == '\0') {
+                            next_token = sample_next(eng, next_token,
+                                                     temperature, top_k);
+                        }
+                    }
+                    continue;
+                }
 
-                next_token = engine_step(eng, next_token);
+                if (!in_think) {
+                    const char *text = tokenizer_decode(next_token);
+                    sse_send_delta(client_fd, text, req_id);
+                }
+
+                next_token = sample_next(eng, next_token, temperature, top_k);
             }
             sse_send_done(client_fd, req_id);
+            } // @autoreleasepool
         } else {
             http_write_str(client_fd,
                 "HTTP/1.1 404 Not Found\r\n"

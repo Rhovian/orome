@@ -33,3 +33,14 @@ n/a	7.36	10077.8	-	discard	two-phase pipelined pread (gate+up first, down during
 n/a	6.69	11542.0	-	keep	fix: disable broken cross-token expert cache (shared GPU buffers served stale data)
 n/a	5.37	-	-	discard	CPU-side per-layer expert cache (4.25 GB, 4-bit sized): page cache regression from memory pressure
 n/a	5.49	-	-	discard	CPU-side per-layer expert cache (2.36 GB, 2-bit sized): still page cache regression
+n/a	6.61	11539.0	-	discard	GPU combine for pread path: eliminate K+1 readbacks, combine on GPU — within noise
+n/a	5.88	13286.0	-	discard	speculative expert prefetch during GPU attention: overlap pread with GPU but 50% more total I/O, bandwidth dropped from 31 to 22 GB/s
+08e3733	7.32	10727.8	-	keep	per-layer expert cache buffers (2.25 GB): correct cross-token caching, 33% hit rate, +9.4% over disabled cache
+n/a	6.89	10557.1	-	discard	K+4 cache slots (14, 3.15 GB) + F_RDADVISE advise + smarter eviction: page cache regression from +900 MB
+1942f27	7.87	10070.0	-	keep	K+2 cache slots (12, 2700 MB) + smarter eviction: +7.5% over K=10, sweet spot for page cache pressure
+n/a	6.89	11584.7	-	discard	F_RDADVISE pre-warming before attention: I/O contention, regression from read-ahead interference
+n/a	7.85	10213.7	-	discard	K+3 cache slots (13, 2925 MB): within noise of K+2, diminishing returns above +2 extra slots
+n/a	7.96	9936.8	-	discard	2-bit batched expert kernels (4 dispatches vs 31): within noise, GPU dispatch overhead not bottleneck
+n/a	7.64	10078.2	-	discard	GPU combine for pread path (correct impl): extra barrier+kernel negated readback savings, within noise
+n/a	7.89	10067.1	-	discard	-O3 compiler optimization: within noise of -O2, CPU code paths not bottleneck
+n/a	6.98	-	-	discard	pipelined pread+GPU via MTLSharedEvent: 2-encoder+event overhead (>0.5ms/layer) negated overlap savings
