@@ -1,13 +1,17 @@
 # Orome
 
-MoE inference engine for Apple Silicon. Runs Qwen3.5 models (35B and 397B) on a single Mac Studio using Metal GPU compute and SSD streaming.
+MoE inference engine for Apple Silicon. Metal GPU compute + SSD streaming.
 
-**35B-A3B**: 62.53 tok/s — all experts GPU-resident, pure dispatch optimization.
-**397B-A17B**: 7.87 tok/s — 120 GB of experts streamed from SSD through the OS page cache, ~1.3 GB read per token.
+| | Qwen3.5-35B-A3B | Qwen3.5-397B-A17B |
+|---|---|---|
+| **Parameters** | 35B (3B active) | 397B (17B active) |
+| **Expert weights** | 18 GB (GPU-resident) | 121 GB 2-bit (SSD-streamed) |
+| **Baseline** | 1.04 tok/s | 4.08 tok/s |
+| **Optimized** | **62.53 tok/s** (60x) | **7.87 tok/s** (+93%) |
+| **Bottleneck** | GPU dispatch | SSD I/O |
+| **Experiments** | 73 | 49 |
 
-## Hardware
-
-Mac Studio (2023): M2 Max, 38 GPU cores, 96 GB unified memory, NVMe SSD.
+**Hardware**: Mac Studio M2 Max — 38 GPU cores, 96 GB unified memory, NVMe SSD.
 
 ## Quick Start
 
