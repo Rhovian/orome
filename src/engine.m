@@ -1057,11 +1057,11 @@ int engine_step(Engine *eng, int token_id) {
 
             if (gguf_experts) {
                 // GGUF expert path: CPU routing readback + GPU expert forward
-                // using Q4_K batch kernels with per-expert offsets from ExpertLayerRef
                 [enc endEncoding];
                 if (cmd) [cmd commit];
                 if (cmd) [cmd waitUntilCompleted];
 
+                // Read routing results from GPU
                 memcpy(s_fused_gate_scores, [ctx->buf_output contents],
                        n_experts * sizeof(float));
                 float shared_gate_score;
@@ -1069,17 +1069,121 @@ int engine_step(Engine *eng, int token_id) {
                        (uint8_t *)[ctx->buf_output contents] + sgg_off,
                        sizeof(float));
 
+                // Read hidden state from GPU
                 memcpy(eng->hidden, [ctx->buf_moe_hidden contents], H * sizeof(float));
                 memcpy(eng->residual, eng->hidden, H * sizeof(float));
 
-                // TODO: GGUF expert forward via batch_expert_matvec_q4k
-                // For now, fall through to CPU expert forward as a correctness test
+                // CPU softmax + topK routing
+                cpu_softmax(s_fused_gate_scores, n_experts);
+                int expert_indices[OROME_MAX_ACTIVE];
+                float expert_weights[OROME_MAX_ACTIVE];
+                cpu_topk(s_fused_gate_scores, n_experts, effective_k, expert_indices, expert_weights);
+                cpu_normalize_weights(expert_weights, effective_k);
+
                 double t0_moe = now_ms();
-                // CPU fallback: dequant Q4_K experts and compute on CPU
-                // This is slow but proves the data path works
-                // moe_forward_routed would need GGUF-aware expert loading
-                // For now, skip expert forward — output will be wrong but won't crash
-                fprintf(stderr, "[gguf] TODO: expert forward for layer %d (skipping)\n", layer);
+
+                // Get expert layer refs from format provider
+                int M = cfg->moe_intermediate;
+                int S = cfg->shared_intermediate;
+                ExpertLayerRef elr = format_resolve_expert_layer(eng->fp, layer, H, M, n_experts);
+
+                // Upload hidden state to GPU for expert forward
+                memcpy([ctx->buf_input contents], eng->hidden, H * sizeof(float));
+
+                // GPU expert forward: per-expert gate → up → swiglu → down
+                id<MTLCommandBuffer> ecmd = [ctx->queue commandBuffer];
+                id<MTLComputeCommandEncoder> eenc = [ecmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+
+                NSUInteger etg = ENGINE_ROWS_PER_TG * 32;
+                uint nrt_M = ((uint)M + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
+                uint nrt_H = ((uint)H + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
+
+                for (int k = 0; k < effective_k; k++) {
+                    int eidx = expert_indices[k];
+                    size_t gate_off = elr.gate.offset + (size_t)eidx * elr.gate.expert_stride;
+                    size_t up_off = elr.up.offset + (size_t)eidx * elr.up.expert_stride;
+
+                    // Gate projection → buf_multi_expert_gate[k]
+                    TensorRef gate_ref = {
+                        .buffer = elr.buffer, .offset = gate_off,
+                        .format = elr.gate.format, .out_dim = (uint32_t)M, .in_dim = (uint32_t)H,
+                    };
+                    gate_ref.pipeline = format_pipeline_for(ctx, gate_ref.format);
+                    format_dispatch_matvec(eenc, ctx, &gate_ref,
+                        ctx->buf_input, 0, ctx->buf_multi_expert_gate[k], 0);
+
+                    // Up projection → buf_multi_expert_up[k]
+                    TensorRef up_ref = {
+                        .buffer = elr.buffer, .offset = up_off,
+                        .format = elr.up.format, .out_dim = (uint32_t)M, .in_dim = (uint32_t)H,
+                    };
+                    up_ref.pipeline = format_pipeline_for(ctx, up_ref.format);
+                    format_dispatch_matvec(eenc, ctx, &up_ref,
+                        ctx->buf_input, 0, ctx->buf_multi_expert_up[k], 0);
+                }
+
+                [eenc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                // SwiGLU per expert
+                for (int k = 0; k < effective_k; k++) {
+                    [eenc setComputePipelineState:ctx->swiglu];
+                    [eenc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:0];
+                    [eenc setBuffer:ctx->buf_multi_expert_up[k] offset:0 atIndex:1];
+                    [eenc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:2]; // reuse gate as act output
+                    { uint dim = (uint)M; [eenc setBytes:&dim length:sizeof(uint) atIndex:3]; }
+                    [eenc dispatchThreadgroups:MTLSizeMake(((uint)M + 255) / 256, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                }
+
+                [eenc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                // Down projection per expert
+                for (int k = 0; k < effective_k; k++) {
+                    int eidx = expert_indices[k];
+                    size_t down_off = elr.down.offset + (size_t)eidx * elr.down.expert_stride;
+
+                    TensorRef down_ref = {
+                        .buffer = elr.buffer, .offset = down_off,
+                        .format = elr.down.format, .out_dim = (uint32_t)H, .in_dim = (uint32_t)M,
+                    };
+                    down_ref.pipeline = format_pipeline_for(ctx, down_ref.format);
+                    format_dispatch_matvec(eenc, ctx, &down_ref,
+                        ctx->buf_multi_expert_gate[k], 0, ctx->buf_multi_expert_out[k], 0);
+                }
+
+                // Shared expert SwiGLU + down
+                {
+                    [eenc setComputePipelineState:ctx->swiglu];
+                    [eenc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
+                    [eenc setBuffer:ctx->buf_shared_up offset:0 atIndex:1];
+                    [eenc setBuffer:ctx->buf_shared_act offset:0 atIndex:2];
+                    { uint dim = (uint)S; [eenc setBytes:&dim length:sizeof(uint) atIndex:3]; }
+                    [eenc dispatchThreadgroups:MTLSizeMake(((uint)S + 255) / 256, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                }
+
+                [eenc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                // Shared expert down
+                format_dispatch_matvec(eenc, ctx, (TensorRef *)&tcache[layer].shared_down,
+                    ctx->buf_shared_act, 0, ctx->buf_shared_out, 0);
+
+                [eenc endEncoding];
+                [ecmd commit];
+                [ecmd waitUntilCompleted];
+
+                // CPU combine: hidden = residual + sum(expert_weights[k] * expert_out[k]) + shared_gate * shared_out
+                float sigmoid_sg = 1.0f / (1.0f + expf(-shared_gate_score));
+                float *shared_out = (float *)[ctx->buf_shared_out contents];
+
+                for (int j = 0; j < H; j++) {
+                    float expert_sum = 0.0f;
+                    for (int k = 0; k < effective_k; k++) {
+                        expert_sum += expert_weights[k] * ((float *)[ctx->buf_multi_expert_out[k] contents])[j];
+                    }
+                    eng->hidden[j] = eng->residual[j] + expert_sum + sigmoid_sg * shared_out[j];
+                }
+
                 double moe_ms = now_ms() - t0_moe;
                 t_moe_total += moe_ms;
             } else if (gpu_resident && layer_fused) {
