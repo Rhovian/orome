@@ -383,6 +383,54 @@ typedef struct {
     id<MTLBuffer> model_buf;    // Metal buffer wrapping the model data
 } FormatProvider;
 
+// Format-agnostic per-layer weight cache.
+// Engine uses these TensorRefs directly — never sees byte offsets or quant formats.
+typedef struct {
+    TensorRef input_norm;       // F32 norm weights (not matvec'd, used by RMS norm kernel)
+    TensorRef post_norm;
+    TensorRef routing_gate;     // MoE routing: [hidden, num_experts]
+    TensorRef shared_gate;      // shared expert gate projection
+    TensorRef shared_up;        // shared expert up projection
+    TensorRef shared_down;      // shared expert down projection
+    TensorRef shared_expert_gate; // scalar gate for shared expert
+    union {
+        struct {
+            TensorRef qkv;      // fused Q+K+V projection
+            TensorRef z;        // Z gate (in_proj_z)
+            TensorRef a;        // alpha projection
+            TensorRef b;        // beta projection
+            TensorRef o;        // output projection
+            TensorRef conv;     // conv1d weights (F32)
+            TensorRef A_log;    // SSM decay (F32)
+            TensorRef dt_bias;  // SSM time step bias (F32)
+            TensorRef o_norm;   // output norm (F32)
+        } lin;
+        struct {
+            TensorRef q, k, v;  // separate Q, K, V projections
+            TensorRef o;        // output projection
+            TensorRef q_norm;   // query norm (F32)
+            TensorRef k_norm;   // key norm (F32)
+        } full;
+    };
+} LayerTensorCache;
+
+// Global (non-per-layer) tensor refs
+typedef struct {
+    TensorRef embedding;        // token embedding
+    TensorRef lm_head;          // final projection
+    TensorRef final_norm;       // final RMS norm
+} GlobalTensorCache;
+
+// Build tensor cache from legacy format (WeightFile with our packed format)
+LayerTensorCache *build_tensor_cache_legacy(WeightFile *wf, MetalCtx *ctx,
+                                             const ModelConfig *cfg,
+                                             GlobalTensorCache *globals);
+
+// Build tensor cache from GGUF file
+LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
+                                           const ModelConfig *cfg,
+                                           GlobalTensorCache *globals);
+
 FormatProvider   *format_provider_open_gguf(GGUFFile *gf, MetalCtx *ctx);
 void              format_provider_close(FormatProvider *fp);
 TensorRef         format_resolve_tensor(FormatProvider *fp, const char *name,
@@ -628,8 +676,12 @@ typedef struct {
 
 
 
-    // Precomputed weight offsets (opaque, owned by engine.m)
+    // Precomputed weight offsets (legacy, opaque, owned by engine.m)
     void *weight_cache;
+
+    // Format-agnostic tensor cache (replaces weight_cache for new code paths)
+    LayerTensorCache *tensor_cache;
+    GlobalTensorCache globals;
 
     // GGUF format support (NULL for legacy format)
     FormatProvider *fp;
