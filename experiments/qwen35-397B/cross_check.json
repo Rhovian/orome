@@ -1,0 +1,7 @@
+{
+  "model_dir": "/Users/j/models/Qwen3.5-397B-A17B-4bit",
+  "min_tok_sec": 1.0,
+  "tokens": 5,
+  "k": 10,
+  "description": "397B pread path regression check"
+}

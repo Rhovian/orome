@@ -1,44 +1,46 @@
-# Xcode
-#
-# gitignore contributors: remember to update Global/Xcode.gitignore, Objective-C.gitignore & Swift.gitignore
+# Build artifacts
+orome
+packed_experts
+src/*.o
+src/*.air
+src/*.metallib
+*.dSYM/
 
-## User settings
-xcuserdata/
+# Experiment state (not committed — each session appends)
+experiments/*/results.tsv
+experiments/*/status.md
+experiments/*/logs/
+experiments/*/errors.log
+experiments/*/bench_err.txt
+experiments/*/*.txt
+*.log
 
-## Obj-C/Swift specific
-*.hmap
+# Model weights (too large for git)
+model_weights.bin
+model_weights.json
+expert_index.json
+packed_experts/
+packed_experts_2bit/
+hot_experts_*.json
+vocab.bin
 
-## App packaging
-*.ipa
-*.dSYM.zip
-*.dSYM
+# Generated images
+progress.png
 
-# CocoaPods
-#
-# We recommend against adding the Pods directory to your .gitignore. However
-# you should judge for yourself, the pros and cons are mentioned at:
-# https://guides.cocoapods.org/using/using-cocoapods.html#should-i-check-the-pods-directory-into-source-control
-#
-# Pods/
-#
-# Add this line if you want to avoid checking in source code from the Xcode workspace
-# *.xcworkspace
+# Python / uv
+__pycache__/
+*.pyc
+.venv/
+uv.lock
 
-# Carthage
-#
-# Add this line if you want to avoid checking in source code from Carthage dependencies.
-# Carthage/Checkouts
+# Agent scratch files
+diag*.txt
+tracing_plan.md
+*.trace.json
+profile_out.txt
+profile_stderr.txt
 
-Carthage/Build/
+# macOS
+.DS_Store
 
-# fastlane
-#
-# It is recommended to not store the screenshots in the git repo.
-# Instead, use fastlane to re-generate the screenshots whenever they are needed.
-# For more information about the recommended setup visit:
-# https://docs.fastlane.tools/best-practices/source-control/#source-control
-
-fastlane/report.xml
-fastlane/Preview.html
-fastlane/screenshots/**/*.png
-fastlane/test_output
+.claude
