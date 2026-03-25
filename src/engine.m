@@ -852,6 +852,7 @@ int engine_step(Engine *eng, int token_id) {
                 format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->lin.qkv,
                     ctx->buf_input, 0, ctx->buf_conv_input, 0);
 
+
                 format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->lin.z,
                     ctx->buf_input, 0, ctx->buf_linear_output, 0);
                 format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->lin.a,
@@ -892,7 +893,7 @@ int engine_step(Engine *eng, int token_id) {
 
             // --- Phase C: Conv1d step ---
             // buf_conv_input → buf_conv_output, updates buf_conv_state[linear_idx]
-            [enc setComputePipelineState:ctx->conv1d];
+            [enc setComputePipelineState:(tcache && ctx->conv1d_f32) ? ctx->conv1d_f32 : ctx->conv1d];
             [enc setBuffer:ctx->buf_conv_state[linear_idx] offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_conv_input offset:0 atIndex:1];
             [enc setBuffer:tcache ? tcache[layer].lin.conv.buffer : ctx->buf_weights
@@ -1191,15 +1192,6 @@ int engine_step(Engine *eng, int token_id) {
                     eng->hidden[j] = eng->residual[j] + expert_sum + sigmoid_sg * shared_out[j];
                 }
 
-                // Debug: check expert output
-                if (eng->pos == 0 && layer == 0) {
-                    fprintf(stderr, "[gguf-dbg] L0 hidden after combine: [%.6f %.6f %.6f %.6f]\n",
-                            eng->hidden[0], eng->hidden[1], eng->hidden[2], eng->hidden[3]);
-                    float *eo = (float *)[ctx->buf_multi_expert_out[0] contents];
-                    int nans = 0; for (int j = 0; j < H; j++) if (isnan(eo[j])) nans++;
-                    fprintf(stderr, "[gguf-dbg] L0 expert_out[0]: nans=%d first=[%.6f %.6f %.6f %.6f]\n",
-                            nans, eo[0], eo[1], eo[2], eo[3]);
-                }
 
                 // Upload combined result back to GPU for next layer's attention
                 memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
