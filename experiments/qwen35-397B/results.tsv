@@ -44,3 +44,6 @@ n/a	7.96	9936.8	-	discard	2-bit batched expert kernels (4 dispatches vs 31): wit
 n/a	7.64	10078.2	-	discard	GPU combine for pread path (correct impl): extra barrier+kernel negated readback savings, within noise
 n/a	7.89	10067.1	-	discard	-O3 compiler optimization: within noise of -O2, CPU code paths not bottleneck
 n/a	6.98	-	-	discard	pipelined pread+GPU via MTLSharedEvent: 2-encoder+event overhead (>0.5ms/layer) negated overlap savings
+n/a	-	-	-	crash	fused 2-bit gate+up+swiglu kernel for pread: all-NaN output at layer 0, correctness bug in kernel (GPU dispatch overhead already proven within noise)
+n/a	7.94	9982.4	-	discard	GPU norm+LM head+argmax for pread path (skip 993KB readback): within noise, 0.5ms savings too small vs 127ms/tok
+n/a	6.83	3027.4	-	discard	tiered quant (hot=4-bit, cold=2-bit, 1116 hot experts): cache slots grew to 6.75 MB → 4860 MB total, page cache regression
