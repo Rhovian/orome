@@ -472,7 +472,7 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
             snprintf(name, sizeof(name), "blk.%d.ssm_a", i);
             c->lin.A_log = G_RAW_F32(name);  // decay_beta kernel expects F32
             snprintf(name, sizeof(name), "blk.%d.ssm_dt.bias", i);
-            c->lin.dt_bias = G_RAW(name);     // decay_beta kernel expects BF16
+            c->lin.dt_bias = G_RAW_F32(name); // F32 decay_beta kernel
             // Output norm (ssm_norm in GGUF)
             snprintf(name, sizeof(name), "blk.%d.ssm_norm.weight", i);
             c->lin.o_norm = G_RAW(name);     // gated_rms_norm expects BF16

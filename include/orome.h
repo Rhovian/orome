@@ -246,6 +246,7 @@ typedef struct {
 
     // GGUF format pipelines
     id<MTLComputePipelineState> conv1d_f32;
+    id<MTLComputePipelineState> decay_beta_f32;
     id<MTLComputePipelineState> norm_apply_f32;
     id<MTLComputePipelineState> norm_apply_partial_f32;
     id<MTLComputePipelineState> matvec_f32;

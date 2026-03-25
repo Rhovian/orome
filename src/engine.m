@@ -919,7 +919,7 @@ int engine_step(Engine *eng, int token_id) {
             // --- Phase E: Compute decay + beta gate ---
             // alpha from buf_linear_decay (reused), beta from buf_linear_beta
             // A_log and dt_bias from weights
-            [enc setComputePipelineState:ctx->decay_beta];
+            [enc setComputePipelineState:(tcache && ctx->decay_beta_f32) ? ctx->decay_beta_f32 : ctx->decay_beta];
             [enc setBuffer:ctx->buf_linear_decay offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_linear_beta offset:0 atIndex:1];
             [enc setBuffer:tcache ? tcache[layer].lin.A_log.buffer : ctx->buf_weights

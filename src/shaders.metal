@@ -1022,6 +1022,24 @@ kernel void compute_decay_beta(
 }
 
 
+// Compute decay_beta with F32 dt_bias (for GGUF models)
+kernel void compute_decay_beta_f32(
+    device const float *alpha_out,
+    device const float *beta_out,
+    device const float *A_log,
+    device const float *dt_bias,      // F32 instead of BF16
+    device float *g_decay,
+    device float *beta_gate,
+    uint idx [[thread_position_in_grid]]
+) {
+    float a_val = alpha_out[idx];
+    float dt_b = dt_bias[idx];
+    float A_val = exp(A_log[idx]);
+    float softplus_val = log(1.0f + exp(a_val + dt_b));
+    g_decay[idx] = exp(-A_val * softplus_val);
+    beta_gate[idx] = 1.0f / (1.0f + exp(-beta_out[idx]));
+}
+
 // ============================================================================
 // Kernel 14: Gated RMS norm (z-gated output normalization)
 // ============================================================================
