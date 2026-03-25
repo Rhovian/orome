@@ -137,6 +137,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->matvec_q8_0 = make_pipeline(ctx, @"dequant_matvec_q8_0");
     ctx->batch_expert_mv_q4k = make_pipeline(ctx, @"batch_expert_matvec_q4k");
     ctx->batch_expert_down_q4k = make_pipeline(ctx, @"batch_expert_down_q4k");
+    ctx->matvec_f32 = make_pipeline(ctx, @"matvec_f32");
     // Q5_K, Q6_K, F16 kernels: TODO — add when needed
     ctx->matvec_q5k = NULL;
     ctx->matvec_q6k = NULL;

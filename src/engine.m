@@ -381,6 +381,62 @@ static void embed_lookup(WeightFile *wf, const ModelConfig *cfg,
     }
 }
 
+// Embedding lookup for GGUF Q8_0 format
+// Q8_0 block: 32 int8 weights + fp16 scale, so one row = H/32 blocks
+static void embed_lookup_gguf(GGUFFile *gf, const ModelConfig *cfg,
+                               int token_id, float *out) {
+    GGUFTensorInfo *ti = gguf_find_tensor(gf, "token_embd.weight");
+    if (!ti) { fprintf(stderr, "ERROR: token_embd.weight not found in GGUF\n"); return; }
+
+    int H = cfg->hidden_dim;
+    uint8_t *data = (uint8_t *)gf->mmap_base + gf->data_offset + ti->offset;
+
+    if (ti->type == 8) { // Q8_0
+        int blocks_per_row = H / 32;
+        int bytes_per_row = blocks_per_row * 34; // 34 bytes per Q8_0 block
+        uint8_t *row = data + (size_t)token_id * bytes_per_row;
+
+        for (int blk = 0; blk < blocks_per_row; blk++) {
+            uint8_t *block = row + blk * 34;
+            uint16_t d_raw = block[0] | ((uint16_t)block[1] << 8);
+            // fp16 to float
+            uint32_t sign = (d_raw >> 15) & 1;
+            uint32_t exp = (d_raw >> 10) & 0x1F;
+            uint32_t mant = d_raw & 0x3FF;
+            float d;
+            if (exp == 0) d = 0.0f;
+            else {
+                uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+                memcpy(&d, &f32, 4);
+            }
+
+            int8_t *qs = (int8_t *)(block + 2);
+            int base = blk * 32;
+            for (int j = 0; j < 32; j++) {
+                out[base + j] = d * (float)qs[j];
+            }
+        }
+    } else if (ti->type == 0) { // F32
+        float *row = (float *)(data + (size_t)token_id * H * sizeof(float));
+        memcpy(out, row, H * sizeof(float));
+    } else if (ti->type == 1) { // F16
+        uint16_t *row = (uint16_t *)(data + (size_t)token_id * H * sizeof(uint16_t));
+        for (int j = 0; j < H; j++) {
+            uint16_t h = row[j];
+            uint32_t sign = (h >> 15) & 1;
+            uint32_t exp = (h >> 10) & 0x1F;
+            uint32_t mant = h & 0x3FF;
+            if (exp == 0) out[j] = 0.0f;
+            else {
+                uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+                memcpy(&out[j], &f32, 4);
+            }
+        }
+    } else {
+        fprintf(stderr, "ERROR: unsupported embedding type %d\n", ti->type);
+    }
+}
+
 // ============================================================================
 // LM head (logits projection)
 // ============================================================================
@@ -410,7 +466,8 @@ static void encode_fused_experts(id<MTLComputeCommandEncoder> enc,
                                   MetalCtx *ctx, const ModelConfig *cfg,
                                   int layer, int K,
                                   QuantType quant,
-                                  const LayerWeightCache *lw) {
+                                  const LayerWeightCache *lw,
+                                  const LayerTensorCache *lt) {
     int H = cfg->hidden_dim;
     int M = cfg->moe_intermediate;
     int S = cfg->shared_intermediate;
@@ -555,21 +612,26 @@ static void encode_fused_experts(id<MTLComputeCommandEncoder> enc,
           threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
 
     // --- Shared expert down (use 2-row kernel if available) ---
-    { id<MTLComputePipelineState> sd_pipe = ctx->matvec_4bit_2row ? ctx->matvec_4bit_2row : ctx->matvec_4bit;
-      uint sd_rows_per_tg = ctx->matvec_4bit_2row ? ENGINE_ROWS_PER_TG * 2 : ENGINE_ROWS_PER_TG;
-      uint sd_num_tgs = ((uint)H + sd_rows_per_tg - 1) / sd_rows_per_tg;
-      [enc setComputePipelineState:sd_pipe];
-      [enc setBuffer:ctx->buf_weights offset:lw->sd_w atIndex:0];
-      [enc setBuffer:ctx->buf_weights offset:lw->sd_s atIndex:1];
-      [enc setBuffer:ctx->buf_weights offset:lw->sd_b atIndex:2];
-      [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:3];
-      [enc setBuffer:ctx->buf_shared_out offset:0 atIndex:4];
-      { uint od = (uint)H, id_ = (uint)S, gs = (uint)cfg->group_size;
-        [enc setBytes:&od length:sizeof(uint) atIndex:5];
-        [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
-        [enc setBytes:&gs length:sizeof(uint) atIndex:7]; }
-      [enc dispatchThreadgroups:MTLSizeMake(sd_num_tgs, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
+    if (lt) {
+        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_down,
+            ctx->buf_shared_act, 0, ctx->buf_shared_out, 0);
+    } else {
+        id<MTLComputePipelineState> sd_pipe = ctx->matvec_4bit_2row ? ctx->matvec_4bit_2row : ctx->matvec_4bit;
+        uint sd_rows_per_tg = ctx->matvec_4bit_2row ? ENGINE_ROWS_PER_TG * 2 : ENGINE_ROWS_PER_TG;
+        uint sd_num_tgs = ((uint)H + sd_rows_per_tg - 1) / sd_rows_per_tg;
+        [enc setComputePipelineState:sd_pipe];
+        [enc setBuffer:ctx->buf_weights offset:lw->sd_w atIndex:0];
+        [enc setBuffer:ctx->buf_weights offset:lw->sd_s atIndex:1];
+        [enc setBuffer:ctx->buf_weights offset:lw->sd_b atIndex:2];
+        [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:3];
+        [enc setBuffer:ctx->buf_shared_out offset:0 atIndex:4];
+        { uint od = (uint)H, id_ = (uint)S, gs = (uint)cfg->group_size;
+          [enc setBytes:&od length:sizeof(uint) atIndex:5];
+          [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+          [enc setBytes:&gs length:sizeof(uint) atIndex:7]; }
+        [enc dispatchThreadgroups:MTLSizeMake(sd_num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    }
 
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -617,7 +679,11 @@ int engine_step(Engine *eng, int token_id) {
 
     // 1. Embedding
     memset(eng->hidden, 0, H * sizeof(float));
-    embed_lookup(eng->wf, cfg, token_id, eng->hidden);
+    if (eng->gf) {
+        embed_lookup_gguf(eng->gf, cfg, token_id, eng->hidden);
+    } else {
+        embed_lookup(eng->wf, cfg, token_id, eng->hidden);
+    }
 
     // Debug: dump embedding
     if (moe_get_profile_experts() && pos < 3) {
@@ -823,7 +889,8 @@ int engine_step(Engine *eng, int token_id) {
             [enc setComputePipelineState:ctx->conv1d];
             [enc setBuffer:ctx->buf_conv_state[linear_idx] offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_conv_input offset:0 atIndex:1];
-            [enc setBuffer:ctx->buf_weights offset:lw->lin.conv_w atIndex:2];
+            [enc setBuffer:tcache ? tcache[layer].lin.conv.buffer : ctx->buf_weights
+                   offset:tcache ? tcache[layer].lin.conv.offset : lw->lin.conv_w atIndex:2];
             [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:3];
             { uint cd = (uint)conv_dim; [enc setBytes:&cd length:sizeof(uint) atIndex:4]; }
             [enc dispatchThreadgroups:MTLSizeMake(((uint)conv_dim + 255) / 256, 1, 1)
@@ -848,8 +915,10 @@ int engine_step(Engine *eng, int token_id) {
             [enc setComputePipelineState:ctx->decay_beta];
             [enc setBuffer:ctx->buf_linear_decay offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_linear_beta offset:0 atIndex:1];
-            [enc setBuffer:ctx->buf_weights offset:lw->lin.A_log atIndex:2];
-            [enc setBuffer:ctx->buf_weights offset:lw->lin.dt_bias atIndex:3];
+            [enc setBuffer:tcache ? tcache[layer].lin.A_log.buffer : ctx->buf_weights
+                   offset:tcache ? tcache[layer].lin.A_log.offset : lw->lin.A_log atIndex:2];
+            [enc setBuffer:tcache ? tcache[layer].lin.dt_bias.buffer : ctx->buf_weights
+                   offset:tcache ? tcache[layer].lin.dt_bias.offset : lw->lin.dt_bias atIndex:3];
             [enc setBuffer:ctx->buf_linear_decay offset:0 atIndex:4];  // output overwrites
             [enc setBuffer:ctx->buf_linear_beta offset:0 atIndex:5];   // output overwrites
             [enc dispatchThreadgroups:MTLSizeMake(((uint)n_v_heads + 63) / 64, 1, 1)
@@ -987,7 +1056,8 @@ int engine_step(Engine *eng, int token_id) {
             if (gpu_resident && layer_fused) {
                 // Fully GPU-resident: no readback between layers
                 encode_fused_experts(enc, ctx, cfg, layer,
-                                     effective_k, eng->quant, lw);
+                                     effective_k, eng->quant, lw,
+                                     tcache ? &tcache[layer] : NULL);
                 if (!fwd_enc) {
                     [enc endEncoding];
                     [cmd commit];
@@ -996,7 +1066,8 @@ int engine_step(Engine *eng, int token_id) {
                 // Hybrid fused: this resident layer has a direct Metal buffer
                 // GPU does softmax+topk+experts — no CPU routing readback
                 encode_fused_experts(enc, ctx, cfg, layer,
-                                     effective_k, eng->quant, lw);
+                                     effective_k, eng->quant, lw,
+                                     tcache ? &tcache[layer] : NULL);
                 [enc endEncoding];
                 [cmd commit];
                 [cmd waitUntilCompleted];
@@ -1396,7 +1467,8 @@ int engine_step(Engine *eng, int token_id) {
 
             if (gpu_resident && layer_fused_fa) {
                 encode_fused_experts(enc, ctx, cfg, layer,
-                                     effective_k, eng->quant, lw);
+                                     effective_k, eng->quant, lw,
+                                     tcache ? &tcache[layer] : NULL);
                 if (!fwd_enc) {
                     [enc endEncoding];
                     [cmd commit];
@@ -1404,7 +1476,8 @@ int engine_step(Engine *eng, int token_id) {
             } else if (layer_fused_fa) {
                 // Hybrid fused: this resident layer has a direct Metal buffer
                 encode_fused_experts(enc, ctx, cfg, layer,
-                                     effective_k, eng->quant, lw);
+                                     effective_k, eng->quant, lw,
+                                     tcache ? &tcache[layer] : NULL);
                 [enc endEncoding];
                 [cmd commit];
                 [cmd waitUntilCompleted];

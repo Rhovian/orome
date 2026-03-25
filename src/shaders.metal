@@ -1826,6 +1826,42 @@ kernel void copy_tmp_to_buf(
 }
 
 // ============================================================================
+// F32 matvec (no dequantization, for GGUF F32 tensors like routing gates)
+// ============================================================================
+
+kernel void matvec_f32(
+    device const float*    W          [[buffer(0)]],
+    device const float*    x          [[buffer(1)]],
+    device float*          out        [[buffer(2)]],
+    constant uint&         out_dim    [[buffer(3)]],
+    constant uint&         in_dim     [[buffer(4)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    if (row >= out_dim) return;
+
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = half(x[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    device const float* w_row = W + row * in_dim;
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < in_dim; col += 32) {
+        acc += w_row[col] * float(x_shared[col]);
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// ============================================================================
 // GGUF Q4_K dequant matvec
 //
 // Q4_K super-block: 256 weights in 144 bytes

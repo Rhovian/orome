@@ -243,9 +243,8 @@ int main(int argc, char **argv) {
             eng->fp = fp;
             eng->gf = gf;
 
-            // Build GGUF weight cache (replaces the legacy build_weight_cache)
-            extern void *build_weight_cache_gguf_ext(GGUFFile *gf, const ModelConfig *cfg);
-            eng->weight_cache = build_weight_cache_gguf_ext(gf, &cfg);
+            // Build format-agnostic tensor cache from GGUF
+            eng->tensor_cache = build_tensor_cache_gguf(gf, ctx, &cfg, &eng->globals);
 
         } else {
             // ==== Legacy loading path ====

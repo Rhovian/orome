@@ -245,6 +245,7 @@ typedef struct {
     id<MTLComputePipelineState> copy_tmp_to_buf;
 
     // GGUF format pipelines
+    id<MTLComputePipelineState> matvec_f32;
     id<MTLComputePipelineState> matvec_q4k;
     id<MTLComputePipelineState> matvec_q5k;
     id<MTLComputePipelineState> matvec_q8_0;

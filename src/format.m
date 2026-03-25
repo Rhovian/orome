@@ -25,10 +25,19 @@ void format_dispatch_matvec(
     id<MTLBuffer> in_buf, size_t in_off,
     id<MTLBuffer> out_buf, size_t out_off
 ) {
+    if (!ref->buffer) {
+        // Tensor not found — skip silently (may be optional like o_norm)
+        return;
+    }
     id<MTLComputePipelineState> pipe = ref->pipeline;
     if (!pipe) {
-        fprintf(stderr, "[format] no pipeline for format %d\n", ref->format);
-        return;
+        // Try to resolve pipeline at dispatch time (in case it was NULL at cache build time)
+        pipe = format_pipeline_for(ctx, ref->format);
+        if (!pipe) {
+            fprintf(stderr, "[format] no pipeline for format %d (od=%u id=%u)\n",
+                    ref->format, ref->out_dim, ref->in_dim);
+            return;
+        }
     }
 
     [enc setComputePipelineState:pipe];
@@ -97,8 +106,8 @@ id<MTLComputePipelineState> format_pipeline_for(MetalCtx *ctx, QuantFormat fmt) 
         case QFMT_GGUF_Q8_0:  return ctx->matvec_q8_0;
         case QFMT_GGUF_Q6_K:  return ctx->matvec_q6k;
         case QFMT_F16:        return ctx->matvec_f16;
-        case QFMT_BF16:       return ctx->matvec_f16; // same kernel, different decode
-        case QFMT_F32:        return ctx->matvec_f16; // placeholder
+        case QFMT_BF16:       return ctx->matvec_f16;
+        case QFMT_F32:        return ctx->matvec_f32;
     }
     return NULL;
 }
