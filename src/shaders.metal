@@ -1194,7 +1194,7 @@ kernel void rope_apply(
     float sin_a = sin(angle);
 
     // Half-split RoPE pairing: (tid, tid+half_rot)
-    // MLX traditional=False = half-split pairing
+    // Qwen3.5 uses rotate_half which is half-split (not interleaved)
 
     // Rotate Q head
     if (head < num_q_heads) {
