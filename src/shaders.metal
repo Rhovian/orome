@@ -1182,48 +1182,74 @@ kernel void dequant_matvec_q5k(
     uint simd_lane  [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
-    uint row = tgid * ROWS_PER_TG + simd_group;
-    if (row >= out_dim) return;
+    uint row0 = tgid * (ROWS_PER_TG * 2) + simd_group * 2;
+    uint row1 = row0 + 1;
+    bool valid0 = row0 < out_dim;
+    bool valid1 = row1 < out_dim;
 
     threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
     for (uint i = lid; i < in_dim; i += tg_size) {
         x_shared[i] = half(x[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!valid0) return;
 
     uint num_superblocks = in_dim / 256;
     uint bytes_per_row = num_superblocks * 176;
-    device const uint8_t* row_data = data + row * bytes_per_row;
+    device const uint8_t* row0_data = data + row0 * bytes_per_row;
+    device const uint8_t* row1_data = valid1 ? data + row1 * bytes_per_row : row0_data;
 
-    float acc = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     uint g = simd_lane / 8;
     uint l_start = (simd_lane % 8) * 4;
     uint8_t hm_lo = 1u << (g * 2);
     uint8_t hm_hi = 1u << (g * 2 + 1);
     for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
-        device const uint8_t* sb = row_data + sb_idx * 176;
-        float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
-        float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
+        device const uint8_t* sb0 = row0_data + sb_idx * 176;
+        float d0    = float(as_type<half>(ushort(ushort(sb0[0]) | (ushort(sb0[1]) << 8))));
+        float dmin0 = float(as_type<half>(ushort(ushort(sb0[2]) | (ushort(sb0[3]) << 8))));
         float sc_lo, sc_hi, mn_lo, mn_hi;
-        unpack_q4k_scale_min_pair(sb + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
-        device const uint8_t* qh = sb + 16;
-        device const uint8_t* ql = sb + 48 + g * 32;
+        unpack_q4k_scale_min_pair(sb0 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
+        device const uint8_t* qh0 = sb0 + 16;
+        device const uint8_t* ql0 = sb0 + 48 + g * 32;
         uint w_base = sb_idx * 256 + g * 64;
-        float q_sc_lo = d * sc_lo, q_mn_lo = dmin * mn_lo;
-        float q_sc_hi = d * sc_hi, q_mn_hi = dmin * mn_hi;
+        float q_sc0_lo = d0 * sc_lo, q_mn0_lo = dmin0 * mn_lo;
+        float q_sc0_hi = d0 * sc_hi, q_mn0_hi = dmin0 * mn_hi;
         for (uint j = 0; j < 4; j++) {
             uint l = l_start + j;
-            uint8_t byte_val = ql[l];
-            uint8_t q5_lo = (byte_val & 0xF) | ((qh[l] & hm_lo) ? 16 : 0);
-            uint8_t q5_hi = (byte_val >> 4) | ((qh[l] & hm_hi) ? 16 : 0);
-            acc += (q_sc_lo * float(q5_lo) - q_mn_lo) * float(x_shared[w_base + l]);
-            acc += (q_sc_hi * float(q5_hi) - q_mn_hi) * float(x_shared[w_base + 32 + l]);
+            uint8_t byte_val = ql0[l];
+            uint8_t q5_lo = (byte_val & 0xF) | ((qh0[l] & hm_lo) ? 16 : 0);
+            uint8_t q5_hi = (byte_val >> 4) | ((qh0[l] & hm_hi) ? 16 : 0);
+            acc0 += (q_sc0_lo * float(q5_lo) - q_mn0_lo) * float(x_shared[w_base + l]);
+            acc0 += (q_sc0_hi * float(q5_hi) - q_mn0_hi) * float(x_shared[w_base + 32 + l]);
+        }
+
+        if (valid1) {
+            device const uint8_t* sb1 = row1_data + sb_idx * 176;
+            float d1    = float(as_type<half>(ushort(ushort(sb1[0]) | (ushort(sb1[1]) << 8))));
+            float dmin1 = float(as_type<half>(ushort(ushort(sb1[2]) | (ushort(sb1[3]) << 8))));
+            unpack_q4k_scale_min_pair(sb1 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
+            device const uint8_t* qh1 = sb1 + 16;
+            device const uint8_t* ql1 = sb1 + 48 + g * 32;
+            float q_sc1_lo = d1 * sc_lo, q_mn1_lo = dmin1 * mn_lo;
+            float q_sc1_hi = d1 * sc_hi, q_mn1_hi = dmin1 * mn_hi;
+            for (uint j = 0; j < 4; j++) {
+                uint l = l_start + j;
+                uint8_t byte_val = ql1[l];
+                uint8_t q5_lo = (byte_val & 0xF) | ((qh1[l] & hm_lo) ? 16 : 0);
+                uint8_t q5_hi = (byte_val >> 4) | ((qh1[l] & hm_hi) ? 16 : 0);
+                acc1 += (q_sc1_lo * float(q5_lo) - q_mn1_lo) * float(x_shared[w_base + l]);
+                acc1 += (q_sc1_hi * float(q5_hi) - q_mn1_hi) * float(x_shared[w_base + 32 + l]);
+            }
         }
     }
 
-    float sum = simd_sum(acc);
+    float sum0 = simd_sum(acc0);
+    float sum1 = simd_sum(acc1);
     if (simd_lane == 0) {
-        out[row] = sum;
+        out[row0] = sum0;
+        if (valid1) out[row1] = sum1;
     }
 }
 
