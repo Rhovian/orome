@@ -38,3 +38,4 @@ n/a	58.58	2155.0	1.1011	discard	de-interleave Q+gate weights at load time to eli
 n/a	58.34	2148.3	1.1011	discard	vectorize GDN state accesses with float4 loads/stores
 n/a	58.08	2175.5	1.1011	discard	2-row GGUF Q8_0 matvec: halve threadgroups for general Q8_0 dispatches
 n/a	53.52	2191.6	1.1011	discard	lane-per-element Q8_0 parallelization: each lane processes 1 element per block
+4f8c12f	59.20	2158.3	1.1011	keep	half-precision GDN state: halve linear attention state bandwidth
