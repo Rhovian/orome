@@ -60,3 +60,4 @@ n/a	66.50	2180.0	1.1011	keep	schedule decay_beta alongside conv1d for concurrent
 n/a	66.12	2181.0	1.1011	keep	fuse QK RMS norm into delta_net kernel to eliminate 1 dispatch+1 barrier per linear layer
 n/a	66.57	2181.0	1.1011	keep	baseline: re-benchmark current HEAD before 2-row Q8_0 experiment
 n/a	66.74	2182.0	1.1011	keep	2-row GGUF Q8_0 matvec: halve threadgroups for all Q8_0 dispatches
+n/a	64.93	2183.0	1.1011	discard	column-major GDN state for cross-thread coalescing (still negative with deferred decay)
