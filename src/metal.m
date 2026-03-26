@@ -201,8 +201,6 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
                         ? cfg->linear_total_key : cfg->linear_total_value;
     ctx->buf_linear_q = [ctx->device newBufferWithLength:q_size * sizeof(float)
                                                  options:MTLResourceStorageModeShared]; }
-    ctx->buf_linear_k = [ctx->device newBufferWithLength:cfg->linear_total_key * sizeof(float)
-                                                 options:MTLResourceStorageModeShared];
     ctx->buf_linear_v = [ctx->device newBufferWithLength:cfg->linear_total_value * sizeof(float)
                                                  options:MTLResourceStorageModeShared];
     ctx->buf_linear_decay = [ctx->device newBufferWithLength:cfg->linear_num_v_heads * sizeof(float)
@@ -255,4 +253,3 @@ void metal_free(MetalCtx *ctx) {
 }
 
 // ============================================================================
-

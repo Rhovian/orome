@@ -95,7 +95,6 @@ int main(int argc, char **argv) {
 
         ModelConfig cfg;
         MetalCtx *ctx = NULL;
-        Vocabulary *vocab = NULL;
         GGUFFile *gf = NULL;
         FormatProvider *fp = NULL;
         Engine *eng = NULL;
@@ -269,15 +268,9 @@ int main(int argc, char **argv) {
                 tokenizer_init("/Users/j/models/Qwen3.5-35B-A3B-4bit");
             }
 
-            char vocab_path[512];
-            snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.bin",
-                     "/Users/j/models/Qwen3.5-35B-A3B-4bit");
-            vocab = vocab_load(vocab_path);
-
             fprintf(stderr, "[main] GGUF: creating engine...\n");
             eng = engine_create(&cfg, ctx,
                                 active_k > 0 ? active_k : 0);
-            eng->fp = fp;
             eng->gf = gf;
 
             // Build format-agnostic tensor cache from GGUF
@@ -286,8 +279,8 @@ int main(int argc, char **argv) {
             // Pre-resolve expert layer refs (avoids per-token GGUF hash lookups)
             eng->expert_layer_cache = calloc(cfg.num_layers, sizeof(ExpertLayerRef));
             for (int i = 0; i < cfg.num_layers; i++) {
-                eng->expert_layer_cache[i] = format_resolve_expert_layer(
-                    fp, i, cfg.hidden_dim, cfg.moe_intermediate, cfg.num_experts);
+                eng->expert_layer_cache[i] =
+                    format_resolve_expert_layer(fp, i, cfg.num_experts);
             }
             fprintf(stderr, "[main] Pre-resolved %d expert layer refs\n", cfg.num_layers);
 
@@ -305,7 +298,7 @@ int main(int argc, char **argv) {
 
         // ---- Run ----
         if (serve_port > 0) {
-            serve_loop(eng, vocab, serve_port);
+            serve_loop(eng, serve_port);
         } else {
             // Tokenize prompt (or use raw token IDs if prompt starts with "[")
             PromptTokens *pt = NULL;
@@ -371,7 +364,6 @@ int main(int argc, char **argv) {
 
         // ---- Cleanup ----
         engine_free(eng);
-        if (vocab) vocab_free(vocab);
         if (fp) format_provider_close(fp);
         if (gf) gguf_close(gf);
         metal_free(ctx);

@@ -178,7 +178,6 @@ typedef struct {
     id<MTLBuffer> __strong *buf_linear_state;   // [num_linear_layers]
     id<MTLBuffer> __strong *buf_conv_state;     // [num_linear_layers]
     id<MTLBuffer> buf_linear_q;
-    id<MTLBuffer> buf_linear_k;
     id<MTLBuffer> buf_linear_v;
     id<MTLBuffer> buf_linear_decay;
     id<MTLBuffer> buf_linear_beta;
@@ -231,7 +230,6 @@ typedef struct {
 // Opaque provider that resolves tensor names to dispatch-ready refs
 typedef struct {
     GGUFFile *gguf;             // non-NULL for GGUF models
-    MetalCtx *ctx;
     id<MTLBuffer> model_buf;    // Metal buffer wrapping the model data
 } FormatProvider;
 
@@ -268,7 +266,6 @@ typedef struct {
 
 // Global (non-per-layer) tensor refs
 typedef struct {
-    TensorRef embedding;        // token embedding
     TensorRef lm_head;          // final projection
     TensorRef final_norm;       // final RMS norm
 } GlobalTensorCache;
@@ -282,7 +279,6 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
 FormatProvider   *format_provider_open_gguf(GGUFFile *gf, MetalCtx *ctx);
 void              format_provider_close(FormatProvider *fp);
 ExpertLayerRef    format_resolve_expert_layer(FormatProvider *fp, int layer_idx,
-                                              uint32_t hidden_dim, uint32_t intermediate,
                                               uint32_t num_experts);
 void              format_dispatch_matvec(id<MTLComputeCommandEncoder> enc,
                                          MetalCtx *ctx, TensorRef *ref,
@@ -326,7 +322,6 @@ typedef struct {
     GlobalTensorCache globals;
 
     // GGUF format support
-    FormatProvider *fp;
     GGUFFile *gf;
     ExpertLayerRef *expert_layer_cache;  // [num_layers], pre-resolved from FormatProvider
 } Engine;
@@ -343,18 +338,9 @@ int engine_step(Engine *eng, int token_id);
 // ============================================================================
 
 typedef struct {
-    char **tokens;
-    int *lengths;
-    int num_tokens;
-} Vocabulary;
-
-typedef struct {
     int *ids;
     int count;
 } PromptTokens;
-
-Vocabulary   *vocab_load(const char *path);
-void          vocab_free(Vocabulary *v);
 
 int           tokenizer_init(const char *model_dir);
 PromptTokens *tokenizer_encode(const char *text);
@@ -367,7 +353,7 @@ bool          is_eos_token(const ModelConfig *cfg, int token_id);
 // Server (HTTP/SSE, OpenAI-compatible API)
 // ============================================================================
 
-void serve_loop(Engine *eng, Vocabulary *vocab, int port);
+void serve_loop(Engine *eng, int port);
 
 // ============================================================================
 // GGUF file format support

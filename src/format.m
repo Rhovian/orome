@@ -119,7 +119,6 @@ QuantFormat format_from_ggml_type(uint32_t ggml_type) {
 FormatProvider *format_provider_open_gguf(GGUFFile *gf, MetalCtx *ctx) {
     FormatProvider *fp = calloc(1, sizeof(FormatProvider));
     fp->gguf = gf;
-    fp->ctx = ctx;
 
     // Wrap the entire GGUF mmap as a single Metal buffer
     size_t aligned = (gf->file_size + 4095) & ~4095;
@@ -149,7 +148,6 @@ void format_provider_close(FormatProvider *fp) {
 
 // Resolve expert layer tensors → ExpertLayerRef
 ExpertLayerRef format_resolve_expert_layer(FormatProvider *fp, int layer_idx,
-                                            uint32_t hidden_dim, uint32_t intermediate,
                                             uint32_t num_experts) {
     ExpertLayerRef elr = {0};
     elr.buffer = fp->model_buf;
@@ -248,7 +246,6 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
 
     // Global tensors
     if (globals) {
-        globals->embedding = G_RAW("token_embd.weight");
         globals->lm_head = G_REF("output.weight", cfg->vocab_size, H);
         globals->final_norm = G_RAW("output_norm.weight");
     }

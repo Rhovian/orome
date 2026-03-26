@@ -119,7 +119,7 @@ static int sample_next(Engine *eng, int token_id, float temperature, int top_k) 
 // Main server loop
 // ============================================================================
 
-void serve_loop(Engine *eng, Vocabulary *vocab, int port) {
+void serve_loop(Engine *eng, int port) {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket");

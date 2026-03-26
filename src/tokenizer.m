@@ -1,5 +1,5 @@
 /*
- * tokenizer.m — Vocabulary loading and BPE tokenizer wrapper.
+ * tokenizer.m — BPE tokenizer wrapper.
  */
 
 #include <stdio.h>
@@ -148,47 +148,4 @@ void prompt_tokens_free(PromptTokens *pt) {
     if (!pt) return;
     free(pt->ids);
     free(pt);
-}
-
-// ============================================================================
-// Vocabulary (binary format: count, max_id, then per-token: len + bytes)
-// ============================================================================
-
-Vocabulary *vocab_load(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "WARNING: Cannot open vocab %s\n", path);
-        return NULL;
-    }
-
-    uint32_t count, max_id;
-    if (fread(&count, 4, 1, f) != 1 || fread(&max_id, 4, 1, f) != 1) {
-        fclose(f);
-        return NULL;
-    }
-
-    Vocabulary *v = calloc(1, sizeof(Vocabulary));
-    v->num_tokens = (int)count;
-    v->tokens = calloc(count, sizeof(char *));
-    v->lengths = calloc(count, sizeof(int));
-
-    for (uint32_t i = 0; i < count; i++) {
-        uint16_t len;
-        if (fread(&len, 2, 1, f) != 1) break;
-        v->tokens[i] = calloc(len + 1, 1);
-        v->lengths[i] = len;
-        if (len > 0 && fread(v->tokens[i], 1, len, f) != len) break;
-    }
-
-    fclose(f);
-    printf("[vocab] Loaded %d tokens from %s\n", v->num_tokens, path);
-    return v;
-}
-
-void vocab_free(Vocabulary *v) {
-    if (!v) return;
-    for (int i = 0; i < v->num_tokens; i++) free(v->tokens[i]);
-    free(v->tokens);
-    free(v->lengths);
-    free(v);
 }
