@@ -1026,41 +1026,64 @@ kernel void dequant_matvec_q4k(
     uint simd_lane  [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
-    uint row = tgid * ROWS_PER_TG + simd_group;
-    if (row >= out_dim) return;
+    uint row0 = tgid * (ROWS_PER_TG * 2) + simd_group * 2;
+    uint row1 = row0 + 1;
+    bool valid0 = row0 < out_dim;
+    bool valid1 = row1 < out_dim;
 
     threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
     for (uint i = lid; i < in_dim; i += tg_size) { x_shared[i] = half(x[i]); }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!valid0) return;
 
     uint num_superblocks = in_dim / 256;
     uint bytes_per_row = num_superblocks * 144;
-    device const uint8_t* row_data = data + row * bytes_per_row;
+    device const uint8_t* row0_data = data + row0 * bytes_per_row;
+    device const uint8_t* row1_data = valid1 ? data + row1 * bytes_per_row : row0_data;
 
-    float acc = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     uint g = simd_lane / 8;
     uint l_start = (simd_lane % 8) * 4;
     for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
-        device const uint8_t* sb = row_data + sb_idx * 144;
-        float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
-        float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
+        device const uint8_t* sb0 = row0_data + sb_idx * 144;
         float sc[8], mn[8];
-        unpack_q4k_scales(sb + 4, sc, mn, 8);
-        device const uint8_t* qs = sb + 16 + g * 32;
         uint w_base = sb_idx * 256 + g * 64;
-        float sc_lo = d * sc[g * 2], mn_lo = dmin * mn[g * 2];
-        float sc_hi = d * sc[g * 2 + 1], mn_hi = dmin * mn[g * 2 + 1];
+        float d0    = float(as_type<half>(ushort(ushort(sb0[0]) | (ushort(sb0[1]) << 8))));
+        float dmin0 = float(as_type<half>(ushort(ushort(sb0[2]) | (ushort(sb0[3]) << 8))));
+        unpack_q4k_scales(sb0 + 4, sc, mn, 8);
+        device const uint8_t* qs0 = sb0 + 16 + g * 32;
+        float sc0_lo = d0 * sc[g * 2], mn0_lo = dmin0 * mn[g * 2];
+        float sc0_hi = d0 * sc[g * 2 + 1], mn0_hi = dmin0 * mn[g * 2 + 1];
         for (uint j = 0; j < 4; j++) {
             uint l = l_start + j;
-            uint8_t byte = qs[l];
-            acc += (sc_lo * float(byte & 0xF) - mn_lo) * float(x_shared[w_base + l]);
-            acc += (sc_hi * float(byte >> 4) - mn_hi) * float(x_shared[w_base + 32 + l]);
+            uint8_t byte = qs0[l];
+            acc0 += (sc0_lo * float(byte & 0xF) - mn0_lo) * float(x_shared[w_base + l]);
+            acc0 += (sc0_hi * float(byte >> 4) - mn0_hi) * float(x_shared[w_base + 32 + l]);
+        }
+
+        if (valid1) {
+            device const uint8_t* sb1 = row1_data + sb_idx * 144;
+            float d1    = float(as_type<half>(ushort(ushort(sb1[0]) | (ushort(sb1[1]) << 8))));
+            float dmin1 = float(as_type<half>(ushort(ushort(sb1[2]) | (ushort(sb1[3]) << 8))));
+            unpack_q4k_scales(sb1 + 4, sc, mn, 8);
+            device const uint8_t* qs1 = sb1 + 16 + g * 32;
+            float sc1_lo = d1 * sc[g * 2], mn1_lo = dmin1 * mn[g * 2];
+            float sc1_hi = d1 * sc[g * 2 + 1], mn1_hi = dmin1 * mn[g * 2 + 1];
+            for (uint j = 0; j < 4; j++) {
+                uint l = l_start + j;
+                uint8_t byte = qs1[l];
+                acc1 += (sc1_lo * float(byte & 0xF) - mn1_lo) * float(x_shared[w_base + l]);
+                acc1 += (sc1_hi * float(byte >> 4) - mn1_hi) * float(x_shared[w_base + 32 + l]);
+            }
         }
     }
 
-    float sum = simd_sum(acc);
+    float sum0 = simd_sum(acc0);
+    float sum1 = simd_sum(acc1);
     if (simd_lane == 0) {
-        out[row] = sum;
+        out[row0] = sum0;
+        if (valid1) out[row1] = sum1;
     }
 }
 
@@ -1221,53 +1244,85 @@ kernel void dequant_matvec_q6k(
     uint simd_lane  [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
-    uint row = tgid * ROWS_PER_TG + simd_group;
-    if (row >= out_dim) return;
+    uint row0 = tgid * (ROWS_PER_TG * 2) + simd_group * 2;
+    uint row1 = row0 + 1;
+    bool valid0 = row0 < out_dim;
+    bool valid1 = row1 < out_dim;
 
     threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
     for (uint i = lid; i < in_dim; i += tg_size) {
         x_shared[i] = half(x[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!valid0) return;
 
     uint num_superblocks = in_dim / 256;
     uint bytes_per_row = num_superblocks * 210;
-    device const uint8_t* row_data = data + row * bytes_per_row;
+    device const uint8_t* row0_data = data + row0 * bytes_per_row;
+    device const uint8_t* row1_data = valid1 ? data + row1 * bytes_per_row : row0_data;
 
-    float acc = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     // Distribute l values across SIMD lanes — each lane handles one l (0..31)
     // per block, giving 4 weights per block × 2 blocks = 8 weights per superblock
     uint l = simd_lane;
     for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
-        device const uint8_t* sb = row_data + sb_idx * 210;
-        device const uint8_t* ql_base = sb;
-        device const uint8_t* qh_base = sb + 128;
-        device const int8_t* sc_base = (device const int8_t*)(sb + 192);
-        float d = float(as_type<half>(ushort(ushort(sb[208]) | (ushort(sb[209]) << 8))));
         uint x_base = sb_idx * 256;
         uint is = l / 16;
 
+        device const uint8_t* sb0 = row0_data + sb_idx * 210;
+        device const uint8_t* ql0_base = sb0;
+        device const uint8_t* qh0_base = sb0 + 128;
+        device const int8_t* sc0_base = (device const int8_t*)(sb0 + 192);
+        float d0 = float(as_type<half>(ushort(ushort(sb0[208]) | (ushort(sb0[209]) << 8))));
         for (uint blk = 0; blk < 2; blk++) {
-            device const uint8_t* ql = ql_base + blk * 64;
-            device const uint8_t* qh = qh_base + blk * 32;
-            device const int8_t* sc = sc_base + blk * 8;
+            device const uint8_t* ql0 = ql0_base + blk * 64;
+            device const uint8_t* qh0 = qh0_base + blk * 32;
+            device const int8_t* sc0 = sc0_base + blk * 8;
             uint y_off = x_base + blk * 128;
 
-            int q1 = (int)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-            int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-            int q3 = (int)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
-            int q4 = (int)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+            int q1 = (int)((ql0[l]      & 0xF) | (((qh0[l] >> 0) & 3) << 4)) - 32;
+            int q2 = (int)((ql0[l + 32] & 0xF) | (((qh0[l] >> 2) & 3) << 4)) - 32;
+            int q3 = (int)((ql0[l]      >> 4)  | (((qh0[l] >> 4) & 3) << 4)) - 32;
+            int q4 = (int)((ql0[l + 32] >> 4)  | (((qh0[l] >> 6) & 3) << 4)) - 32;
 
-            acc += d * (float)sc[is + 0] * (float)q1 * float(x_shared[y_off + l]);
-            acc += d * (float)sc[is + 2] * (float)q2 * float(x_shared[y_off + l + 32]);
-            acc += d * (float)sc[is + 4] * (float)q3 * float(x_shared[y_off + l + 64]);
-            acc += d * (float)sc[is + 6] * (float)q4 * float(x_shared[y_off + l + 96]);
+            acc0 += d0 * (float)sc0[is + 0] * (float)q1 * float(x_shared[y_off + l]);
+            acc0 += d0 * (float)sc0[is + 2] * (float)q2 * float(x_shared[y_off + l + 32]);
+            acc0 += d0 * (float)sc0[is + 4] * (float)q3 * float(x_shared[y_off + l + 64]);
+            acc0 += d0 * (float)sc0[is + 6] * (float)q4 * float(x_shared[y_off + l + 96]);
+        }
+
+        if (valid1) {
+            device const uint8_t* sb1 = row1_data + sb_idx * 210;
+            device const uint8_t* ql1_base = sb1;
+            device const uint8_t* qh1_base = sb1 + 128;
+            device const int8_t* sc1_base = (device const int8_t*)(sb1 + 192);
+            float d1 = float(as_type<half>(ushort(ushort(sb1[208]) | (ushort(sb1[209]) << 8))));
+
+            for (uint blk = 0; blk < 2; blk++) {
+                device const uint8_t* ql1 = ql1_base + blk * 64;
+                device const uint8_t* qh1 = qh1_base + blk * 32;
+                device const int8_t* sc1 = sc1_base + blk * 8;
+                uint y_off = x_base + blk * 128;
+
+                int q1 = (int)((ql1[l]      & 0xF) | (((qh1[l] >> 0) & 3) << 4)) - 32;
+                int q2 = (int)((ql1[l + 32] & 0xF) | (((qh1[l] >> 2) & 3) << 4)) - 32;
+                int q3 = (int)((ql1[l]      >> 4)  | (((qh1[l] >> 4) & 3) << 4)) - 32;
+                int q4 = (int)((ql1[l + 32] >> 4)  | (((qh1[l] >> 6) & 3) << 4)) - 32;
+
+                acc1 += d1 * (float)sc1[is + 0] * (float)q1 * float(x_shared[y_off + l]);
+                acc1 += d1 * (float)sc1[is + 2] * (float)q2 * float(x_shared[y_off + l + 32]);
+                acc1 += d1 * (float)sc1[is + 4] * (float)q3 * float(x_shared[y_off + l + 64]);
+                acc1 += d1 * (float)sc1[is + 6] * (float)q4 * float(x_shared[y_off + l + 96]);
+            }
         }
     }
 
-    float sum = simd_sum(acc);
+    float sum0 = simd_sum(acc0);
+    float sum1 = simd_sum(acc1);
     if (simd_lane == 0) {
-        out[row] = sum;
+        out[row0] = sum0;
+        if (valid1) out[row1] = sum1;
     }
 }
 kernel void batch_expert_mv_q4k_dyn(

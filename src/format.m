@@ -17,6 +17,17 @@
 // ============================================================================
 
 #define FORMAT_ROWS_PER_TG 16
+#define FORMAT_TWO_ROW_MULTIPLIER 2
+
+static inline uint format_effective_rows_per_tg(QuantFormat fmt) {
+    switch (fmt) {
+        case QFMT_GGUF_Q4_K:
+        case QFMT_GGUF_Q6_K:
+            return FORMAT_ROWS_PER_TG * FORMAT_TWO_ROW_MULTIPLIER;
+        default:
+            return FORMAT_ROWS_PER_TG;
+    }
+}
 
 void format_dispatch_matvec(
     id<MTLComputeCommandEncoder> enc,
@@ -71,7 +82,7 @@ void format_dispatch_matvec(
         }
     }
 
-    uint rows_per_tg = FORMAT_ROWS_PER_TG;
+    uint rows_per_tg = format_effective_rows_per_tg(ref->format);
     NSUInteger num_tgs = (ref->out_dim + rows_per_tg - 1) / rows_per_tg;
     NSUInteger tg_size = FORMAT_ROWS_PER_TG * 32; // 512 threads
     [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
