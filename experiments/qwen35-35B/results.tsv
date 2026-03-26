@@ -1,0 +1,81 @@
+commit	tok_sec	ttft_ms	proj_avg_ms	status	description
+0dd5b00	46.88	2252.4	1.1011	keep	baseline: current GGUF-only HEAD before 2-row matvec experiment
+n/a	47.19	2241.2	1.1011	keep	2-row-per-simdgroup GGUF Q4_K/Q6_K matvec: halve projection and LM-head TG count
+n/a	47.24	2143.7	1.1011	keep	2-row-per-simdgroup expert down kernels for GGUF Q4_K/Q5_K
+n/a	47.31	2145.6	1.1011	keep	fuse GGUF routed expert gate+up+SwiGLU into one kernel
+n/a	47.32	2166.1	1.1011	keep	fuse GGUF shared expert gate+up+SwiGLU into one kernel
+n/a	46.85	2194.1	1.1011	discard	2-row-per-simdgroup fused routed+shared expert gate/up kernels
+aab62c5	47.49	2074.9	1.1011	keep	re-benchmark restored HEAD after discarding 2-row fused gate/up experiment
+932ce2a	47.28	2145.5	1.1011	keep	baseline: re-benchmark current GGUF HEAD before per-group Q4_K scale decode experiment
+n/a	48.22	2099.4	1.1011	keep	specialize Q4_K scale unpack to per-group pairs in hot GGUF Q4_K/Q5_K kernels
+4cb4516	1.04	3016.0	0.0	keep	baseline: naive single-dispatch GPU, CPU experts
+499b87b	1.05	76440.0	0.0	keep	batch linear attn projections (qkv/z/a/b) into single GPU commit
+e259b59	1.06	75388.0	0.0	keep	batch MoE routing+shared expert gate/up/shared_gate into single GPU commit
+4559430	13.12	7823.0	0.0	keep	GPU expert forward: gate+up batch + down batch per layer, 12.5x speedup
+d60441a	14.31	7291.0	0.0	keep	fuse expert gate+up/SwiGLU/down into 1 GPU commit instead of 2
+ea79cbf	15.65	6785.0	0.0	keep	fuse shared expert SwiGLU+down into expert GPU command buffer
+n/a	0	0	0	discard	ROWS_PER_TG tuning: 4=14.13, 8=15.88, 16=15.65, 32=15.96 — 16 is optimal
+n/a	15.45	6839.0	0.0	discard	eliminate calloc/free in full attn scores — within noise, negligible impact
+n/a	2.72	31115.0	0.0	discard	move O proj from GPU to CPU — 5.7x regression, CPU dequant matvec too slow
+0fe717d	17.03	6294.0	0.0	keep	fuse O-proj+post-norm+MoE routing into 1 GPU commit (saves 80 commits/tok)
+560c4ad	17.81	6224.0	0.0	keep	use Accelerate cblas_sgemv for full attention dot-product
+n/a	17.84	6225.0	0.0	discard	GPU moe_combine_residual kernel — within noise, adds complexity
+5f2790e	28.04	4597.0	0.0	keep	fuse linear attn pipeline into 1 GPU commit: projs+conv1d+delta_net+O-proj+norm+routing
+08fe72f	28.76	4511.0	0.0	keep	fuse full attn pipeline into 1 GPU commit: QKV+QK norm+RoPE+KV+attn+O-proj+norm+routing
+83c726e	37.35	3841.0	0.0	keep	GPU-resident hidden + async expert forward: eliminate 40 CPU↔GPU round-trips/token
+d364582	43.77	3552.0	0.0	keep	batched expert kernels: gate+up+down+swiglu+combine use batch dispatches (34→6 per layer)
+f0e9d7d	44.06	3519.0	0.0	keep	fuse final norm + lm_head into single GPU commit (eliminates 1 CPU↔GPU round-trip)
+n/a	43.26	3525.0	0.0	discard	fuse attn+routing+experts into 1 GPU commit/layer (GPU softmax_topk) — regression, extra barriers outweigh saved commit overhead
+n/a	43.72	3536.0	0.0	discard	fused RMS norm kernel (1 dispatch vs 2) — slight regression, reduced parallelism in apply phase
+n/a	22.86	5097.0	0.0	discard	GPU softmax_topk_route for full attn layers — 2x regression, async path causes GPU stall
+n/a	44.18	3515.0	0.0	discard	eliminate blit encoder with in-place residual add — within noise, blit is negligible
+n/a	44.13	3531.0	0.0	discard	commandBufferWithUnretainedReferences — within noise, ARC overhead is negligible
+f8aad22	48.08	3315.0	0.0	keep	GPU softmax+topk routing: eliminate 40 CPU-GPU sync points/token, single CB per layer
+n/a	0	0	0	discard	ROWS_PER_TG tuning at 48 tok/s: 8=44.98, 16=48.08, 32=47.07 — 16 still optimal
+n/a	48.01	3319.0	0.0	discard	eliminate blit encoder with in-place residual add — within noise, changed token output
+n/a	47.74	3311.0	0.0	discard	fused residual_add+norm kernel (1 dispatch vs 3) — slight regression, single TG reduces parallelism
+n/a	48.02	3305.0	0.0	discard	-O3 compiler flag — within noise, no measurable improvement
+n/a	48.11	3347.0	0.0	discard	fused RMS norm kernel (sum_sq+apply in 1 dispatch, 1024 threads) — within noise
+n/a	48.01	3321.0	0.0	discard	reduced expert shared memory (4096→2048/512 floats) — within noise, occupancy not bottleneck
+ee30a0e	49.25	3276.0	0.0	keep	fuse expert gate+up+SwiGLU into 1 kernel: eliminate 80 dispatches + 40 barriers/token
+n/a	47.36	3327.0	0.0	discard	register-cached delta_net state (float s[128]) — 4% regression, register spilling
+03641d7	49.34	3272.0	0.0	keep	threadgroup k/q in delta_net: shared memory for k,q vectors across 128 threads
+7bba7c7	51.05	3176.0	0.0	keep	single command buffer for entire forward pass: 1 CB instead of 41 per token
+n/a	50.33	3200.0	0.0	discard	fused normed matvec kernel: inline RMS norm during x_shared load — regression, extra TG barriers outweigh saved dispatches
+44974d9	52.40	3174.0	0.0	keep	per-layer CBs with compute copy kernel: eliminates blit transitions, preserves pipelining
+n/a	52.50	3163.0	0.0	discard	fuse O-proj+residual add via matvec_residual + eliminate copy_buffer — within noise
+n/a	51.01	3167.0	0.0	discard	single command buffer for all layers (re-test) — regression from deferred GPU start
+n/a	52.75	3167.0	0.0	discard	batched CBs (2/4/8 layers per CB) — within noise, CB overhead not the bottleneck
+n/a	52.44	3201.0	0.0	discard	MADV_SEQUENTIAL for expert mmap — within noise, data already warm in RAM
+n/a	52.46	3167.0	0.0	discard	ping-pong buffering: eliminate copy_buffer dispatch+barrier per layer — within noise
+d8047bb	57.09	3048.0	0.0	keep	concurrent GPU dispatch: overlap independent matvecs between barriers (9% improvement)
+n/a	57.17	3044.0	0.0	discard	ping-pong buffering + concurrent dispatch — within noise of concurrent-only
+n/a	55.17	3053.0	0.0	discard	single CB + concurrent dispatch — regression, extra trailing barrier + deferred start outweigh CB savings
+n/a	57.29	3078.0	0.0	discard	remove copy_buffer barriers (allow overlap with norm_sum_sq) — within noise
+d9549de	57.86	3058.0	0.0	keep	half-precision threadgroup memory in all matvec kernels (8KB vs 16KB x_shared)
+n/a	57.33	3047.0	0.0	discard	ROWS_PER_TG=32 with half-precision shared memory — slight regression, 16 still optimal
+n/a	58.09	3041.0	0.0	discard	2-wide vectorized weight loads in main matvec kernel — within noise
+n/a	57.87	3030.0	0.0	discard	fused residual_add+norm_sum_sq kernel (saves 40 barriers) — within noise, single TG bottleneck
+246b806	58.62	3016.0	0.0	keep	half-precision delta_net state: halve linear attention state bandwidth
+n/a	58.12	3052.0	0.0	discard	merge delta_net loops 2+3 only (no half-precision state) — within noise
+n/a	58.15	3022.0	0.0	discard	remove copy_buffer barrier (concurrent with norm_sum_sq) — within noise
+n/a	58.03	3022.0	0.0	discard	ROWS_PER_TG=24 with half-precision delta_net state — slight regression, 16 still optimal
+9c64472	58.92	3007.0	0.0	keep	precompute weight byte offsets: eliminate ~1200 hash lookups/token
+n/a	58.98	3020.0	0.0	discard	command queue depth 64 — within noise
+n/a	59.0	3033.0	0.0	discard	eliminate copy_buffer with in-place residual add — within noise (40 dispatches + 40 barriers removed)
+n/a	58.58	3026.0	0.0	discard	normed matvec kernel for input norm projections — slight regression, per-TG barrier overhead in 770+ TGs outweighs 2 device barriers saved
+06414b4	59.46	2996.0	0.0	keep	fuse moe_combine with copy_buffer + norm_sum_sq: save 78 dispatches + 78 barriers/token
+n/a	58.93	3017.0	0.0	discard	normed routing matvec (4 routing projections) — within noise vs 58.92
+6e60c64	61.06	2973.0	0.0	keep	2-row-per-simdgroup matvec: halve TG count while keeping 512 threads
+n/a	59.30	0	0.0	discard	4-row-per-simdgroup matvec — register pressure causes regression vs 2-row
+n/a	61.13	2953.0	0.0	discard	shared expert down with 2-row matvec — within noise
+9b3184f	62.0	2943.0	0.0	keep	2-row expert down projection: halve TG count for expert down matvec
+n/a	62.25	2974.0	0.0	discard	2-row expert gate+up+SwiGLU — within noise, register pressure offsets TG reduction
+b5a3bcb	61.91	1481.0	0.0	keep	mlock expert pages: pre-fault all expert mmap pages (TTFT halved)
+4532cb3	62.02	1377.0	0.0	keep	mlock non-expert weights: pre-fault weight file pages (TTFT further reduced)
+n/a	57.25	1493.0	0.0	discard	transposed delta_net state for simdgroup coalescing — 8% regression, sequential prefetch > coalescing for L2-resident data
+n/a	55.12	1534.0	0.0	discard	remove all barriers + serial encoders — 11% regression, losing concurrent dispatch outweighs barrier savings
+n/a	60.85	1384.0	0.0	discard	per-head attn scores kernel — 2% regression vs true baseline 62.06, underutilizes GPU with only 16 TGs
+n/a	60.06	1420.0	0.0	discard	inline decay_beta into delta_net: data race (missing barrier after QK norm) + 3% regression
+e82b32a	62.39	1369.0	0.0	keep	GPU argmax: eliminate 993KB logits readback + CPU argmax scan
+n/a	62.53	1362.0	0.0	discard	fused QK weighted norm + RoPE kernel (full attn) — within noise, shared memory overhead offsets saved dispatches

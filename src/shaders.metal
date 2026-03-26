@@ -997,20 +997,29 @@ kernel void matvec_f32(
 //                 scales[4..7] in low 4 bits of bytes 8..9 | high 2 bits of bytes 0..3,
 //                 mins[0..3] in low 6 bits of bytes 4..7,
 //                 mins[4..7] in low 4 bits of bytes 10..11 | high 2 bits of bytes 4..7.
-inline void unpack_q4k_scales(device const uint8_t* sc_data,
-                               thread float* sc, thread float* mn, int count) {
-    // First 4 scales and mins: lower 6 bits of bytes 0..3 and 4..7
-    for (int i = 0; i < 4 && i < count; i++) {
-        sc[i] = float(sc_data[i] & 63);
-        mn[i] = float(sc_data[i + 4] & 63);
+inline void unpack_q4k_scale_min_pair(device const uint8_t* sc_data,
+                                      uint g,
+                                      thread float* sc_lo,
+                                      thread float* sc_hi,
+                                      thread float* mn_lo,
+                                      thread float* mn_hi) {
+    if (g < 2) {
+        uint base = g * 2;
+        *sc_lo = float(sc_data[base] & 63);
+        *sc_hi = float(sc_data[base + 1] & 63);
+        *mn_lo = float(sc_data[base + 4] & 63);
+        *mn_hi = float(sc_data[base + 5] & 63);
+        return;
     }
-    // Next 4 scales and mins: combine high bits
-    for (int i = 0; i < 4 && i + 4 < count; i++) {
-        sc[i + 4] = float(((sc_data[8 + i/2] >> (4 * (i % 2))) & 0xF)
-                  | ((sc_data[i] >> 6) << 4));
-        mn[i + 4] = float(((sc_data[10 + i/2] >> (4 * (i % 2))) & 0xF)
-                  | ((sc_data[i + 4] >> 6) << 4));
-    }
+
+    uint base = (g - 2) * 2;
+    uint upper = g - 2;
+    uint8_t sc_pack = sc_data[8 + upper];
+    uint8_t mn_pack = sc_data[10 + upper];
+    *sc_lo = float((sc_pack & 0xF) | ((sc_data[base] >> 6) << 4));
+    *sc_hi = float((sc_pack >> 4) | ((sc_data[base + 1] >> 6) << 4));
+    *mn_lo = float((mn_pack & 0xF) | ((sc_data[base + 4] >> 6) << 4));
+    *mn_hi = float((mn_pack >> 4) | ((sc_data[base + 5] >> 6) << 4));
 }
 
 kernel void dequant_matvec_q4k(
@@ -1046,14 +1055,14 @@ kernel void dequant_matvec_q4k(
     uint l_start = (simd_lane % 8) * 4;
     for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
         device const uint8_t* sb0 = row0_data + sb_idx * 144;
-        float sc[8], mn[8];
+        float sc_lo, sc_hi, mn_lo, mn_hi;
         uint w_base = sb_idx * 256 + g * 64;
         float d0    = float(as_type<half>(ushort(ushort(sb0[0]) | (ushort(sb0[1]) << 8))));
         float dmin0 = float(as_type<half>(ushort(ushort(sb0[2]) | (ushort(sb0[3]) << 8))));
-        unpack_q4k_scales(sb0 + 4, sc, mn, 8);
+        unpack_q4k_scale_min_pair(sb0 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
         device const uint8_t* qs0 = sb0 + 16 + g * 32;
-        float sc0_lo = d0 * sc[g * 2], mn0_lo = dmin0 * mn[g * 2];
-        float sc0_hi = d0 * sc[g * 2 + 1], mn0_hi = dmin0 * mn[g * 2 + 1];
+        float sc0_lo = d0 * sc_lo, mn0_lo = dmin0 * mn_lo;
+        float sc0_hi = d0 * sc_hi, mn0_hi = dmin0 * mn_hi;
         for (uint j = 0; j < 4; j++) {
             uint l = l_start + j;
             uint8_t byte = qs0[l];
@@ -1065,10 +1074,10 @@ kernel void dequant_matvec_q4k(
             device const uint8_t* sb1 = row1_data + sb_idx * 144;
             float d1    = float(as_type<half>(ushort(ushort(sb1[0]) | (ushort(sb1[1]) << 8))));
             float dmin1 = float(as_type<half>(ushort(ushort(sb1[2]) | (ushort(sb1[3]) << 8))));
-            unpack_q4k_scales(sb1 + 4, sc, mn, 8);
+            unpack_q4k_scale_min_pair(sb1 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
             device const uint8_t* qs1 = sb1 + 16 + g * 32;
-            float sc1_lo = d1 * sc[g * 2], mn1_lo = dmin1 * mn[g * 2];
-            float sc1_hi = d1 * sc[g * 2 + 1], mn1_hi = dmin1 * mn[g * 2 + 1];
+            float sc1_lo = d1 * sc_lo, mn1_lo = dmin1 * mn_lo;
+            float sc1_hi = d1 * sc_hi, mn1_hi = dmin1 * mn_hi;
             for (uint j = 0; j < 4; j++) {
                 uint l = l_start + j;
                 uint8_t byte = qs1[l];
@@ -1195,20 +1204,20 @@ kernel void dequant_matvec_q5k(
         device const uint8_t* sb = row_data + sb_idx * 176;
         float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
         float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
-        float sc[8], mn[8];
-        unpack_q4k_scales(sb + 4, sc, mn, 8);
+        float sc_lo, sc_hi, mn_lo, mn_hi;
+        unpack_q4k_scale_min_pair(sb + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
         device const uint8_t* qh = sb + 16;
         device const uint8_t* ql = sb + 48 + g * 32;
         uint w_base = sb_idx * 256 + g * 64;
-        float sc_lo = d * sc[g * 2], mn_lo = dmin * mn[g * 2];
-        float sc_hi = d * sc[g * 2 + 1], mn_hi = dmin * mn[g * 2 + 1];
+        float q_sc_lo = d * sc_lo, q_mn_lo = dmin * mn_lo;
+        float q_sc_hi = d * sc_hi, q_mn_hi = dmin * mn_hi;
         for (uint j = 0; j < 4; j++) {
             uint l = l_start + j;
             uint8_t byte_val = ql[l];
             uint8_t q5_lo = (byte_val & 0xF) | ((qh[l] & hm_lo) ? 16 : 0);
             uint8_t q5_hi = (byte_val >> 4) | ((qh[l] & hm_hi) ? 16 : 0);
-            acc += (sc_lo * float(q5_lo) - mn_lo) * float(x_shared[w_base + l]);
-            acc += (sc_hi * float(q5_hi) - mn_hi) * float(x_shared[w_base + 32 + l]);
+            acc += (q_sc_lo * float(q5_lo) - q_mn_lo) * float(x_shared[w_base + l]);
+            acc += (q_sc_hi * float(q5_hi) - q_mn_hi) * float(x_shared[w_base + 32 + l]);
         }
     }
 
@@ -1364,17 +1373,17 @@ kernel void batch_expert_mv_q4k_dyn(
         device const uint8_t* sb = row_data + sb_idx * 144;
         float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
         float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
-        float sc[8], mn[8];
-        unpack_q4k_scales(sb + 4, sc, mn, 8);
+        float sc_lo, sc_hi, mn_lo, mn_hi;
+        unpack_q4k_scale_min_pair(sb + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
         device const uint8_t* qs = sb + 16 + g * 32;
         uint w_base = sb_idx * 256 + g * 64;
-        float sc_lo = d * sc[g * 2], mn_lo = dmin * mn[g * 2];
-        float sc_hi = d * sc[g * 2 + 1], mn_hi = dmin * mn[g * 2 + 1];
+        float q_sc_lo = d * sc_lo, q_mn_lo = dmin * mn_lo;
+        float q_sc_hi = d * sc_hi, q_mn_hi = dmin * mn_hi;
         for (uint j = 0; j < 4; j++) {
             uint l = l_start + j;
             uint8_t byte = qs[l];
-            acc += (sc_lo * float(byte & 0xF) - mn_lo) * float(x_shared[w_base + l]);
-            acc += (sc_hi * float(byte >> 4) - mn_hi) * float(x_shared[w_base + 32 + l]);
+            acc += (q_sc_lo * float(byte & 0xF) - q_mn_lo) * float(x_shared[w_base + l]);
+            acc += (q_sc_hi * float(byte >> 4) - q_mn_hi) * float(x_shared[w_base + 32 + l]);
         }
     }
     float sum = simd_sum(acc);
@@ -1426,15 +1435,15 @@ kernel void batch_expert_gate_up_swiglu_q4k_dyn(
     uint l_start = (simd_lane % 8) * 4;
     for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
         uint w_base = sb_idx * 256 + g * 64;
-        float sc[8], mn[8];
+        float sc_lo, sc_hi, mn_lo, mn_hi;
 
         device const uint8_t* gate_sb = gate_row_data + sb_idx * 144;
         float gate_d = float(as_type<half>(ushort(ushort(gate_sb[0]) | (ushort(gate_sb[1]) << 8))));
         float gate_dmin = float(as_type<half>(ushort(ushort(gate_sb[2]) | (ushort(gate_sb[3]) << 8))));
-        unpack_q4k_scales(gate_sb + 4, sc, mn, 8);
+        unpack_q4k_scale_min_pair(gate_sb + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
         device const uint8_t* gate_qs = gate_sb + 16 + g * 32;
-        float gate_sc_lo = gate_d * sc[g * 2], gate_mn_lo = gate_dmin * mn[g * 2];
-        float gate_sc_hi = gate_d * sc[g * 2 + 1], gate_mn_hi = gate_dmin * mn[g * 2 + 1];
+        float gate_sc_lo = gate_d * sc_lo, gate_mn_lo = gate_dmin * mn_lo;
+        float gate_sc_hi = gate_d * sc_hi, gate_mn_hi = gate_dmin * mn_hi;
         for (uint j = 0; j < 4; j++) {
             uint l = l_start + j;
             uint8_t byte = gate_qs[l];
@@ -1445,10 +1454,10 @@ kernel void batch_expert_gate_up_swiglu_q4k_dyn(
         device const uint8_t* up_sb = up_row_data + sb_idx * 144;
         float up_d = float(as_type<half>(ushort(ushort(up_sb[0]) | (ushort(up_sb[1]) << 8))));
         float up_dmin = float(as_type<half>(ushort(ushort(up_sb[2]) | (ushort(up_sb[3]) << 8))));
-        unpack_q4k_scales(up_sb + 4, sc, mn, 8);
+        unpack_q4k_scale_min_pair(up_sb + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
         device const uint8_t* up_qs = up_sb + 16 + g * 32;
-        float up_sc_lo = up_d * sc[g * 2], up_mn_lo = up_dmin * mn[g * 2];
-        float up_sc_hi = up_d * sc[g * 2 + 1], up_mn_hi = up_dmin * mn[g * 2 + 1];
+        float up_sc_lo = up_d * sc_lo, up_mn_lo = up_dmin * mn_lo;
+        float up_sc_hi = up_d * sc_hi, up_mn_hi = up_dmin * mn_hi;
         for (uint j = 0; j < 4; j++) {
             uint l = l_start + j;
             uint8_t byte = up_qs[l];
@@ -1502,15 +1511,15 @@ kernel void shared_gate_up_swiglu_q4k(
     uint l_start = (simd_lane % 8) * 4;
     for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
         uint w_base = sb_idx * 256 + g * 64;
-        float sc[8], mn[8];
+        float sc_lo, sc_hi, mn_lo, mn_hi;
 
         device const uint8_t* gate_sb = gate_row_data + sb_idx * 144;
         float gate_d = float(as_type<half>(ushort(ushort(gate_sb[0]) | (ushort(gate_sb[1]) << 8))));
         float gate_dmin = float(as_type<half>(ushort(ushort(gate_sb[2]) | (ushort(gate_sb[3]) << 8))));
-        unpack_q4k_scales(gate_sb + 4, sc, mn, 8);
+        unpack_q4k_scale_min_pair(gate_sb + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
         device const uint8_t* gate_qs = gate_sb + 16 + g * 32;
-        float gate_sc_lo = gate_d * sc[g * 2], gate_mn_lo = gate_dmin * mn[g * 2];
-        float gate_sc_hi = gate_d * sc[g * 2 + 1], gate_mn_hi = gate_dmin * mn[g * 2 + 1];
+        float gate_sc_lo = gate_d * sc_lo, gate_mn_lo = gate_dmin * mn_lo;
+        float gate_sc_hi = gate_d * sc_hi, gate_mn_hi = gate_dmin * mn_hi;
         for (uint j = 0; j < 4; j++) {
             uint l = l_start + j;
             uint8_t byte = gate_qs[l];
@@ -1521,10 +1530,10 @@ kernel void shared_gate_up_swiglu_q4k(
         device const uint8_t* up_sb = up_row_data + sb_idx * 144;
         float up_d = float(as_type<half>(ushort(ushort(up_sb[0]) | (ushort(up_sb[1]) << 8))));
         float up_dmin = float(as_type<half>(ushort(ushort(up_sb[2]) | (ushort(up_sb[3]) << 8))));
-        unpack_q4k_scales(up_sb + 4, sc, mn, 8);
+        unpack_q4k_scale_min_pair(up_sb + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
         device const uint8_t* up_qs = up_sb + 16 + g * 32;
-        float up_sc_lo = up_d * sc[g * 2], up_mn_lo = up_dmin * mn[g * 2];
-        float up_sc_hi = up_d * sc[g * 2 + 1], up_mn_hi = up_dmin * mn[g * 2 + 1];
+        float up_sc_lo = up_d * sc_lo, up_mn_lo = up_dmin * mn_lo;
+        float up_sc_hi = up_d * sc_hi, up_mn_hi = up_dmin * mn_hi;
         for (uint j = 0; j < 4; j++) {
             uint l = l_start + j;
             uint8_t byte = up_qs[l];
@@ -1585,14 +1594,14 @@ kernel void batch_expert_down_q4k_dyn(
     uint l_start = (simd_lane % 8) * 4;
     for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
         device const uint8_t* sb0 = row0_data + sb_idx * 144;
-        float sc[8], mn[8];
+        float sc_lo, sc_hi, mn_lo, mn_hi;
         uint w_base = sb_idx * 256 + g * 64;
         float d0    = float(as_type<half>(ushort(ushort(sb0[0]) | (ushort(sb0[1]) << 8))));
         float dmin0 = float(as_type<half>(ushort(ushort(sb0[2]) | (ushort(sb0[3]) << 8))));
-        unpack_q4k_scales(sb0 + 4, sc, mn, 8);
+        unpack_q4k_scale_min_pair(sb0 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
         device const uint8_t* qs0 = sb0 + 16 + g * 32;
-        float sc0_lo = d0 * sc[g * 2], mn0_lo = dmin0 * mn[g * 2];
-        float sc0_hi = d0 * sc[g * 2 + 1], mn0_hi = dmin0 * mn[g * 2 + 1];
+        float sc0_lo = d0 * sc_lo, mn0_lo = dmin0 * mn_lo;
+        float sc0_hi = d0 * sc_hi, mn0_hi = dmin0 * mn_hi;
         for (uint j = 0; j < 4; j++) {
             uint l = l_start + j;
             uint8_t byte = qs0[l];
@@ -1604,10 +1613,10 @@ kernel void batch_expert_down_q4k_dyn(
             device const uint8_t* sb1 = row1_data + sb_idx * 144;
             float d1    = float(as_type<half>(ushort(ushort(sb1[0]) | (ushort(sb1[1]) << 8))));
             float dmin1 = float(as_type<half>(ushort(ushort(sb1[2]) | (ushort(sb1[3]) << 8))));
-            unpack_q4k_scales(sb1 + 4, sc, mn, 8);
+            unpack_q4k_scale_min_pair(sb1 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
             device const uint8_t* qs1 = sb1 + 16 + g * 32;
-            float sc1_lo = d1 * sc[g * 2], mn1_lo = dmin1 * mn[g * 2];
-            float sc1_hi = d1 * sc[g * 2 + 1], mn1_hi = dmin1 * mn[g * 2 + 1];
+            float sc1_lo = d1 * sc_lo, mn1_lo = dmin1 * mn_lo;
+            float sc1_hi = d1 * sc_hi, mn1_hi = dmin1 * mn_hi;
             for (uint j = 0; j < 4; j++) {
                 uint l = l_start + j;
                 uint8_t byte = qs1[l];
@@ -1671,15 +1680,15 @@ kernel void batch_expert_down_q5k_dyn(
     uint8_t hm_hi = 1u << (g * 2 + 1);
     for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
         device const uint8_t* sb0 = row0_data + sb_idx * 176;
-        float sc[8], mn[8];
+        float sc_lo, sc_hi, mn_lo, mn_hi;
         uint w_base = sb_idx * 256 + g * 64;
         float d0    = float(as_type<half>(ushort(ushort(sb0[0]) | (ushort(sb0[1]) << 8))));
         float dmin0 = float(as_type<half>(ushort(ushort(sb0[2]) | (ushort(sb0[3]) << 8))));
-        unpack_q4k_scales(sb0 + 4, sc, mn, 8);
+        unpack_q4k_scale_min_pair(sb0 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
         device const uint8_t* qh0 = sb0 + 16;
         device const uint8_t* ql0 = sb0 + 48 + g * 32;
-        float sc0_lo = d0 * sc[g * 2], mn0_lo = dmin0 * mn[g * 2];
-        float sc0_hi = d0 * sc[g * 2 + 1], mn0_hi = dmin0 * mn[g * 2 + 1];
+        float sc0_lo = d0 * sc_lo, mn0_lo = dmin0 * mn_lo;
+        float sc0_hi = d0 * sc_hi, mn0_hi = dmin0 * mn_hi;
         for (uint j = 0; j < 4; j++) {
             uint l = l_start + j;
             uint8_t byte_val = ql0[l];
@@ -1693,11 +1702,11 @@ kernel void batch_expert_down_q5k_dyn(
             device const uint8_t* sb1 = row1_data + sb_idx * 176;
             float d1    = float(as_type<half>(ushort(ushort(sb1[0]) | (ushort(sb1[1]) << 8))));
             float dmin1 = float(as_type<half>(ushort(ushort(sb1[2]) | (ushort(sb1[3]) << 8))));
-            unpack_q4k_scales(sb1 + 4, sc, mn, 8);
+            unpack_q4k_scale_min_pair(sb1 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
             device const uint8_t* qh1 = sb1 + 16;
             device const uint8_t* ql1 = sb1 + 48 + g * 32;
-            float sc1_lo = d1 * sc[g * 2], mn1_lo = dmin1 * mn[g * 2];
-            float sc1_hi = d1 * sc[g * 2 + 1], mn1_hi = dmin1 * mn[g * 2 + 1];
+            float sc1_lo = d1 * sc_lo, mn1_lo = dmin1 * mn_lo;
+            float sc1_hi = d1 * sc_hi, mn1_hi = dmin1 * mn_hi;
             for (uint j = 0; j < 4; j++) {
                 uint l = l_start + j;
                 uint8_t byte_val = ql1[l];
