@@ -19,341 +19,7 @@ inline float bf16_to_f32(uint16_t bf16) {
     return as_type<float>(uint(bf16) << 16);
 }
 
-// ============================================================================
-// Kernel 1c: FULLY OPTIMIZED 4-bit dequant matvec
-// ============================================================================
-
 #define ROWS_PER_TG 16
-
-kernel void dequant_matvec_4bit_v3(
-    device const uint32_t* W_packed   [[buffer(0)]],
-    device const uint16_t* scales     [[buffer(1)]],
-    device const uint16_t* biases     [[buffer(2)]],
-    device const float*    x          [[buffer(3)]],
-    device float*          out        [[buffer(4)]],
-    constant uint&         out_dim    [[buffer(5)]],
-    constant uint&         in_dim     [[buffer(6)]],
-    constant uint&         group_size [[buffer(7)]],
-    uint tgid   [[threadgroup_position_in_grid]],
-    uint lid    [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
-) {
-    uint row = tgid * ROWS_PER_TG + simd_group;
-
-    uint packed_cols = in_dim / 8;
-    uint num_groups  = in_dim / group_size;
-
-    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (row >= out_dim) return;
-
-    device const uint32_t* w_row = W_packed + row * packed_cols;
-    device const uint16_t* s_row = scales + row * num_groups;
-    device const uint16_t* b_row = biases + row * num_groups;
-
-    float acc = 0.0f;
-
-    for (uint col = simd_lane; col < packed_cols; col += 32) {
-        uint g = col / (group_size / 8);
-        float scale = bf16_to_f32(s_row[g]);
-        float bias  = bf16_to_f32(b_row[g]);
-
-        uint32_t packed = w_row[col];
-        uint x_base = col * 8;
-
-        float x0 = x_shared[x_base + 0];
-        float x1 = x_shared[x_base + 1];
-        float x2 = x_shared[x_base + 2];
-        float x3 = x_shared[x_base + 3];
-        float x4 = x_shared[x_base + 4];
-        float x5 = x_shared[x_base + 5];
-        float x6 = x_shared[x_base + 6];
-        float x7 = x_shared[x_base + 7];
-
-        float sx0 = scale * x0;  float bx0 = bias * x0;
-        float sx1 = scale * x1;  float bx1 = bias * x1;
-        float sx2 = scale * x2;  float bx2 = bias * x2;
-        float sx3 = scale * x3;  float bx3 = bias * x3;
-        float sx4 = scale * x4;  float bx4 = bias * x4;
-        float sx5 = scale * x5;  float bx5 = bias * x5;
-        float sx6 = scale * x6;  float bx6 = bias * x6;
-        float sx7 = scale * x7;  float bx7 = bias * x7;
-
-        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
-        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
-        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
-        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
-        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
-        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
-        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
-        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
-    }
-
-    float sum = simd_sum(acc);
-
-    if (simd_lane == 0) {
-        out[row] = sum;
-    }
-}
-
-// ============================================================================
-// Kernel 1b: 2-row-per-simdgroup 4-bit dequant matvec
-// Each simdgroup computes 2 output rows, doubling effective ROWS_PER_TG to 32
-// while keeping 512 threads (16 simdgroups) for better occupancy than ROWS_PER_TG=32
-// ============================================================================
-
-kernel void dequant_matvec_4bit_2row(
-    device const uint32_t* W_packed   [[buffer(0)]],
-    device const uint16_t* scales     [[buffer(1)]],
-    device const uint16_t* biases     [[buffer(2)]],
-    device const float*    x          [[buffer(3)]],
-    device float*          out        [[buffer(4)]],
-    constant uint&         out_dim    [[buffer(5)]],
-    constant uint&         in_dim     [[buffer(6)]],
-    constant uint&         group_size [[buffer(7)]],
-    uint tgid   [[threadgroup_position_in_grid]],
-    uint lid    [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
-) {
-    uint row0 = tgid * (ROWS_PER_TG * 2) + simd_group * 2;
-    uint row1 = row0 + 1;
-
-    uint packed_cols = in_dim / 8;
-    uint num_groups  = in_dim / group_size;
-
-    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    bool valid0 = (row0 < out_dim);
-    bool valid1 = (row1 < out_dim);
-    if (!valid0) return;
-
-    device const uint32_t* w_row0 = W_packed + row0 * packed_cols;
-    device const uint16_t* s_row0 = scales + row0 * num_groups;
-    device const uint16_t* b_row0 = biases + row0 * num_groups;
-
-    device const uint32_t* w_row1 = valid1 ? W_packed + row1 * packed_cols : w_row0;
-    device const uint16_t* s_row1 = valid1 ? scales + row1 * num_groups : s_row0;
-    device const uint16_t* b_row1 = valid1 ? biases + row1 * num_groups : b_row0;
-
-    float acc0 = 0.0f, acc1 = 0.0f;
-
-    for (uint col = simd_lane; col < packed_cols; col += 32) {
-        uint g = col / (group_size / 8);
-        uint x_base = col * 8;
-
-        float x0 = x_shared[x_base + 0];
-        float x1 = x_shared[x_base + 1];
-        float x2 = x_shared[x_base + 2];
-        float x3 = x_shared[x_base + 3];
-        float x4 = x_shared[x_base + 4];
-        float x5 = x_shared[x_base + 5];
-        float x6 = x_shared[x_base + 6];
-        float x7 = x_shared[x_base + 7];
-
-        // Row 0
-        float scale0 = bf16_to_f32(s_row0[g]);
-        float bias0  = bf16_to_f32(b_row0[g]);
-        uint32_t packed0 = w_row0[col];
-        acc0 += fma(float((packed0 >>  0) & 0xF), scale0 * x0, bias0 * x0);
-        acc0 += fma(float((packed0 >>  4) & 0xF), scale0 * x1, bias0 * x1);
-        acc0 += fma(float((packed0 >>  8) & 0xF), scale0 * x2, bias0 * x2);
-        acc0 += fma(float((packed0 >> 12) & 0xF), scale0 * x3, bias0 * x3);
-        acc0 += fma(float((packed0 >> 16) & 0xF), scale0 * x4, bias0 * x4);
-        acc0 += fma(float((packed0 >> 20) & 0xF), scale0 * x5, bias0 * x5);
-        acc0 += fma(float((packed0 >> 24) & 0xF), scale0 * x6, bias0 * x6);
-        acc0 += fma(float((packed0 >> 28) & 0xF), scale0 * x7, bias0 * x7);
-
-        // Row 1
-        float scale1 = bf16_to_f32(s_row1[g]);
-        float bias1  = bf16_to_f32(b_row1[g]);
-        uint32_t packed1 = w_row1[col];
-        acc1 += fma(float((packed1 >>  0) & 0xF), scale1 * x0, bias1 * x0);
-        acc1 += fma(float((packed1 >>  4) & 0xF), scale1 * x1, bias1 * x1);
-        acc1 += fma(float((packed1 >>  8) & 0xF), scale1 * x2, bias1 * x2);
-        acc1 += fma(float((packed1 >> 12) & 0xF), scale1 * x3, bias1 * x3);
-        acc1 += fma(float((packed1 >> 16) & 0xF), scale1 * x4, bias1 * x4);
-        acc1 += fma(float((packed1 >> 20) & 0xF), scale1 * x5, bias1 * x5);
-        acc1 += fma(float((packed1 >> 24) & 0xF), scale1 * x6, bias1 * x6);
-        acc1 += fma(float((packed1 >> 28) & 0xF), scale1 * x7, bias1 * x7);
-    }
-
-    float sum0 = simd_sum(acc0);
-    float sum1 = simd_sum(acc1);
-
-    if (simd_lane == 0) {
-        out[row0] = sum0;
-        if (valid1) out[row1] = sum1;
-    }
-}
-
-// ============================================================================
-// Batched multi-expert 4-bit matvec — processes K experts in one dispatch
-// Grid: 2D (row_groups × K), threadgroup: ROWS_PER_TG * 32
-// ============================================================================
-
-struct ExpertOffsets {
-    uint w_off;  // byte offset to weights within expert layer data
-    uint s_off;  // byte offset to scales
-    uint b_off;  // byte offset to biases
-};
-
-kernel void batch_expert_matvec_4bit(
-    device const uint8_t*  layer_data  [[buffer(0)]],  // full layer expert data
-    device const float*    x           [[buffer(1)]],  // input vector [in_dim]
-    device float*          out         [[buffer(2)]],  // packed output [K * out_dim]
-    constant ExpertOffsets* offsets     [[buffer(3)]],  // [K] per-expert offsets
-    constant uint&         out_dim     [[buffer(4)]],
-    constant uint&         in_dim      [[buffer(5)]],
-    constant uint&         group_size  [[buffer(6)]],
-    constant uint&         num_row_tgs [[buffer(7)]],   // = ceil(out_dim / ROWS_PER_TG)
-    uint tgid    [[threadgroup_position_in_grid]],      // linearized: row_group + expert * num_row_tgs
-    uint lid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
-) {
-    uint expert = tgid / num_row_tgs;
-    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
-
-    uint packed_cols = in_dim / 8;
-    uint num_groups  = in_dim / group_size;
-
-    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (row >= out_dim) return;
-
-    device const uint32_t* W = (device const uint32_t*)(layer_data + offsets[expert].w_off);
-    device const uint16_t* S = (device const uint16_t*)(layer_data + offsets[expert].s_off);
-    device const uint16_t* B = (device const uint16_t*)(layer_data + offsets[expert].b_off);
-
-    device const uint32_t* w_row = W + row * packed_cols;
-    device const uint16_t* s_row = S + row * num_groups;
-    device const uint16_t* b_row = B + row * num_groups;
-
-    float acc = 0.0f;
-    for (uint col = simd_lane; col < packed_cols; col += 32) {
-        uint g = col / (group_size / 8);
-        float scale = bf16_to_f32(s_row[g]);
-        float bias  = bf16_to_f32(b_row[g]);
-
-        uint32_t packed = w_row[col];
-        uint x_base = col * 8;
-
-        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
-        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
-        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
-        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
-        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
-        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
-        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
-        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
-
-        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
-        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
-        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
-        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
-        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
-        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
-        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
-        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
-    }
-
-    float sum = simd_sum(acc);
-    if (simd_lane == 0) {
-        out[expert * out_dim + row] = sum;
-    }
-}
-
-// Batched multi-expert 4-bit matvec with per-expert packed input
-// Same as batch_expert_matvec_4bit but input is packed [K * in_dim]
-kernel void batch_expert_down_4bit(
-    device const uint8_t*  layer_data  [[buffer(0)]],
-    device const float*    x           [[buffer(1)]],  // packed [K * in_dim]
-    device float*          out         [[buffer(2)]],  // packed [K * out_dim]
-    constant ExpertOffsets* offsets     [[buffer(3)]],
-    constant uint&         out_dim     [[buffer(4)]],
-    constant uint&         in_dim      [[buffer(5)]],
-    constant uint&         group_size  [[buffer(6)]],
-    constant uint&         num_row_tgs [[buffer(7)]],
-    uint tgid    [[threadgroup_position_in_grid]],
-    uint lid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
-) {
-    uint expert = tgid / num_row_tgs;
-    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
-
-    uint packed_cols = in_dim / 8;
-    uint num_groups  = in_dim / group_size;
-
-    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    device const float* x_expert = x + expert * in_dim;
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x_expert[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (row >= out_dim) return;
-
-    device const uint32_t* W = (device const uint32_t*)(layer_data + offsets[expert].w_off);
-    device const uint16_t* S = (device const uint16_t*)(layer_data + offsets[expert].s_off);
-    device const uint16_t* B = (device const uint16_t*)(layer_data + offsets[expert].b_off);
-
-    device const uint32_t* w_row = W + row * packed_cols;
-    device const uint16_t* s_row = S + row * num_groups;
-    device const uint16_t* b_row = B + row * num_groups;
-
-    float acc = 0.0f;
-    for (uint col = simd_lane; col < packed_cols; col += 32) {
-        uint g = col / (group_size / 8);
-        float scale = bf16_to_f32(s_row[g]);
-        float bias  = bf16_to_f32(b_row[g]);
-
-        uint32_t packed = w_row[col];
-        uint x_base = col * 8;
-
-        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
-        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
-        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
-        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
-        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
-        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
-        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
-        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
-
-        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
-        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
-        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
-        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
-        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
-        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
-        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
-        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
-    }
-
-    float sum = simd_sum(acc);
-    if (simd_lane == 0) {
-        out[expert * out_dim + row] = sum;
-    }
-}
 
 // Batched SwiGLU — processes K experts' activations packed sequentially
 kernel void batch_swiglu(
@@ -368,95 +34,6 @@ kernel void batch_swiglu(
     float silu_g = g / (1.0f + exp(-g));
     out[tid] = silu_g * up[tid];
 }
-
-kernel void dequant_matvec_2bit(
-    device const uint32_t* W_packed   [[buffer(0)]],
-    device const uint16_t* scales     [[buffer(1)]],
-    device const uint16_t* biases     [[buffer(2)]],
-    device const float*    x          [[buffer(3)]],
-    device float*          out        [[buffer(4)]],
-    constant uint&         out_dim    [[buffer(5)]],
-    constant uint&         in_dim     [[buffer(6)]],
-    constant uint&         group_size [[buffer(7)]],
-    uint tgid   [[threadgroup_position_in_grid]],
-    uint lid    [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
-) {
-    uint row = tgid * ROWS_PER_TG + simd_group;
-
-    uint packed_cols = in_dim / 16;
-    uint num_groups  = in_dim / group_size;
-
-    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (row >= out_dim) return;
-
-    device const uint32_t* w_row = W_packed + row * packed_cols;
-    device const uint16_t* s_row = scales + row * num_groups;
-    device const uint16_t* b_row = biases + row * num_groups;
-
-    float acc = 0.0f;
-
-    for (uint col = simd_lane; col < packed_cols; col += 32) {
-        uint g = col / (group_size / 16);
-        float scale = bf16_to_f32(s_row[g]);
-        float bias  = bf16_to_f32(b_row[g]);
-
-        uint32_t packed = w_row[col];
-        uint x_base = col * 16;
-
-        float sx0 = scale * x_shared[x_base + 0];   float bx0 = bias * x_shared[x_base + 0];
-        float sx1 = scale * x_shared[x_base + 1];   float bx1 = bias * x_shared[x_base + 1];
-        float sx2 = scale * x_shared[x_base + 2];   float bx2 = bias * x_shared[x_base + 2];
-        float sx3 = scale * x_shared[x_base + 3];   float bx3 = bias * x_shared[x_base + 3];
-        float sx4 = scale * x_shared[x_base + 4];   float bx4 = bias * x_shared[x_base + 4];
-        float sx5 = scale * x_shared[x_base + 5];   float bx5 = bias * x_shared[x_base + 5];
-        float sx6 = scale * x_shared[x_base + 6];   float bx6 = bias * x_shared[x_base + 6];
-        float sx7 = scale * x_shared[x_base + 7];   float bx7 = bias * x_shared[x_base + 7];
-        float sx8 = scale * x_shared[x_base + 8];   float bx8 = bias * x_shared[x_base + 8];
-        float sx9 = scale * x_shared[x_base + 9];   float bx9 = bias * x_shared[x_base + 9];
-        float sx10 = scale * x_shared[x_base + 10]; float bx10 = bias * x_shared[x_base + 10];
-        float sx11 = scale * x_shared[x_base + 11]; float bx11 = bias * x_shared[x_base + 11];
-        float sx12 = scale * x_shared[x_base + 12]; float bx12 = bias * x_shared[x_base + 12];
-        float sx13 = scale * x_shared[x_base + 13]; float bx13 = bias * x_shared[x_base + 13];
-        float sx14 = scale * x_shared[x_base + 14]; float bx14 = bias * x_shared[x_base + 14];
-        float sx15 = scale * x_shared[x_base + 15]; float bx15 = bias * x_shared[x_base + 15];
-
-        acc += fma(float((packed >>  0) & 0x3), sx0, bx0);
-        acc += fma(float((packed >>  2) & 0x3), sx1, bx1);
-        acc += fma(float((packed >>  4) & 0x3), sx2, bx2);
-        acc += fma(float((packed >>  6) & 0x3), sx3, bx3);
-        acc += fma(float((packed >>  8) & 0x3), sx4, bx4);
-        acc += fma(float((packed >> 10) & 0x3), sx5, bx5);
-        acc += fma(float((packed >> 12) & 0x3), sx6, bx6);
-        acc += fma(float((packed >> 14) & 0x3), sx7, bx7);
-        acc += fma(float((packed >> 16) & 0x3), sx8, bx8);
-        acc += fma(float((packed >> 18) & 0x3), sx9, bx9);
-        acc += fma(float((packed >> 20) & 0x3), sx10, bx10);
-        acc += fma(float((packed >> 22) & 0x3), sx11, bx11);
-        acc += fma(float((packed >> 24) & 0x3), sx12, bx12);
-        acc += fma(float((packed >> 26) & 0x3), sx13, bx13);
-        acc += fma(float((packed >> 28) & 0x3), sx14, bx14);
-        acc += fma(float((packed >> 30) & 0x3), sx15, bx15);
-    }
-
-    float sum = simd_sum(acc);
-
-    if (simd_lane == 0) {
-        out[row] = sum;
-    }
-}
-
-// ============================================================================
-// Kernel 4: RMS Normalization
-// ============================================================================
 
 kernel void rms_norm_sum_sq(
     device const float* x       [[buffer(0)]],
@@ -511,57 +88,6 @@ kernel void rms_norm_apply_bf16(
     float w = bf16_to_f32(weight[tid]);
     out[tid] = x[tid] * rms * w;
 }
-
-// RMS norm apply with F32 weights (for GGUF models)
-kernel void rms_norm_apply_f32(
-    device const float*    x       [[buffer(0)]],
-    device const float*    weight  [[buffer(1)]],
-    device const float*    sum_sq  [[buffer(2)]],
-    device float*          out     [[buffer(3)]],
-    constant uint&         dim     [[buffer(4)]],
-    constant float&        eps     [[buffer(5)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid >= dim) return;
-    float rms = rsqrt(sum_sq[0] / float(dim) + eps);
-    out[tid] = x[tid] * rms * weight[tid];
-}
-
-// RMS norm apply partial with F32 weights (for GGUF models)
-kernel void rms_norm_apply_partial_f32(
-    device const float*    x          [[buffer(0)]],
-    device const float*    weight     [[buffer(1)]],
-    device const float*    partial_sq [[buffer(2)]],
-    device float*          out        [[buffer(3)]],
-    constant uint&         dim        [[buffer(4)]],
-    constant float&        eps        [[buffer(5)]],
-    constant uint&         num_parts  [[buffer(6)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid >= dim) return;
-    float total_sq = 0;
-    for (uint i = 0; i < num_parts; i++) total_sq += partial_sq[i];
-    float rms = rsqrt(total_sq / float(dim) + eps);
-    out[tid] = x[tid] * rms * weight[tid];
-}
-
-// ============================================================================
-// Kernel 5: Residual add
-// ============================================================================
-
-kernel void residual_add(
-    device const float* a   [[buffer(0)]],
-    device const float* b   [[buffer(1)]],
-    device float*       out [[buffer(2)]],
-    constant uint&      dim [[buffer(3)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid >= dim) return;
-    out[tid] = a[tid] + b[tid];
-}
-
-// Fused residual add + per-TG partial sum of squares (for subsequent RMS norm)
-// Each threadgroup writes its partial sum_sq to sum_sq_parts[tgid]
 kernel void residual_add_sum_sq(
     device const float* a          [[buffer(0)]],
     device const float* b          [[buffer(1)]],
@@ -877,39 +403,6 @@ kernel void gated_delta_net_step(
 // Conv state layout: [(kernel_size-1) * channels] row-major, state[k * channels + c]
 // kernel_size = 4 (hardcoded), so 3 history slots + 1 new input.
 //
-// Dispatch: conv_dim threads (12288), one per channel.
-
-kernel void conv1d_step(
-    device float *conv_state,         // [(kernel_size-1) * conv_dim] = [3 * conv_dim]
-    device const float *input,        // [conv_dim] current input
-    device const uint16_t *weights,   // [conv_dim * 4] bf16 as uint16 (legacy) or float* (GGUF via conv1d_step_f32)
-    device float *output,             // [conv_dim] convolution output
-    constant uint &conv_dim,          // = 12288
-    uint idx [[thread_position_in_grid]]
-) {
-    if (idx >= conv_dim) return;
-
-    uint w_base = idx * 4;
-    float acc = 0.0f;
-
-    acc += conv_state[0 * conv_dim + idx] * bf16_to_f32(weights[w_base + 0]);
-    acc += conv_state[1 * conv_dim + idx] * bf16_to_f32(weights[w_base + 1]);
-    acc += conv_state[2 * conv_dim + idx] * bf16_to_f32(weights[w_base + 2]);
-
-    float inp = input[idx];
-    acc += inp * bf16_to_f32(weights[w_base + 3]);
-
-    // SiLU activation
-    output[idx] = acc / (1.0f + exp(-acc));
-
-    // Shift history: move slots 1,2 -> 0,1, append input at slot 2
-    conv_state[0 * conv_dim + idx] = conv_state[1 * conv_dim + idx];
-    conv_state[1 * conv_dim + idx] = conv_state[2 * conv_dim + idx];
-    conv_state[2 * conv_dim + idx] = inp;
-}
-
-
-// Conv1d with F32 weights (for GGUF models)
 kernel void conv1d_step_f32(
     device float *conv_state,         // [(kernel_size-1) * conv_dim] = [3 * conv_dim]
     device const float *input,
@@ -1002,28 +495,6 @@ kernel void rms_norm_qk(
 // Kernel 13: Compute g_decay and beta_gate for GatedDeltaNet
 // ============================================================================
 // Per v-head: g_decay = exp(-A * softplus(alpha + dt_bias)), beta_gate = sigmoid(beta)
-// Dispatch: num_v_heads threads (64)
-
-kernel void compute_decay_beta(
-    device const float *alpha_out,   // [num_v_heads] from projection
-    device const float *beta_out,    // [num_v_heads] from projection
-    device const float *A_log,       // [num_v_heads] log of decay base (persistent)
-    device const uint16_t *dt_bias,  // [num_v_heads] bf16
-    device float *g_decay,           // [num_v_heads] output
-    device float *beta_gate,         // [num_v_heads] output
-    uint idx [[thread_position_in_grid]]
-) {
-    float a_val = alpha_out[idx];
-    float dt_b = bf16_to_f32(dt_bias[idx]);
-    // GGUF ssm_a stores -exp(A_log), not A_log itself
-    float neg_A = A_log[idx];  // = -exp(A_log) = -A
-    float softplus_val = log(1.0f + exp(a_val + dt_b));
-    g_decay[idx] = exp(neg_A * softplus_val);  // exp(-A * softplus)
-    beta_gate[idx] = 1.0f / (1.0f + exp(-beta_out[idx]));
-}
-
-
-// Compute decay_beta with F32 dt_bias (for GGUF models)
 kernel void compute_decay_beta_f32(
     device const float *alpha_out,
     device const float *beta_out,
@@ -1257,70 +728,6 @@ kernel void swiglu_fused(
     out[tid] = silu_g * up[tid];
 }
 
-// ============================================================================
-// Kernel 16: MoE combine + residual + shared expert gate
-// ============================================================================
-
-kernel void moe_combine_residual(
-    device const float* h_mid       [[buffer(0)]],
-    device const float* shared_out  [[buffer(1)]],
-    device float*       hidden_out  [[buffer(2)]],
-    device const float* expert_out0 [[buffer(3)]],
-    device const float* expert_out1 [[buffer(4)]],
-    device const float* expert_out2 [[buffer(5)]],
-    device const float* expert_out3 [[buffer(6)]],
-    device const float* expert_out4 [[buffer(7)]],
-    device const float* expert_out5 [[buffer(8)]],
-    device const float* expert_out6 [[buffer(9)]],
-    device const float* expert_out7 [[buffer(10)]],
-    device const float* params      [[buffer(11)]],
-    constant uint&      dim         [[buffer(12)]],
-    constant uint&      K           [[buffer(13)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid >= dim) return;
-
-    float shared_gate = 1.0f / (1.0f + exp(-params[8]));
-
-    float moe = 0.0f;
-    if (K > 0) moe += params[0] * expert_out0[tid];
-    if (K > 1) moe += params[1] * expert_out1[tid];
-    if (K > 2) moe += params[2] * expert_out2[tid];
-    if (K > 3) moe += params[3] * expert_out3[tid];
-    if (K > 4) moe += params[4] * expert_out4[tid];
-    if (K > 5) moe += params[5] * expert_out5[tid];
-    if (K > 6) moe += params[6] * expert_out6[tid];
-    if (K > 7) moe += params[7] * expert_out7[tid];
-
-    hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
-}
-
-// MoE combine with packed expert output buffer [K * dim]
-kernel void moe_combine_residual_packed(
-    device const float* h_mid       [[buffer(0)]],
-    device const float* shared_out  [[buffer(1)]],
-    device float*       hidden_out  [[buffer(2)]],
-    device const float* expert_out  [[buffer(3)]],  // packed [K * dim]
-    device const float* params      [[buffer(4)]],  // [0..K-1]=weights, [K]=shared_gate_score
-    constant uint&      dim         [[buffer(5)]],
-    constant uint&      K           [[buffer(6)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid >= dim) return;
-
-    float shared_gate = 1.0f / (1.0f + exp(-params[K]));
-
-    float moe = 0.0f;
-    for (uint k = 0; k < K && k < 16; k++) {
-        moe += params[k] * expert_out[k * dim + tid];
-    }
-
-    hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
-}
-
-// MoE combine + copy residual + partial sum_sq for next layer's norm
-// Fuses moe_combine_packed + copy_buffer + norm_sum_sq into 1 dispatch
-// Saves 2 dispatches + 2 barriers per layer
 kernel void moe_combine_copy_sq(
     device const float* h_mid        [[buffer(0)]],
     device const float* shared_out   [[buffer(1)]],
@@ -1441,188 +848,6 @@ kernel void softmax_topk_route(
 }
 
 // ============================================================================
-// Fused expert gate+up+SwiGLU — compute both projections and activation in one dispatch
-// ============================================================================
-// Eliminates separate up projection and SwiGLU dispatches + 1 barrier.
-// Each simdgroup computes both gate and up dot products for one output row,
-// then applies SwiGLU inline. x_shared is loaded once instead of twice.
-
-kernel void expert_gate_up_swiglu_dyn(
-    device const uint8_t*  layer_data     [[buffer(0)]],
-    device const float*    x              [[buffer(1)]],
-    device float*          act_out        [[buffer(2)]],   // [K * out_dim]
-    device const uint32_t* expert_indices [[buffer(3)]],
-    constant uint&         expert_size    [[buffer(4)]],
-    constant uint&         gate_w_off     [[buffer(5)]],
-    constant uint&         gate_s_off     [[buffer(6)]],
-    constant uint&         gate_b_off     [[buffer(7)]],
-    constant uint&         up_w_off       [[buffer(8)]],
-    constant uint&         up_s_off       [[buffer(9)]],
-    constant uint&         up_b_off       [[buffer(10)]],
-    constant uint&         out_dim        [[buffer(11)]],
-    constant uint&         in_dim         [[buffer(12)]],
-    constant uint&         group_size     [[buffer(13)]],
-    constant uint&         num_row_tgs    [[buffer(14)]],
-    uint tgid    [[threadgroup_position_in_grid]],
-    uint lid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
-) {
-    uint expert_k = tgid / num_row_tgs;
-    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
-
-    uint packed_cols = in_dim / 8;
-    uint num_groups  = in_dim / group_size;
-
-    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (row >= out_dim) return;
-
-    uint expert_id = expert_indices[expert_k];
-    uint ebase = expert_id * expert_size;
-
-    device const uint32_t* gW = (device const uint32_t*)(layer_data + ebase + gate_w_off);
-    device const uint16_t* gS = (device const uint16_t*)(layer_data + ebase + gate_s_off);
-    device const uint16_t* gB = (device const uint16_t*)(layer_data + ebase + gate_b_off);
-
-    device const uint32_t* uW = (device const uint32_t*)(layer_data + ebase + up_w_off);
-    device const uint16_t* uS = (device const uint16_t*)(layer_data + ebase + up_s_off);
-    device const uint16_t* uB = (device const uint16_t*)(layer_data + ebase + up_b_off);
-
-    device const uint32_t* g_row = gW + row * packed_cols;
-    device const uint16_t* gs_row = gS + row * num_groups;
-    device const uint16_t* gb_row = gB + row * num_groups;
-
-    device const uint32_t* u_row = uW + row * packed_cols;
-    device const uint16_t* us_row = uS + row * num_groups;
-    device const uint16_t* ub_row = uB + row * num_groups;
-
-    float gate_acc = 0.0f;
-    float up_acc = 0.0f;
-
-    for (uint col = simd_lane; col < packed_cols; col += 32) {
-        uint g = col / (group_size / 8);
-        uint x_base = col * 8;
-
-        float g_scale = bf16_to_f32(gs_row[g]);
-        float g_bias  = bf16_to_f32(gb_row[g]);
-        uint32_t g_packed = g_row[col];
-
-        float u_scale = bf16_to_f32(us_row[g]);
-        float u_bias  = bf16_to_f32(ub_row[g]);
-        uint32_t u_packed = u_row[col];
-
-        for (uint b = 0; b < 8; b++) {
-            float xv = x_shared[x_base + b];
-            float gsx = g_scale * xv;
-            float gbx = g_bias * xv;
-            float usx = u_scale * xv;
-            float ubx = u_bias * xv;
-            gate_acc += fma(float((g_packed >> (b * 4)) & 0xF), gsx, gbx);
-            up_acc   += fma(float((u_packed >> (b * 4)) & 0xF), usx, ubx);
-        }
-    }
-
-    float gate_sum = simd_sum(gate_acc);
-    float up_sum   = simd_sum(up_acc);
-
-    if (simd_lane == 0) {
-        float silu_gate = gate_sum / (1.0f + exp(-gate_sum));
-        act_out[expert_k * out_dim + row] = silu_gate * up_sum;
-    }
-}
-
-// ============================================================================
-// Dynamic batch expert matvec — reads expert indices from GPU buffer
-// ============================================================================
-
-kernel void batch_expert_mv_dyn(
-    device const uint8_t*  layer_data    [[buffer(0)]],
-    device const float*    x             [[buffer(1)]],
-    device float*          out           [[buffer(2)]],
-    device const uint32_t* expert_indices [[buffer(3)]],
-    constant uint&         expert_size   [[buffer(4)]],
-    constant uint&         proj_w_off    [[buffer(5)]],
-    constant uint&         proj_s_off    [[buffer(6)]],
-    constant uint&         proj_b_off    [[buffer(7)]],
-    constant uint&         out_dim       [[buffer(8)]],
-    constant uint&         in_dim        [[buffer(9)]],
-    constant uint&         group_size    [[buffer(10)]],
-    constant uint&         num_row_tgs   [[buffer(11)]],
-    uint tgid    [[threadgroup_position_in_grid]],
-    uint lid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
-) {
-    uint expert_k = tgid / num_row_tgs;
-    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
-
-    uint packed_cols = in_dim / 8;
-    uint num_groups  = in_dim / group_size;
-
-    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (row >= out_dim) return;
-
-    uint expert_id = expert_indices[expert_k];
-    uint base = expert_id * expert_size;
-
-    device const uint32_t* W = (device const uint32_t*)(layer_data + base + proj_w_off);
-    device const uint16_t* S = (device const uint16_t*)(layer_data + base + proj_s_off);
-    device const uint16_t* B = (device const uint16_t*)(layer_data + base + proj_b_off);
-
-    device const uint32_t* w_row = W + row * packed_cols;
-    device const uint16_t* s_row = S + row * num_groups;
-    device const uint16_t* b_row = B + row * num_groups;
-
-    float acc = 0.0f;
-    for (uint col = simd_lane; col < packed_cols; col += 32) {
-        uint g = col / (group_size / 8);
-        float scale = bf16_to_f32(s_row[g]);
-        float bias  = bf16_to_f32(b_row[g]);
-
-        uint32_t packed = w_row[col];
-        uint x_base = col * 8;
-
-        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
-        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
-        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
-        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
-        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
-        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
-        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
-        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
-
-        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
-        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
-        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
-        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
-        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
-        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
-        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
-        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
-    }
-
-    float sum = simd_sum(acc);
-    if (simd_lane == 0) {
-        out[expert_k * out_dim + row] = sum;
-    }
-}
-
-// ============================================================================
-// Simple buffer copy kernel (replaces blit encoder to stay in compute encoder)
-// ============================================================================
-
 kernel void copy_buffer(
     device const float* src [[buffer(0)]],
     device float*       dst [[buffer(1)]],
@@ -1692,185 +917,6 @@ kernel void argmax_kernel(
         }
     }
 }
-
-// Dynamic batch expert down matvec — per-expert packed input, GPU-driven indices
-kernel void batch_expert_down_dyn(
-    device const uint8_t*  layer_data    [[buffer(0)]],
-    device const float*    x             [[buffer(1)]],
-    device float*          out           [[buffer(2)]],
-    device const uint32_t* expert_indices [[buffer(3)]],
-    constant uint&         expert_size   [[buffer(4)]],
-    constant uint&         proj_w_off    [[buffer(5)]],
-    constant uint&         proj_s_off    [[buffer(6)]],
-    constant uint&         proj_b_off    [[buffer(7)]],
-    constant uint&         out_dim       [[buffer(8)]],
-    constant uint&         in_dim        [[buffer(9)]],
-    constant uint&         group_size    [[buffer(10)]],
-    constant uint&         num_row_tgs   [[buffer(11)]],
-    uint tgid    [[threadgroup_position_in_grid]],
-    uint lid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
-) {
-    uint expert_k = tgid / num_row_tgs;
-    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
-
-    uint packed_cols = in_dim / 8;
-    uint num_groups  = in_dim / group_size;
-
-    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    device const float* x_expert = x + expert_k * in_dim;
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x_expert[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (row >= out_dim) return;
-
-    uint expert_id = expert_indices[expert_k];
-    uint base = expert_id * expert_size;
-
-    device const uint32_t* W = (device const uint32_t*)(layer_data + base + proj_w_off);
-    device const uint16_t* S = (device const uint16_t*)(layer_data + base + proj_s_off);
-    device const uint16_t* B = (device const uint16_t*)(layer_data + base + proj_b_off);
-
-    device const uint32_t* w_row = W + row * packed_cols;
-    device const uint16_t* s_row = S + row * num_groups;
-    device const uint16_t* b_row = B + row * num_groups;
-
-    float acc = 0.0f;
-    for (uint col = simd_lane; col < packed_cols; col += 32) {
-        uint g = col / (group_size / 8);
-        float scale = bf16_to_f32(s_row[g]);
-        float bias  = bf16_to_f32(b_row[g]);
-
-        uint32_t packed = w_row[col];
-        uint x_base = col * 8;
-
-        float sx0 = scale * x_shared[x_base + 0];  float bx0 = bias * x_shared[x_base + 0];
-        float sx1 = scale * x_shared[x_base + 1];  float bx1 = bias * x_shared[x_base + 1];
-        float sx2 = scale * x_shared[x_base + 2];  float bx2 = bias * x_shared[x_base + 2];
-        float sx3 = scale * x_shared[x_base + 3];  float bx3 = bias * x_shared[x_base + 3];
-        float sx4 = scale * x_shared[x_base + 4];  float bx4 = bias * x_shared[x_base + 4];
-        float sx5 = scale * x_shared[x_base + 5];  float bx5 = bias * x_shared[x_base + 5];
-        float sx6 = scale * x_shared[x_base + 6];  float bx6 = bias * x_shared[x_base + 6];
-        float sx7 = scale * x_shared[x_base + 7];  float bx7 = bias * x_shared[x_base + 7];
-
-        acc += fma(float((packed >>  0) & 0xF), sx0, bx0);
-        acc += fma(float((packed >>  4) & 0xF), sx1, bx1);
-        acc += fma(float((packed >>  8) & 0xF), sx2, bx2);
-        acc += fma(float((packed >> 12) & 0xF), sx3, bx3);
-        acc += fma(float((packed >> 16) & 0xF), sx4, bx4);
-        acc += fma(float((packed >> 20) & 0xF), sx5, bx5);
-        acc += fma(float((packed >> 24) & 0xF), sx6, bx6);
-        acc += fma(float((packed >> 28) & 0xF), sx7, bx7);
-    }
-
-    float sum = simd_sum(acc);
-    if (simd_lane == 0) {
-        out[expert_k * out_dim + row] = sum;
-    }
-}
-
-// 2-row-per-simdgroup variant of batch_expert_down_dyn
-kernel void batch_expert_down_dyn_2row(
-    device const uint8_t*  layer_data    [[buffer(0)]],
-    device const float*    x             [[buffer(1)]],
-    device float*          out           [[buffer(2)]],
-    device const uint32_t* expert_indices [[buffer(3)]],
-    constant uint&         expert_size   [[buffer(4)]],
-    constant uint&         proj_w_off    [[buffer(5)]],
-    constant uint&         proj_s_off    [[buffer(6)]],
-    constant uint&         proj_b_off    [[buffer(7)]],
-    constant uint&         out_dim       [[buffer(8)]],
-    constant uint&         in_dim        [[buffer(9)]],
-    constant uint&         group_size    [[buffer(10)]],
-    constant uint&         num_row_tgs   [[buffer(11)]],
-    uint tgid    [[threadgroup_position_in_grid]],
-    uint lid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
-) {
-    uint expert_k = tgid / num_row_tgs;
-    uint row0 = (tgid % num_row_tgs) * (ROWS_PER_TG * 2) + simd_group * 2;
-    uint row1 = row0 + 1;
-
-    uint packed_cols = in_dim / 8;
-    uint num_groups  = in_dim / group_size;
-
-    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    device const float* x_expert = x + expert_k * in_dim;
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x_expert[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    bool valid0 = (row0 < out_dim);
-    bool valid1 = (row1 < out_dim);
-    if (!valid0) return;
-
-    uint expert_id = expert_indices[expert_k];
-    uint base = expert_id * expert_size;
-
-    device const uint32_t* W = (device const uint32_t*)(layer_data + base + proj_w_off);
-    device const uint16_t* S = (device const uint16_t*)(layer_data + base + proj_s_off);
-    device const uint16_t* B = (device const uint16_t*)(layer_data + base + proj_b_off);
-
-    device const uint32_t* w_row0 = W + row0 * packed_cols;
-    device const uint16_t* s_row0 = S + row0 * num_groups;
-    device const uint16_t* b_row0 = B + row0 * num_groups;
-    device const uint32_t* w_row1 = valid1 ? W + row1 * packed_cols : w_row0;
-    device const uint16_t* s_row1 = valid1 ? S + row1 * num_groups : s_row0;
-    device const uint16_t* b_row1 = valid1 ? B + row1 * num_groups : b_row0;
-
-    float acc0 = 0.0f, acc1 = 0.0f;
-    for (uint col = simd_lane; col < packed_cols; col += 32) {
-        uint g = col / (group_size / 8);
-        uint x_base = col * 8;
-        float x0 = float(x_shared[x_base+0]), x1 = float(x_shared[x_base+1]);
-        float x2 = float(x_shared[x_base+2]), x3 = float(x_shared[x_base+3]);
-        float x4 = float(x_shared[x_base+4]), x5 = float(x_shared[x_base+5]);
-        float x6 = float(x_shared[x_base+6]), x7 = float(x_shared[x_base+7]);
-
-        float scale0 = bf16_to_f32(s_row0[g]), bias0 = bf16_to_f32(b_row0[g]);
-        uint32_t p0 = w_row0[col];
-        acc0 += fma(float((p0>> 0)&0xF), scale0*x0, bias0*x0);
-        acc0 += fma(float((p0>> 4)&0xF), scale0*x1, bias0*x1);
-        acc0 += fma(float((p0>> 8)&0xF), scale0*x2, bias0*x2);
-        acc0 += fma(float((p0>>12)&0xF), scale0*x3, bias0*x3);
-        acc0 += fma(float((p0>>16)&0xF), scale0*x4, bias0*x4);
-        acc0 += fma(float((p0>>20)&0xF), scale0*x5, bias0*x5);
-        acc0 += fma(float((p0>>24)&0xF), scale0*x6, bias0*x6);
-        acc0 += fma(float((p0>>28)&0xF), scale0*x7, bias0*x7);
-
-        float scale1 = bf16_to_f32(s_row1[g]), bias1 = bf16_to_f32(b_row1[g]);
-        uint32_t p1 = w_row1[col];
-        acc1 += fma(float((p1>> 0)&0xF), scale1*x0, bias1*x0);
-        acc1 += fma(float((p1>> 4)&0xF), scale1*x1, bias1*x1);
-        acc1 += fma(float((p1>> 8)&0xF), scale1*x2, bias1*x2);
-        acc1 += fma(float((p1>>12)&0xF), scale1*x3, bias1*x3);
-        acc1 += fma(float((p1>>16)&0xF), scale1*x4, bias1*x4);
-        acc1 += fma(float((p1>>20)&0xF), scale1*x5, bias1*x5);
-        acc1 += fma(float((p1>>24)&0xF), scale1*x6, bias1*x6);
-        acc1 += fma(float((p1>>28)&0xF), scale1*x7, bias1*x7);
-    }
-
-    float sum0 = simd_sum(acc0), sum1 = simd_sum(acc1);
-    if (simd_lane == 0) {
-        out[expert_k * out_dim + row0] = sum0;
-        if (valid1) out[expert_k * out_dim + row1] = sum1;
-    }
-}
-
-// ============================================================================
-// De-interleave Q+gate from per-head [Q_h, gate_h] to [all_Q, all_gate]
-// ============================================================================
-// Input:  [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]  = n_heads * hd * 2
-// Output: [Q_h0(hd), Q_h1(hd), ..., gate_h0(hd), gate_h1(hd), ...] = n_heads * hd * 2
-// Dispatch: n_heads * hd threads
-
 kernel void deinterleave_qgate(
     device float* buf           [[buffer(0)]],   // in-place
     device float* tmp           [[buffer(1)]],   // scratch [n_heads * hd * 2]
@@ -1921,12 +967,6 @@ kernel void matvec_f32(
 ) {
     uint row = tgid * ROWS_PER_TG + simd_group;
     if (row >= out_dim) return;
-
-    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     device const float* w_row = W + row * in_dim;
     float acc = 0.0f;
@@ -1989,36 +1029,32 @@ kernel void dequant_matvec_q4k(
     uint row = tgid * ROWS_PER_TG + simd_group;
     if (row >= out_dim) return;
 
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
+    for (uint i = lid; i < in_dim; i += tg_size) { x_shared[i] = half(x[i]); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     uint num_superblocks = in_dim / 256;
     uint bytes_per_row = num_superblocks * 144;
     device const uint8_t* row_data = data + row * bytes_per_row;
 
     float acc = 0.0f;
-
-    // Each SIMD lane processes a subset of super-blocks
-    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
+    uint g = simd_lane / 8;
+    uint l_start = (simd_lane % 8) * 4;
+    for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
         device const uint8_t* sb = row_data + sb_idx * 144;
-
         float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
         float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
-
         float sc[8], mn[8];
         unpack_q4k_scales(sb + 4, sc, mn, 8);
-
-        device const uint8_t* qs = sb + 16;
-        uint x_base = sb_idx * 256;
-
-        for (uint sub = 0; sub < 8; sub++) {
-            float sub_sc = d * sc[sub];
-            float sub_mn = dmin * mn[sub];
-            device const uint8_t* qsub = qs + sub * 16;
-
-            for (uint j = 0; j < 16; j++) {
-                uint8_t byte = qsub[j];
-                uint xi = x_base + sub * 32;
-                acc += (sub_sc * float(byte & 0xF) - sub_mn) * x[xi + j];
-                acc += (sub_sc * float(byte >> 4) - sub_mn) * x[xi + j + 16];
-            }
+        device const uint8_t* qs = sb + 16 + g * 32;
+        uint w_base = sb_idx * 256 + g * 64;
+        float sc_lo = d * sc[g * 2], mn_lo = dmin * mn[g * 2];
+        float sc_hi = d * sc[g * 2 + 1], mn_hi = dmin * mn[g * 2 + 1];
+        for (uint j = 0; j < 4; j++) {
+            uint l = l_start + j;
+            uint8_t byte = qs[l];
+            acc += (sc_lo * float(byte & 0xF) - mn_lo) * float(x_shared[w_base + l]);
+            acc += (sc_hi * float(byte >> 4) - mn_hi) * float(x_shared[w_base + 32 + l]);
         }
     }
 
@@ -2077,7 +1113,7 @@ kernel void dequant_matvec_q8_0(
 
         float local_acc = 0.0f;
         for (uint j = 0; j < 32; j++) {
-            local_acc += d * float(qs[j]) * x[x_base + j];
+            local_acc += d * float(qs[j]) * float(x_shared[x_base + j]);
         }
         acc += local_acc;
     }
@@ -2129,42 +1165,28 @@ kernel void dequant_matvec_q5k(
     device const uint8_t* row_data = data + row * bytes_per_row;
 
     float acc = 0.0f;
-
-    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
+    uint g = simd_lane / 8;
+    uint l_start = (simd_lane % 8) * 4;
+    uint8_t hm_lo = 1u << (g * 2);
+    uint8_t hm_hi = 1u << (g * 2 + 1);
+    for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
         device const uint8_t* sb = row_data + sb_idx * 176;
-
         float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
         float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
-
-        // Unpack sub-block scales and mins (same packing as Q4_K)
         float sc[8], mn[8];
         unpack_q4k_scales(sb + 4, sc, mn, 8);
-
-        // High bits: 32 bytes at offset 16 (256 bits = 1 per weight)
         device const uint8_t* qh = sb + 16;
-        // Low nibbles: 128 bytes at offset 48
-        device const uint8_t* ql = sb + 48;
-
-        uint x_base = sb_idx * 256;
-
-        for (uint sub = 0; sub < 8; sub++) {
-            float sub_sc = d * sc[sub];
-            float sub_mn = dmin * mn[sub];
-            uint sub_base = sub * 32;
-            device const uint8_t* qsub = ql + sub * 16;
-
-            // Split-half: byte l → low nibble at position l, high nibble at position l+16
-            for (uint l = 0; l < 16; l++) {
-                uint8_t byte_val = qsub[l];
-                uint idx_lo = sub_base + l;
-                uint idx_hi = sub_base + l + 16;
-                uint8_t qh_lo = (qh[idx_lo / 8] >> (idx_lo % 8)) & 1;
-                uint8_t qh_hi = (qh[idx_hi / 8] >> (idx_hi % 8)) & 1;
-                float q5_lo = float((byte_val & 0xF) | (qh_lo << 4));
-                float q5_hi = float((byte_val >> 4) | (qh_hi << 4));
-                acc += (sub_sc * q5_lo - sub_mn) * x[x_base + idx_lo];
-                acc += (sub_sc * q5_hi - sub_mn) * x[x_base + idx_hi];
-            }
+        device const uint8_t* ql = sb + 48 + g * 32;
+        uint w_base = sb_idx * 256 + g * 64;
+        float sc_lo = d * sc[g * 2], mn_lo = dmin * mn[g * 2];
+        float sc_hi = d * sc[g * 2 + 1], mn_hi = dmin * mn[g * 2 + 1];
+        for (uint j = 0; j < 4; j++) {
+            uint l = l_start + j;
+            uint8_t byte_val = ql[l];
+            uint8_t q5_lo = (byte_val & 0xF) | ((qh[l] & hm_lo) ? 16 : 0);
+            uint8_t q5_hi = (byte_val >> 4) | ((qh[l] & hm_hi) ? 16 : 0);
+            acc += (sc_lo * float(q5_lo) - mn_lo) * float(x_shared[w_base + l]);
+            acc += (sc_hi * float(q5_hi) - mn_hi) * float(x_shared[w_base + 32 + l]);
         }
     }
 
@@ -2213,37 +1235,33 @@ kernel void dequant_matvec_q6k(
     device const uint8_t* row_data = data + row * bytes_per_row;
 
     float acc = 0.0f;
-
-    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
+    // Distribute l values across SIMD lanes — each lane handles one l (0..31)
+    // per block, giving 4 weights per block × 2 blocks = 8 weights per superblock
+    uint l = simd_lane;
+    for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
         device const uint8_t* sb = row_data + sb_idx * 210;
-
-        // Q6_K layout: ql(128) + qh(64) + scales(16) + d(2) = 210 bytes
         device const uint8_t* ql_base = sb;
         device const uint8_t* qh_base = sb + 128;
         device const int8_t* sc_base = (device const int8_t*)(sb + 192);
         float d = float(as_type<half>(ushort(ushort(sb[208]) | (ushort(sb[209]) << 8))));
-
         uint x_base = sb_idx * 256;
+        uint is = l / 16;
 
-        // Process 256 weights in 2 blocks of 128, matching GGML Q6_K layout
         for (uint blk = 0; blk < 2; blk++) {
             device const uint8_t* ql = ql_base + blk * 64;
             device const uint8_t* qh = qh_base + blk * 32;
             device const int8_t* sc = sc_base + blk * 8;
             uint y_off = x_base + blk * 128;
 
-            for (uint l = 0; l < 32; l++) {
-                uint is = l / 16;
-                int q1 = (int)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-                int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-                int q3 = (int)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
-                int q4 = (int)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+            int q1 = (int)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            int q3 = (int)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+            int q4 = (int)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
 
-                acc += d * (float)sc[is + 0] * (float)q1 * x[y_off + l];
-                acc += d * (float)sc[is + 2] * (float)q2 * x[y_off + l + 32];
-                acc += d * (float)sc[is + 4] * (float)q3 * x[y_off + l + 64];
-                acc += d * (float)sc[is + 6] * (float)q4 * x[y_off + l + 96];
-            }
+            acc += d * (float)sc[is + 0] * (float)q1 * float(x_shared[y_off + l]);
+            acc += d * (float)sc[is + 2] * (float)q2 * float(x_shared[y_off + l + 32]);
+            acc += d * (float)sc[is + 4] * (float)q3 * float(x_shared[y_off + l + 64]);
+            acc += d * (float)sc[is + 6] * (float)q4 * float(x_shared[y_off + l + 96]);
         }
     }
 
@@ -2252,155 +1270,6 @@ kernel void dequant_matvec_q6k(
         out[row] = sum;
     }
 }
-
-// Batched Q4_K expert matvec (gate/up projections)
-// Same dispatch pattern as batch_expert_matvec_4bit but reads Q4_K format.
-// offsets[expert].w_off points to the start of Q4_K data for that expert.
-// ============================================================================
-
-struct ExpertQ4KOffsets {
-    uint data_off;  // byte offset to Q4_K data within layer buffer
-};
-
-kernel void batch_expert_matvec_q4k(
-    device const uint8_t*       layer_data  [[buffer(0)]],
-    device const float*         x           [[buffer(1)]],
-    device float*               out         [[buffer(2)]],
-    constant ExpertQ4KOffsets*   offsets     [[buffer(3)]],
-    constant uint&              out_dim     [[buffer(4)]],
-    constant uint&              in_dim      [[buffer(5)]],
-    constant uint&              num_row_tgs [[buffer(6)]],
-    uint tgid    [[threadgroup_position_in_grid]],
-    uint lid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
-) {
-    uint expert = tgid / num_row_tgs;
-    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
-    if (row >= out_dim) return;
-
-    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint num_superblocks = in_dim / 256;
-    uint bytes_per_row = num_superblocks * 144;
-
-    device const uint8_t* expert_data = layer_data + offsets[expert].data_off;
-    device const uint8_t* row_data = expert_data + row * bytes_per_row;
-
-    float acc = 0.0f;
-
-    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
-        device const uint8_t* sb = row_data + sb_idx * 144;
-
-        float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
-        float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
-
-        float sc[8], mn[8];
-        unpack_q4k_scales(sb + 4, sc, mn, 8);
-
-        device const uint8_t* qs = sb + 16;
-        uint x_base = sb_idx * 256;
-
-        for (uint sub = 0; sub < 8; sub++) {
-            float sub_sc = d * sc[sub];
-            float sub_mn = dmin * mn[sub];
-            device const uint8_t* qsub = qs + sub * 16;
-
-            for (uint j = 0; j < 16; j++) {
-                uint8_t byte = qsub[j];
-                uint xi = x_base + sub * 32;
-                acc += (sub_sc * float(byte & 0xF) - sub_mn) * x[xi + j];
-                acc += (sub_sc * float(byte >> 4) - sub_mn) * x[xi + j + 16];
-            }
-        }
-    }
-
-    float sum = simd_sum(acc);
-    if (simd_lane == 0) {
-        out[expert * out_dim + row] = sum;
-    }
-}
-
-// Batched Q4_K expert down projection (per-expert input)
-kernel void batch_expert_down_q4k(
-    device const uint8_t*       layer_data  [[buffer(0)]],
-    device const float*         x           [[buffer(1)]],  // packed [K * in_dim]
-    device float*               out         [[buffer(2)]],  // packed [K * out_dim]
-    constant ExpertQ4KOffsets*   offsets     [[buffer(3)]],
-    constant uint&              out_dim     [[buffer(4)]],
-    constant uint&              in_dim      [[buffer(5)]],
-    constant uint&              num_row_tgs [[buffer(6)]],
-    uint tgid    [[threadgroup_position_in_grid]],
-    uint lid     [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]],
-    uint simd_lane  [[thread_index_in_simdgroup]],
-    uint simd_group [[simdgroup_index_in_threadgroup]]
-) {
-    uint expert = tgid / num_row_tgs;
-    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
-    if (row >= out_dim) return;
-
-    // Per-expert input
-    device const float* ex = x + expert * in_dim;
-
-    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(ex[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint num_superblocks = in_dim / 256;
-    uint bytes_per_row = num_superblocks * 144;
-
-    device const uint8_t* expert_data = layer_data + offsets[expert].data_off;
-    device const uint8_t* row_data = expert_data + row * bytes_per_row;
-
-    float acc = 0.0f;
-
-    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
-        device const uint8_t* sb = row_data + sb_idx * 144;
-
-        float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
-        float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
-
-        float sc[8], mn[8];
-        unpack_q4k_scales(sb + 4, sc, mn, 8);
-
-        device const uint8_t* qs = sb + 16;
-        uint x_base = sb_idx * 256;
-
-        for (uint sub = 0; sub < 8; sub++) {
-            float sub_sc = d * sc[sub];
-            float sub_mn = dmin * mn[sub];
-            device const uint8_t* qsub = qs + sub * 16;
-
-            for (uint j = 0; j < 16; j++) {
-                uint8_t byte = qsub[j];
-                uint xi = x_base + sub * 32;
-                acc += (sub_sc * float(byte & 0xF) - sub_mn) * ex[xi + j];
-                acc += (sub_sc * float(byte >> 4) - sub_mn) * ex[xi + j + 16];
-            }
-        }
-    }
-
-    float sum = simd_sum(acc);
-    if (simd_lane == 0) {
-        out[expert * out_dim + row] = sum;
-    }
-}
-
-// ============================================================================
-// Dynamic Q4_K batched expert matvec (gate/up projections)
-// ============================================================================
-// Reads expert indices from GPU buffer (written by softmax_topk_route).
-// Buffer(0) bound with Metal offset = projection base (elr->gate.offset),
-// so kernel only needs expert_stride (uint32) to index within the projection.
-
 kernel void batch_expert_mv_q4k_dyn(
     device const uint8_t*       layer_data      [[buffer(0)]],
     device const float*         x               [[buffer(1)]],
@@ -2433,24 +1302,25 @@ kernel void batch_expert_mv_q4k_dyn(
     device const uint8_t* row_data = expert_data + row * bytes_per_row;
 
     float acc = 0.0f;
-    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
+    // Distribute 128 bytes per superblock across 32 SIMD lanes (4 bytes each)
+    // → 100% utilization regardless of superblock count
+    uint g = simd_lane / 8;           // group index (0-3)
+    uint l_start = (simd_lane % 8) * 4;  // byte offset within group
+    for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
         device const uint8_t* sb = row_data + sb_idx * 144;
         float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
         float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
         float sc[8], mn[8];
         unpack_q4k_scales(sb + 4, sc, mn, 8);
-        device const uint8_t* qs = sb + 16;
-        uint x_base = sb_idx * 256;
-        for (uint sub = 0; sub < 8; sub++) {
-            float sub_sc = d * sc[sub];
-            float sub_mn = dmin * mn[sub];
-            device const uint8_t* qsub = qs + sub * 16;
-            for (uint j = 0; j < 16; j++) {
-                uint8_t byte = qsub[j];
-                uint xi = x_base + sub * 32;
-                acc += (sub_sc * float(byte & 0xF) - sub_mn) * x[xi + j];
-                acc += (sub_sc * float(byte >> 4) - sub_mn) * x[xi + j + 16];
-            }
+        device const uint8_t* qs = sb + 16 + g * 32;
+        uint w_base = sb_idx * 256 + g * 64;
+        float sc_lo = d * sc[g * 2], mn_lo = dmin * mn[g * 2];
+        float sc_hi = d * sc[g * 2 + 1], mn_hi = dmin * mn[g * 2 + 1];
+        for (uint j = 0; j < 4; j++) {
+            uint l = l_start + j;
+            uint8_t byte = qs[l];
+            acc += (sc_lo * float(byte & 0xF) - mn_lo) * float(x_shared[w_base + l]);
+            acc += (sc_hi * float(byte >> 4) - mn_hi) * float(x_shared[w_base + 32 + l]);
         }
     }
     float sum = simd_sum(acc);
@@ -2492,24 +1362,23 @@ kernel void batch_expert_down_q4k_dyn(
     device const uint8_t* row_data = expert_data + row * bytes_per_row;
 
     float acc = 0.0f;
-    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
+    uint g = simd_lane / 8;
+    uint l_start = (simd_lane % 8) * 4;
+    for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
         device const uint8_t* sb = row_data + sb_idx * 144;
         float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
         float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
         float sc[8], mn[8];
         unpack_q4k_scales(sb + 4, sc, mn, 8);
-        device const uint8_t* qs = sb + 16;
-        uint x_base = sb_idx * 256;
-        for (uint sub = 0; sub < 8; sub++) {
-            float sub_sc = d * sc[sub];
-            float sub_mn = dmin * mn[sub];
-            device const uint8_t* qsub = qs + sub * 16;
-            for (uint j = 0; j < 16; j++) {
-                uint8_t byte = qsub[j];
-                uint xi = x_base + sub * 32;
-                acc += (sub_sc * float(byte & 0xF) - sub_mn) * ex[xi + j];
-                acc += (sub_sc * float(byte >> 4) - sub_mn) * ex[xi + j + 16];
-            }
+        device const uint8_t* qs = sb + 16 + g * 32;
+        uint w_base = sb_idx * 256 + g * 64;
+        float sc_lo = d * sc[g * 2], mn_lo = dmin * mn[g * 2];
+        float sc_hi = d * sc[g * 2 + 1], mn_hi = dmin * mn[g * 2 + 1];
+        for (uint j = 0; j < 4; j++) {
+            uint l = l_start + j;
+            uint8_t byte = qs[l];
+            acc += (sc_lo * float(byte & 0xF) - mn_lo) * float(x_shared[w_base + l]);
+            acc += (sc_hi * float(byte >> 4) - mn_hi) * float(x_shared[w_base + 32 + l]);
         }
     }
     float sum = simd_sum(acc);
@@ -2551,26 +1420,28 @@ kernel void batch_expert_down_q5k_dyn(
     device const uint8_t* row_data = expert_data + row * bytes_per_row;
 
     float acc = 0.0f;
-    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
+    uint g = simd_lane / 8;
+    uint l_start = (simd_lane % 8) * 4;
+    uint8_t hm_lo = 1u << (g * 2);
+    uint8_t hm_hi = 1u << (g * 2 + 1);
+    for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
         device const uint8_t* sb = row_data + sb_idx * 176;
         float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
         float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
         float sc[8], mn[8];
         unpack_q4k_scales(sb + 4, sc, mn, 8);
         device const uint8_t* qh = sb + 16;
-        device const uint8_t* ql = sb + 48;
-        uint x_base = sb_idx * 256;
-        for (uint sub = 0; sub < 8; sub++) {
-            float sub_sc = d * sc[sub];
-            float sub_mn = dmin * mn[sub];
-            uint sub_base = sub * 32;
-            for (uint j = 0; j < 32; j++) {
-                uint idx = sub_base + j;
-                uint8_t q_lo = (ql[idx / 2] >> (4 * (idx % 2))) & 0xF;
-                uint8_t q_hi = (qh[idx / 8] >> (idx % 8)) & 1;
-                float q5 = float(q_lo | (q_hi << 4));
-                acc += (sub_sc * q5 - sub_mn) * ex[x_base + idx];
-            }
+        device const uint8_t* ql = sb + 48 + g * 32;
+        uint w_base = sb_idx * 256 + g * 64;
+        float sc_lo = d * sc[g * 2], mn_lo = dmin * mn[g * 2];
+        float sc_hi = d * sc[g * 2 + 1], mn_hi = dmin * mn[g * 2 + 1];
+        for (uint j = 0; j < 4; j++) {
+            uint l = l_start + j;
+            uint8_t byte_val = ql[l];
+            uint8_t q5_lo = (byte_val & 0xF) | ((qh[l] & hm_lo) ? 16 : 0);
+            uint8_t q5_hi = (byte_val >> 4) | ((qh[l] & hm_hi) ? 16 : 0);
+            acc += (sc_lo * float(q5_lo) - mn_lo) * float(x_shared[w_base + l]);
+            acc += (sc_hi * float(q5_hi) - mn_hi) * float(x_shared[w_base + 32 + l]);
         }
     }
     float sum = simd_sum(acc);

@@ -88,8 +88,8 @@ id<MTLComputePipelineState> format_pipeline_for(MetalCtx *ctx, QuantFormat fmt) 
         case QFMT_GGUF_Q5_K:  return ctx->matvec_q5k;
         case QFMT_GGUF_Q8_0:  return ctx->matvec_q8_0;
         case QFMT_GGUF_Q6_K:  return ctx->matvec_q6k;
-        case QFMT_F16:        return ctx->matvec_f16;
-        case QFMT_BF16:       return ctx->matvec_f16;
+        case QFMT_F16:        return ctx->matvec_f32;  // F16 uses F32 kernel (upcast at load)
+        case QFMT_BF16:       return ctx->matvec_f32;
         case QFMT_F32:        return ctx->matvec_f32;
     }
     return NULL;
@@ -101,7 +101,6 @@ id<MTLComputePipelineState> format_pipeline_for(MetalCtx *ctx, QuantFormat fmt) 
 
 QuantFormat format_from_ggml_type(uint32_t ggml_type) {
     switch (ggml_type) {
-        case 2:  return QFMT_GGUF_Q4_0;   // GGML_TYPE_Q4_0
         case 8:  return QFMT_GGUF_Q8_0;   // GGML_TYPE_Q8_0
         case 12: return QFMT_GGUF_Q4_K;   // GGML_TYPE_Q4_K
         case 13: return QFMT_GGUF_Q5_K;   // GGML_TYPE_Q5_K
@@ -147,28 +146,6 @@ void format_provider_close(FormatProvider *fp) {
 }
 
 // Resolve a tensor by name → TensorRef ready for dispatch
-TensorRef format_resolve_tensor(FormatProvider *fp, const char *name,
-                                uint32_t out_dim, uint32_t in_dim) {
-    TensorRef ref = {0};
-
-    GGUFTensorInfo *ti = gguf_find_tensor(fp->gguf, name);
-    if (!ti) {
-        fprintf(stderr, "[format] tensor not found: %s\n", name);
-        return ref;
-    }
-
-    ref.buffer = fp->model_buf;
-    ref.offset = fp->gguf->data_offset + ti->offset;
-    ref.format = format_from_ggml_type(ti->type);
-    ref.pipeline = format_pipeline_for(fp->ctx, ref.format);
-    ref.out_dim = out_dim;
-    ref.in_dim = in_dim;
-    ref.group_size = 0; // not used for GGUF formats
-    ref.scale_offset = 0;
-    ref.bias_offset = 0;
-
-    return ref;
-}
 
 // Resolve expert layer tensors → ExpertLayerRef
 ExpertLayerRef format_resolve_expert_layer(FormatProvider *fp, int layer_idx,
@@ -176,9 +153,7 @@ ExpertLayerRef format_resolve_expert_layer(FormatProvider *fp, int layer_idx,
                                             uint32_t num_experts) {
     ExpertLayerRef elr = {0};
     elr.buffer = fp->model_buf;
-    elr.num_experts = num_experts;
 
-    // Build tensor names
     char name[128];
 
     // Gate: shape [hidden, intermediate, num_experts] → per-expert stride
@@ -187,11 +162,7 @@ ExpertLayerRef format_resolve_expert_layer(FormatProvider *fp, int layer_idx,
     if (gate_ti) {
         elr.gate.offset = fp->gguf->data_offset + gate_ti->offset;
         elr.gate.format = format_from_ggml_type(gate_ti->type);
-        elr.gate.pipeline = format_pipeline_for(fp->ctx, elr.gate.format);
-        // Expert stride: total tensor size / num_experts
         elr.gate.expert_stride = gguf_tensor_size(gate_ti) / num_experts;
-        elr.gate.out_dim = intermediate;
-        elr.gate.in_dim = hidden_dim;
     }
 
     // Up: same layout as gate
@@ -200,10 +171,7 @@ ExpertLayerRef format_resolve_expert_layer(FormatProvider *fp, int layer_idx,
     if (up_ti) {
         elr.up.offset = fp->gguf->data_offset + up_ti->offset;
         elr.up.format = format_from_ggml_type(up_ti->type);
-        elr.up.pipeline = format_pipeline_for(fp->ctx, elr.up.format);
         elr.up.expert_stride = gguf_tensor_size(up_ti) / num_experts;
-        elr.up.out_dim = intermediate;
-        elr.up.in_dim = hidden_dim;
     }
 
     // Down: shape [intermediate, hidden, num_experts]
@@ -212,41 +180,7 @@ ExpertLayerRef format_resolve_expert_layer(FormatProvider *fp, int layer_idx,
     if (down_ti) {
         elr.down.offset = fp->gguf->data_offset + down_ti->offset;
         elr.down.format = format_from_ggml_type(down_ti->type);
-        elr.down.pipeline = format_pipeline_for(fp->ctx, elr.down.format);
         elr.down.expert_stride = gguf_tensor_size(down_ti) / num_experts;
-        elr.down.out_dim = hidden_dim;
-        elr.down.in_dim = intermediate;
-    }
-
-    // Shared expert
-    snprintf(name, sizeof(name), "blk.%d.ffn_gate_shexp.weight", layer_idx);
-    GGUFTensorInfo *sgate_ti = gguf_find_tensor(fp->gguf, name);
-    if (sgate_ti) {
-        elr.shared_gate.offset = fp->gguf->data_offset + sgate_ti->offset;
-        elr.shared_gate.format = format_from_ggml_type(sgate_ti->type);
-        elr.shared_gate.pipeline = format_pipeline_for(fp->ctx, elr.shared_gate.format);
-        elr.shared_gate.out_dim = intermediate;
-        elr.shared_gate.in_dim = hidden_dim;
-    }
-
-    snprintf(name, sizeof(name), "blk.%d.ffn_up_shexp.weight", layer_idx);
-    GGUFTensorInfo *sup_ti = gguf_find_tensor(fp->gguf, name);
-    if (sup_ti) {
-        elr.shared_up.offset = fp->gguf->data_offset + sup_ti->offset;
-        elr.shared_up.format = format_from_ggml_type(sup_ti->type);
-        elr.shared_up.pipeline = format_pipeline_for(fp->ctx, elr.shared_up.format);
-        elr.shared_up.out_dim = intermediate;
-        elr.shared_up.in_dim = hidden_dim;
-    }
-
-    snprintf(name, sizeof(name), "blk.%d.ffn_down_shexp.weight", layer_idx);
-    GGUFTensorInfo *sdown_ti = gguf_find_tensor(fp->gguf, name);
-    if (sdown_ti) {
-        elr.shared_down.offset = fp->gguf->data_offset + sdown_ti->offset;
-        elr.shared_down.format = format_from_ggml_type(sdown_ti->type);
-        elr.shared_down.pipeline = format_pipeline_for(fp->ctx, elr.shared_down.format);
-        elr.shared_down.out_dim = hidden_dim;
-        elr.shared_down.in_dim = intermediate;
     }
 
     return elr;
@@ -406,7 +340,6 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
                     uint8_t *d = (uint8_t *)[db contents];
                     // Interleave pattern: GGUF row r → ref row (r%_half < _half ? r%(_half) mapped)
                     // Groups of hd rows. First half: even groups, second half: odd groups.
-                    int heads_per_half = n_v / 2;  // 16
                     for (int gr = 0; gr < _rows; gr++) {
                         int half = gr / _half;
                         int within_half = gr % _half;

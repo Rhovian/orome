@@ -26,11 +26,7 @@ typedef struct GGUFTensorInfo GGUFTensorInfo;
 // Limits (allocation upper bounds, not model-specific)
 // ============================================================================
 
-#define OROME_MAX_EXPERTS       512     // largest MoE model we expect
 #define OROME_MAX_ACTIVE        16      // max active experts per token
-#define OROME_EXPERT_CACHE_SLOTS 48     // max expert data buffer slots (for caching)
-#define OROME_MAX_LAYERS        80      // enough for 397B (60 layers)
-#define OROME_MAX_SEQ_LEN       1048576
 #define OROME_GPU_KV_SEQ        4096    // GPU-side KV cache for attention offload
 
 // ============================================================================
@@ -41,28 +37,6 @@ typedef enum {
     ATTN_FULL,          // Standard grouped-query attention (Q/K/V + RoPE + softmax)
     ATTN_LINEAR,        // GatedDeltaNet (linear attention with SSM-style state)
 } AttnLayerType;
-
-// ============================================================================
-// Quantization
-// ============================================================================
-
-typedef enum {
-    QUANT_NONE = 0,     // FP32 / BF16 (no packing)
-    QUANT_4BIT = 4,     // 4-bit grouped quantization
-    QUANT_2BIT = 2,     // 2-bit grouped quantization
-} QuantType;
-
-// ============================================================================
-// Expert weight layout — computed from model config, not hardcoded
-// ============================================================================
-
-typedef struct {
-    size_t expert_size;         // total bytes per expert (all 3 projections)
-    // Offsets within a single expert's packed data:
-    size_t gate_w_off, gate_s_off, gate_b_off;
-    size_t up_w_off,   up_s_off,   up_b_off;
-    size_t down_w_off, down_s_off, down_b_off;
-} ExpertLayout;
 
 // ============================================================================
 // Model configuration — everything that varies between models
@@ -107,15 +81,8 @@ typedef struct {
     int num_experts_per_tok;    // default active experts, e.g. 8
     int moe_intermediate;       // expert FFN hidden dim, e.g. 512
     int shared_intermediate;    // shared expert FFN hidden dim, e.g. 512
-    int group_size;             // quantization group size, e.g. 64
-
-    // --- Expert weight layout (computed from above) ---
-    ExpertLayout expert_4bit;
-    ExpertLayout expert_2bit;
-
     // --- Special tokens ---
     int eos_tokens[4];          // EOS token IDs (up to 4, -1 terminated)
-    int think_start_token;
     int think_end_token;
 
     // --- Derived (computed during init) ---
@@ -130,72 +97,7 @@ void model_config_init_derived(ModelConfig *cfg);
 
 // Load config from a model directory (reads config.json from HF format).
 // Returns 0 on success, -1 on failure.
-int model_config_load(ModelConfig *cfg, const char *model_dir);
 
-// Hardcoded config for known models (fallback if config.json not found).
-void model_config_qwen35_35b(ModelConfig *cfg);
-void model_config_qwen35_397b(ModelConfig *cfg);
-
-// model_config_detect_layers declared below (after WeightFile typedef)
-
-// ============================================================================
-// Tensor manifest & weight file (mmap'd)
-// ============================================================================
-
-typedef struct {
-    const char *name;
-    size_t offset;
-    size_t size;
-    int ndim;
-    int shape[4];
-    char dtype[8];
-} TensorInfo;
-
-typedef struct {
-    TensorInfo *tensors;
-    int num_tensors;
-    int capacity;
-} TensorManifest;
-
-typedef struct {
-    void *data;
-    size_t size;
-    TensorManifest *manifest;
-} WeightFile;
-
-WeightFile *weights_open(const char *bin_path, const char *json_path);
-void        weights_close(WeightFile *wf);
-void       *weights_tensor_ptr(WeightFile *wf, const char *name);
-TensorInfo *weights_tensor_info(WeightFile *wf, const char *name);
-size_t      weights_tensor_offset(WeightFile *wf, const char *name);
-
-// Layer-specific tensor helpers (constructs "model.layers.{layer}.{suffix}").
-void       *weights_layer_ptr(WeightFile *wf, int layer, const char *suffix);
-size_t      weights_layer_offset(WeightFile *wf, int layer, const char *suffix);
-
-// Detect layer types (full vs linear attention) from weight manifest.
-// Call after weights_open — overrides any hardcoded layer_types with reality.
-void model_config_detect_layers(ModelConfig *cfg, WeightFile *wf);
-
-// ============================================================================
-// KV cache & linear attention state
-// ============================================================================
-
-typedef struct {
-    float *k_cache;     // [gpu_kv_seq * kv_dim]
-    float *v_cache;     // [gpu_kv_seq * kv_dim]
-    int len;
-} KVCache;
-
-typedef struct {
-    float *conv_state;  // [(conv_kernel_size - 1) * linear_conv_dim]
-    float *ssm_state;   // [linear_num_v_heads * linear_key_dim * linear_value_dim]
-} LinearAttnState;
-
-KVCache         *kv_cache_new(const ModelConfig *cfg);
-void             kv_cache_free(KVCache *kv);
-LinearAttnState *linear_state_new(const ModelConfig *cfg);
-void             linear_state_free(LinearAttnState *s);
 
 // ============================================================================
 // Metal GPU context
@@ -206,57 +108,36 @@ typedef struct {
     id<MTLCommandQueue>         queue;
     id<MTLLibrary>              library;
 
-    // Pipelines (created from shaders.metal)
-    id<MTLComputePipelineState> matvec_4bit;
-    id<MTLComputePipelineState> matvec_2bit;
+    // Pipelines
     id<MTLComputePipelineState> norm_sum_sq;
     id<MTLComputePipelineState> norm_apply;
-    id<MTLComputePipelineState> residual_add;
     id<MTLComputePipelineState> attn_scores;
     id<MTLComputePipelineState> attn_softmax;
     id<MTLComputePipelineState> attn_values;
     id<MTLComputePipelineState> sigmoid_gate;
     id<MTLComputePipelineState> swiglu;
-    id<MTLComputePipelineState> moe_combine;
     id<MTLComputePipelineState> delta_net;
-    id<MTLComputePipelineState> conv1d;
     id<MTLComputePipelineState> rms_norm_qk;
-    id<MTLComputePipelineState> decay_beta;
     id<MTLComputePipelineState> gated_rms_norm;
-    id<MTLComputePipelineState> batch_expert_mv;
     id<MTLComputePipelineState> batch_swiglu;
-    id<MTLComputePipelineState> batch_expert_down;
-    id<MTLComputePipelineState> moe_combine_packed;
     id<MTLComputePipelineState> rms_norm_qk_w;
     id<MTLComputePipelineState> rope_apply;
     id<MTLComputePipelineState> kv_cache_write;
     id<MTLComputePipelineState> softmax_topk;
-    id<MTLComputePipelineState> batch_expert_mv_dyn;
-    id<MTLComputePipelineState> batch_expert_down_dyn;
-    id<MTLComputePipelineState> expert_gate_up_swiglu;
     id<MTLComputePipelineState> copy_buffer;
     id<MTLComputePipelineState> residual_add_sq;
     id<MTLComputePipelineState> norm_apply_partial;
     id<MTLComputePipelineState> moe_combine_copy_sq;
-    id<MTLComputePipelineState> matvec_4bit_2row;
-    id<MTLComputePipelineState> batch_expert_down_dyn_2row;
     id<MTLComputePipelineState> argmax;
     id<MTLComputePipelineState> deinterleave_qgate;
     id<MTLComputePipelineState> copy_tmp_to_buf;
-
-    // GGUF format pipelines
     id<MTLComputePipelineState> conv1d_f32;
     id<MTLComputePipelineState> decay_beta_f32;
-    id<MTLComputePipelineState> norm_apply_f32;
-    id<MTLComputePipelineState> norm_apply_partial_f32;
     id<MTLComputePipelineState> matvec_f32;
     id<MTLComputePipelineState> matvec_q4k;
     id<MTLComputePipelineState> matvec_q5k;
     id<MTLComputePipelineState> matvec_q8_0;
     id<MTLComputePipelineState> matvec_q6k;
-    id<MTLComputePipelineState> matvec_f16;
-    id<MTLComputePipelineState> batch_expert_mv_q4k;
-    id<MTLComputePipelineState> batch_expert_down_q4k;
     id<MTLComputePipelineState> batch_expert_mv_q4k_dyn;
     id<MTLComputePipelineState> batch_expert_down_q4k_dyn;
     id<MTLComputePipelineState> batch_expert_down_q5k_dyn;
@@ -272,21 +153,11 @@ typedef struct {
     id<MTLBuffer> buf_combine_params;
     id<MTLBuffer> buf_weights;          // mmap'd weight file as MTL buffer
 
-    // Per-expert GPU buffers
-    id<MTLBuffer> buf_multi_expert_input;
-    id<MTLBuffer> buf_multi_expert_data[OROME_EXPERT_CACHE_SLOTS];
-    int num_expert_data_slots;  // actual number of data buffer slots allocated
-    id<MTLBuffer> buf_multi_expert_gate[OROME_MAX_ACTIVE];
-    id<MTLBuffer> buf_multi_expert_up[OROME_MAX_ACTIVE];
-    id<MTLBuffer> buf_multi_expert_act[OROME_MAX_ACTIVE];
-    id<MTLBuffer> buf_multi_expert_out[OROME_MAX_ACTIVE];
-
-    // Packed batch expert buffers (K × dim)
+    // Batched expert buffers (K × dim)
     id<MTLBuffer> buf_batch_expert_gate;
     id<MTLBuffer> buf_batch_expert_up;
     id<MTLBuffer> buf_batch_expert_act;
     id<MTLBuffer> buf_batch_expert_out;
-    id<MTLBuffer> buf_expert_offsets;
     id<MTLBuffer> buf_topk_indices;  // [K] uint32_t expert indices from GPU routing
 
     // Shared expert buffers
@@ -303,15 +174,6 @@ typedef struct {
     id<MTLBuffer> buf_attn_scores;
     id<MTLBuffer> buf_attn_output;
 
-    // Expert layer data wrapped as Metal buffers (per layer)
-    id<MTLBuffer> __strong *buf_expert_layers;  // [num_layers] - mmap'd expert data
-    int num_expert_layers;
-
-    // Per-layer expert data cache for correct cross-token caching (pread layers only).
-    // Each buffer holds K expert slots contiguously; slot k at offset k * expert_cache_slot_bytes.
-    id<MTLBuffer> __strong *buf_expert_layer_cache;  // [num_layers], NULL entries for resident layers
-    size_t expert_cache_slot_bytes;  // aligned bytes per expert slot
-
     // Linear attention GPU state (per layer)
     id<MTLBuffer> __strong *buf_linear_state;   // [num_linear_layers]
     id<MTLBuffer> __strong *buf_conv_state;     // [num_linear_layers]
@@ -325,15 +187,7 @@ typedef struct {
     id<MTLBuffer> buf_conv_output;
 } MetalCtx;
 
-// Initialize Metal: create device, compile shaders, allocate buffers.
-// Returns NULL if Metal is unavailable (CPU-only fallback).
 MetalCtx *metal_setup(const ModelConfig *cfg);
-
-// Wrap mmap'd weights as a Metal buffer for zero-copy GPU access.
-void metal_set_weights(MetalCtx *ctx, WeightFile *wf);
-
-// metal_set_expert_weights declared after ExpertFiles typedef below
-
 void metal_free(MetalCtx *ctx);
 
 // ============================================================================
@@ -341,7 +195,6 @@ void metal_free(MetalCtx *ctx);
 // ============================================================================
 
 typedef enum {
-    QFMT_GGUF_Q4_0,     // GGUF: 32 weights + fp16 scale per block
     QFMT_GGUF_Q4_K,     // GGUF: 256 weights in 144-byte super-block
     QFMT_GGUF_Q5_K,     // GGUF: 256 weights in 176-byte super-block
     QFMT_GGUF_Q6_K,     // GGUF: 256 weights in 210-byte super-block
@@ -356,13 +209,10 @@ typedef enum {
 typedef struct {
     id<MTLBuffer> buffer;       // Metal buffer containing the data
     size_t offset;              // byte offset within buffer
-    size_t scale_offset;        // for legacy format: separate scale buffer offset
-    size_t bias_offset;         // for legacy format: separate bias buffer offset
     id<MTLComputePipelineState> pipeline;  // which dequant kernel to use
     QuantFormat format;
     uint32_t out_dim;
     uint32_t in_dim;
-    uint32_t group_size;        // for legacy format only
 } TensorRef;
 
 // Per-projection info within an ExpertLayerRef
@@ -370,16 +220,12 @@ typedef struct {
     size_t offset;              // byte offset to start of 3D tensor in buffer
     size_t expert_stride;       // bytes between consecutive experts
     QuantFormat format;
-    id<MTLComputePipelineState> pipeline;
-    uint32_t out_dim, in_dim;
 } ExpertProjRef;
 
 // All expert weight references for one layer, handles mixed quant
 typedef struct {
-    id<MTLBuffer> buffer;       // single Metal buffer (GGUF mmap or legacy layer)
-    uint32_t num_experts;
+    id<MTLBuffer> buffer;       // single Metal buffer (GGUF mmap)
     ExpertProjRef gate, up, down;
-    ExpertProjRef shared_gate, shared_up, shared_down;
 } ExpertLayerRef;
 
 // Opaque provider that resolves tensor names to dispatch-ready refs
@@ -427,10 +273,6 @@ typedef struct {
     TensorRef final_norm;       // final RMS norm
 } GlobalTensorCache;
 
-// Build tensor cache from legacy format (WeightFile with our packed format)
-LayerTensorCache *build_tensor_cache_legacy(WeightFile *wf, MetalCtx *ctx,
-                                             const ModelConfig *cfg,
-                                             GlobalTensorCache *globals);
 
 // Build tensor cache from GGUF file
 LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
@@ -439,8 +281,6 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
 
 FormatProvider   *format_provider_open_gguf(GGUFFile *gf, MetalCtx *ctx);
 void              format_provider_close(FormatProvider *fp);
-TensorRef         format_resolve_tensor(FormatProvider *fp, const char *name,
-                                         uint32_t out_dim, uint32_t in_dim);
 ExpertLayerRef    format_resolve_expert_layer(FormatProvider *fp, int layer_idx,
                                               uint32_t hidden_dim, uint32_t intermediate,
                                               uint32_t num_experts);
@@ -451,195 +291,9 @@ void              format_dispatch_matvec(id<MTLComputeCommandEncoder> enc,
 id<MTLComputePipelineState> format_pipeline_for(MetalCtx *ctx, QuantFormat fmt);
 QuantFormat       format_from_ggml_type(uint32_t ggml_type);
 
-// ============================================================================
-// GPU matvec dispatch (legacy — used by existing engine code)
-// ============================================================================
-
-typedef struct {
-    id<MTLBuffer> w_buf;    size_t w_off;   // weight data (or single GGUF data buffer)
-    id<MTLBuffer> s_buf;    size_t s_off;   // scales (legacy only)
-    id<MTLBuffer> b_buf;    size_t b_off;   // biases (legacy only)
-    id<MTLBuffer> in_buf;   size_t in_off;  // input buffer (NULL → ctx->buf_input)
-    id<MTLBuffer> out_buf;  size_t out_off;
-    float *out_ptr;         // CPU pointer for readback (or NULL)
-    int out_dim;
-    int in_dim;
-    int group_size;
-    bool is_2bit;
-    QuantFormat format;
-} GpuMatvecJob;
-
-// Batch multiple matvecs in one command buffer. Returns after GPU completion.
-void gpu_run_matvec_batch(MetalCtx *ctx, GpuMatvecJob *jobs, int count);
-
-// Encode a single matvec into an existing command encoder (no commit).
-void gpu_encode_matvec_job(id<MTLComputeCommandEncoder> enc, MetalCtx *ctx,
-                           GpuMatvecJob *job);
-
-// Single matvec (copies input to buf_input, runs, copies result out).
-void gpu_dequant_matvec(MetalCtx *ctx, const ModelConfig *cfg,
-                        uint32_t *W, uint16_t *scales, uint16_t *biases,
-                        float *x, float *out, int out_dim, int in_dim,
-                        QuantType quant);
-
-// Dispatch to GPU if available, else CPU fallback.
-void fast_dequant_matvec(MetalCtx *ctx, const ModelConfig *cfg,
-                         uint32_t *W, uint16_t *scales, uint16_t *biases,
-                         float *x, float *out, int out_dim, int in_dim,
-                         QuantType quant);
-
-// ============================================================================
-// CPU compute kernels
-// ============================================================================
-
-// Dequantized matrix-vector multiply (4-bit and 2-bit)
-void cpu_dequant_matvec(const uint32_t *W, const uint16_t *scales,
-                        const uint16_t *biases, const float *x, float *out,
-                        int out_dim, int in_dim, int group_size);
-void cpu_dequant_matvec_2bit(const uint32_t *W, const uint16_t *scales,
-                             const uint16_t *biases, const float *x, float *out,
-                             int out_dim, int in_dim, int group_size);
-
-// Normalization
-void cpu_rms_norm(const float *x, const uint16_t *weight, float *out,
-                  int dim, float eps);
-void cpu_rms_norm_bare(const float *x, float *out, int dim, float eps);
-void cpu_rms_norm_gated(const float *values, const float *z,
-                        const uint16_t *weight, float *out,
-                        int num_heads, int value_dim, float eps);
-
-// Activations & reductions
-void cpu_softmax(float *x, int len);
-float cpu_sigmoid(float x);
-void cpu_swiglu(const float *gate, const float *up, float *out, int dim);
-int cpu_argmax(const float *x, int len);
-int cpu_sample_topk(const float *logits, int vocab_size, int top_k, float temperature);
-void cpu_topk(const float *scores, int n, int k, int *indices, float *weights);
-void cpu_normalize_weights(float *weights, int K);
-
-// Vector ops
-void cpu_vec_add(float *a, const float *b, int len);
-void cpu_vec_madd(float *out, const float *x, float scale, int len);
-
-// Positional encoding
-void apply_rotary_emb(float *q, float *k, int pos, int num_heads,
-                      int head_dim, int rotary_dim, float theta);
-
-// Conv1d step (for linear attention)
-void cpu_conv1d_step(float *conv_state, const float *input,
-                     const uint16_t *weights, float *output,
-                     int channels, int kernel_size);
-
-// BF16 conversion
-static inline float bf16_to_f32(uint16_t bf16) {
-    uint32_t bits = (uint32_t)bf16 << 16;
-    float f;
-    memcpy(&f, &bits, 4);
-    return f;
-}
-
-static inline uint16_t f32_to_bf16(float f) {
-    uint32_t bits;
-    memcpy(&bits, &f, 4);
-    return (uint16_t)(bits >> 16);
-}
-
 // Timing
 double now_ms(void);
-
-// ============================================================================
-// Attention layers
-// ============================================================================
-
-// Attention forward — returns pre-O-proj output via attn_out/attn_out_dim.
-// Does NOT perform O projection or residual add (caller handles these).
-void full_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
-                            int layer_idx, int pos, float *hidden, float *residual,
-                            float *h_post, KVCache *kv,
-                            float **attn_out, int *attn_out_dim);
-
-void linear_attention_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
-                              int layer_idx, int pos, float *hidden, float *residual,
-                              float *h_post, LinearAttnState *state,
-                              float **attn_out, int *attn_out_dim);
-
-// ============================================================================
-// MoE (Mixture of Experts)
-// ============================================================================
-
-// Per-layer I/O and compute instrumentation.
-// Accumulated across tokens, reset periodically by moe_print_layer_stats().
-typedef struct {
-    double io_ms;              // wall time in pread dispatch
-    double compute_ms;         // wall time in GPU expert compute
-    double combine_ms;         // wall time in CPU combine
-    uint64_t io_bytes;         // bytes pread'd
-    int token_count;           // tokens accumulated
-    // pread latency histogram (per-expert-read, microseconds)
-    // buckets: [0-200us] [200-1000us] [1000-5000us] [5000+us]
-    uint32_t pread_us_buckets[4];
-    uint16_t expert_freq[];    // [num_experts] routing frequency (flexible array)
-} MoeLayerStats;
-
-// Expert weight management — mmap'd for machines with enough RAM
-typedef struct {
-    void **layer_data;      // [num_layers] mmap'd expert data (NULL if not loaded)
-    size_t *layer_size;     // [num_layers] size of each mmap
-    int *layer_fds;         // [num_layers] fd (kept open for mmap lifetime)
-    bool *layer_resident;   // [num_layers] safe for direct GPU access (resident, not streamed)
-    bool pread_mode;        // true when experts are loaded via pread into staging buffers
-    int *layer_fds_2bit;    // [num_layers] fd for 2-bit expert files
-    int num_experts;        // cached for hot mask checks
-    int num_layers;         // cached for cleanup
-    uint32_t *hot_mask;     // [num_layers * (max_experts/32)] bitmask of hot experts
-    bool tiered_quant;      // using tiered quantization?
-    bool all_resident;      // true if every layer is resident and direct-access safe
-    bool gpu_resident_safe; // true only when fused GPU path is safe across all layers
-    size_t resident_budget_bytes;
-    size_t resident_bytes;
-    size_t shared_weight_bytes;
-    size_t runtime_reserve_bytes;
-    MoeLayerStats **layer_stats; // [num_layers] per-layer I/O instrumentation
-    // Token-to-token expert buffer cache: tracks which expert ID is in each GPU buffer slot
-    // per layer. Enables skipping pread for experts already loaded from the previous token.
-    int *buf_cached_ids;   // [num_layers * OROME_EXPERT_CACHE_SLOTS], -1 = empty
-    int num_cache_slots;   // actual number of data buffer slots allocated
-    // Previous token's routing results per layer (for page cache warming)
-    int *last_routing;     // [num_layers * OROME_MAX_ACTIVE]
-    int *last_routing_k;   // [num_layers]
-} ExpertFiles;
-
-ExpertFiles *expert_files_open(const ModelConfig *cfg, const char *model_dir,
-                               const char *hot_mask_path);
-void         expert_files_close(ExpertFiles *ef, const ModelConfig *cfg);
-bool         expert_is_hot(const ExpertFiles *ef, int layer, int expert_id);
-void         moe_set_profile_experts(bool enabled);
-bool         moe_get_profile_experts(void);
-void         moe_print_layer_stats(ExpertFiles *ef, bool reset);
-bool         moe_get_profile_experts(void);
-
-// Wrap mmap'd expert layer data as Metal buffers for GPU expert forward.
-void metal_set_expert_weights(MetalCtx *ctx, ExpertFiles *ef, const ModelConfig *cfg);
-
-// Issue F_RDADVISE hints to warm the page cache for predicted experts.
-// Non-blocking: returns immediately. Call before GPU attention to overlap.
-void moe_advise_experts(const ModelConfig *cfg, ExpertFiles *ef,
-                         int layer_idx, QuantType quant);
-
-void moe_forward(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
-                 int layer_idx, float *hidden, float *h_post,
-                 ExpertFiles *ef, int K, QuantType quant);
-
-// MoE forward with pre-computed routing (skips routing GPU batch).
-// gate_scores and shared_gate_score must already be computed.
-// If gpu_combine=true: adds moe_combine kernel on GPU, writes result to
-// ctx->buf_moe_hidden, does NOT wait or read back (caller must sync).
-// If gpu_combine=false: reads back expert results, combines on CPU into hidden.
-void moe_forward_routed(WeightFile *wf, MetalCtx *ctx, const ModelConfig *cfg,
-                        int layer_idx, float *hidden, float *h_post,
-                        float *gate_scores, float shared_gate_score,
-                        ExpertFiles *ef, int K, QuantType quant,
-                        bool gpu_combine);
+int cpu_sample_topk(const float *logits, int vocab_size, int top_k, float temperature);
 
 // ============================================================================
 // Engine — full forward pass
@@ -660,10 +314,7 @@ typedef struct {
     ModelConfig     *cfg;
     MetalCtx        *ctx;
 
-    // Per-token state
     float *hidden;
-    float *residual;
-    float *logits;
 
     // Generation state
     int pos;
@@ -695,7 +346,6 @@ typedef struct {
     char **tokens;
     int *lengths;
     int num_tokens;
-    int max_id;
 } Vocabulary;
 
 typedef struct {
@@ -750,7 +400,6 @@ struct GGUFFile {
 GGUFFile       *gguf_open(const char *path);
 void            gguf_close(GGUFFile *gf);
 GGUFTensorInfo *gguf_find_tensor(GGUFFile *gf, const char *name);
-void           *gguf_tensor_data(GGUFFile *gf, GGUFTensorInfo *ti);
 size_t          gguf_tensor_size(GGUFTensorInfo *ti);
 const char     *ggml_type_name(uint32_t type);
 void            gguf_print_summary(GGUFFile *gf);

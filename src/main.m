@@ -12,7 +12,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
-#include <sys/time.h>
 
 #include "orome.h"
 
@@ -23,12 +22,9 @@ static void print_usage(const char *prog) {
         "  --prompt TEXT     Prompt text\n"
         "  --tokens N        Max tokens to generate (default: 20)\n"
         "  --k N             Active experts per layer (default: from config)\n"
-        "  --2bit            Use 2-bit quantized experts\n"
         "  --thermal-k N     Reduce K to N when thermal throttling engages\n"
         "  --thermal-proj-ms F  Engage thermal-K when step EMA exceeds F ms\n"
         "  --thermal-gen N   Minimum tokens before thermal-K can engage\n"
-        "  --hot-mask PATH   JSON hot expert mask for tiered quantization\n"
-        "  --profile-experts Emit routed expert IDs to stderr\n"
         "  --serve PORT      Run HTTP/SSE server on PORT\n"
         "  --timing          Print per-token timing\n"
         "  --help            Show this help\n",
@@ -41,26 +37,20 @@ int main(int argc, char **argv) {
         const char *prompt_text = NULL;
         int max_tokens = 20;
         int active_k = 0;  // 0 = use config default
-        int use_2bit = 0;
         int serve_port = 0;
         int timing = 0;
         int thermal_k = 0;
         double thermal_proj_ms = 85.0;
         int thermal_gen = 16;
-        const char *hot_mask_path = NULL;
-        int profile_experts = 0;
         int max_layers = 0; // 0 = all layers
         static struct option long_options[] = {
             {"model",   required_argument, 0, 'm'},
             {"prompt",  required_argument, 0, 'p'},
             {"tokens",  required_argument, 0, 't'},
             {"k",       required_argument, 0, 'k'},
-            {"2bit",    no_argument,       0, '2'},
             {"thermal-k", required_argument, 0, 'K'},
             {"thermal-proj-ms", required_argument, 0, 'P'},
             {"thermal-gen", required_argument, 0, 'G'},
-            {"hot-mask", required_argument, 0, 'H'},
-            {"profile-experts", no_argument, 0, 'E'},
             {"serve",   required_argument, 0, 'S'},
             {"timing",  no_argument,       0, 'T'},
             {"gguf-info", no_argument,     0, 'I'},
@@ -77,13 +67,10 @@ int main(int argc, char **argv) {
                 case 'p': prompt_text = optarg; break;
                 case 't': max_tokens = atoi(optarg); break;
                 case 'k': active_k = atoi(optarg); break;
-                case '2': use_2bit = 1; break;
                 case 'K': thermal_k = atoi(optarg); break;
                 case 'L': max_layers = atoi(optarg); break;
                 case 'P': thermal_proj_ms = atof(optarg); break;
                 case 'G': thermal_gen = atoi(optarg); break;
-                case 'H': hot_mask_path = optarg; break;
-                case 'E': profile_experts = 1; break;
                 case 'S': serve_port = atoi(optarg); break;
                 case 'T': timing = 1; break;
                 case 'I': gguf_info = 1; break;
@@ -131,7 +118,6 @@ int main(int argc, char **argv) {
             cfg.num_experts_per_tok = gf->num_experts_per_tok;
             cfg.moe_intermediate = gf->moe_intermediate;
             cfg.vocab_size = gf->vocab_size;
-            cfg.group_size = 64; // not used for GGUF but needed for struct
 
             // Attention config — detect from GGUF metadata
             cfg.num_attn_heads = gf->num_attn_heads;

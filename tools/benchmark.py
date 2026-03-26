@@ -48,12 +48,11 @@ def parse_metrics(output):
     }
 
 
-def run_infer(cwd, infer_path, prompt, tokens, k, use_2bit, timing, extra_args=None):
-    cmd = [str(infer_path), "--prompt", prompt, "--tokens", str(tokens), "--k", str(k)]
-    if use_2bit:
-        cmd.append("--2bit")
-    if timing:
-        cmd.append("--timing")
+def run_infer(cwd, infer_path, prompt, tokens, k, use_2bit, timing, model=None, extra_args=None):
+    cmd = [str(infer_path)]
+    if model:
+        cmd.extend(["--model", model])
+    cmd.extend(["--prompt", prompt, "--tokens", str(tokens)])
     if extra_args:
         cmd.extend(extra_args)
 
@@ -77,10 +76,11 @@ def run_infer(cwd, infer_path, prompt, tokens, k, use_2bit, timing, extra_args=N
 def main():
     parser = argparse.ArgumentParser(description="Run a repeatable orome benchmark")
     parser.add_argument("--infer", default="./orome", help="Path to orome binary")
-    parser.add_argument("--prompt", default="Explain how mixture-of-experts models work, including routing, load balancing, and why they are efficient for inference. Be detailed.", help="Prompt text")
+    parser.add_argument("--model", default="/Users/j/Code/lllm/models/Qwen3.5-35B-A3B-Q4_K_S.gguf", help="Path to GGUF model file")
+    parser.add_argument("--prompt", default="[248045,846,198,9419,248046,198,248045,74455,198]", help="Prompt (raw token IDs or text)")
     parser.add_argument("--tokens", type=int, default=100, help="Tokens to generate (default: 100 for sustained throughput)")
     parser.add_argument("--k", type=int, default=8, help="Active experts")
-    parser.add_argument("--2bit", dest="use_2bit", action="store_true", help="Use 2-bit experts")
+    parser.add_argument("--2bit", dest="use_2bit", action="store_true", help="Use 2-bit experts (legacy)")
     parser.add_argument("--trials", type=int, default=3, help="Number of timed trials")
     parser.add_argument("--warmup-runs", type=int, default=1, help="Untimed warm-up runs before first trial")
     parser.add_argument("--cooldown-sec", type=float, default=5.0, help="Sleep between trials (short — Mac Studio has a fan)")
@@ -114,7 +114,7 @@ def main():
         print("[warmup] warming cache and Metal pipeline")
     for warmup_idx in range(1, args.warmup_runs + 1):
         run_infer(cwd, infer_path, args.prompt, min(args.tokens, 20), args.k,
-                  args.use_2bit, timing=False, extra_args=args.extra)
+                  args.use_2bit, timing=False, model=args.model, extra_args=args.extra)
         if not args.json:
             print(f"  warm-up {warmup_idx}/{args.warmup_runs} complete")
 
@@ -127,7 +127,7 @@ def main():
             print(f"[trial {trial_idx}/{args.trials}] running timed benchmark")
         output = run_infer(
             cwd, infer_path, args.prompt, args.tokens, args.k,
-            args.use_2bit, timing=True, extra_args=args.extra
+            args.use_2bit, timing=True, model=args.model, extra_args=args.extra
         )
         metrics = parse_metrics(output)
         trials.append(metrics)

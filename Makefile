@@ -1,7 +1,7 @@
 CC = clang
-CFLAGS = -O2 -Wall -Wextra -fobjc-arc -DACCELERATE_NEW_LAPACK -Iinclude -Ivendor
-FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
-LDFLAGS = -lpthread -lcompression
+CFLAGS = -O2 -Wall -Wextra -fobjc-arc -Iinclude -Ivendor
+FRAMEWORKS = -framework Metal -framework Foundation
+LDFLAGS =
 
 # Multi-file build
 OROME_TARGET = orome
@@ -16,7 +16,7 @@ SHADER_SRC = src/shaders.metal
 SHADER_AIR = src/shaders.air
 SHADER_LIB = src/shaders.metallib
 
-.PHONY: all clean run bench
+.PHONY: all clean bench
 
 all: $(SHADER_LIB) $(OROME_TARGET)
 
@@ -38,13 +38,10 @@ $(SHADER_LIB): $(SHADER_AIR)
 clean:
 	rm -f $(OROME_TARGET) $(OROME_OBJS) $(SHADER_AIR) $(SHADER_LIB)
 
-run: $(OROME_TARGET)
-	./$(OROME_TARGET) --prompt "Hello" --tokens 20
-
 bench: $(OROME_TARGET)
-	uv run tools/benchmark.py --trials 3
+	python3 tools/benchmark.py --trials 1 --json
 
-MODEL ?= /Users/j/models/Qwen3.5-35B-A3B-4bit
+MODEL ?= /Users/j/Code/lllm/models/Qwen3.5-35B-A3B-Q4_K_S.gguf
 PORT ?= 8080
 
 serve: $(OROME_TARGET)

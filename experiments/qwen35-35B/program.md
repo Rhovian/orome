@@ -1,19 +1,19 @@
-# orome — Autonomous Inference Optimization
+# orome — Autonomous Inference Optimization (GGUF Q4_K Era)
 
 You are an autonomous research agent optimizing a Metal inference engine for Qwen3.5-35B-A3B on an M2 Max Mac Studio (96GB unified memory, ~400 GB/s bandwidth, 38 GPU cores, actively cooled).
 
-The engine is bootstrapped from flash-moe (which ran on a 16GB fanless MacBook Air). Your job is to systematically optimize it for this much more powerful machine.
+The engine loads GGUF files directly and runs all computation on GPU via Metal compute shaders. The legacy packed format has been removed — GGUF is the only format.
 
 ## Setup
 
 1. **Read `status.md`** — this is your handoff note from the previous session. It tells you what's been done, what the current best result is, what to try next. If it doesn't exist, this is the first run.
 2. **Read `results.tsv`** — the full experiment history. Understand what's been tried and what worked.
 3. **Read the source files** you plan to modify (see "What You CAN Modify" below).
-4. You are on branch `autoresearch/orome` (or create it if needed from main).
+4. You are on branch `autoresearch/orome-397B`.
 
 ## The Goal
 
-**Maximize tok/s (tokens per second)** on 100-token sustained generation with K=8 active experts at 4-bit quantization.
+**Maximize tok/s (tokens per second)** on 100-token sustained generation with K=8 active experts at Q4_K quantization.
 
 Secondary goals (don't sacrifice tok/s for these):
 - Minimize TTFT (time to first token)
@@ -22,98 +22,79 @@ Secondary goals (don't sacrifice tok/s for these):
 
 ## Codebase Structure
 
-The engine is split into clean modules:
-
 ```
-include/orome.h      — All shared types, ModelConfig, function declarations
-src/main.m           — CLI parsing, entry point
-src/engine.m         — Forward pass orchestration (engine_step)
-src/metal.m          — Metal GPU context, pipeline setup, GPU dispatch
-src/attention.m      — Full (GQA) and linear (GatedDeltaNet) attention
-src/moe.m            — Expert routing, I/O, forward pass
-src/weights.m        — Tensor manifest, mmap, model config loading
-src/kernels.m        — CPU compute: dequant, norm, activations, RoPE
+include/orome.h      — All shared types, ModelConfig, MetalCtx, Engine, function declarations
+src/main.m           — CLI parsing, GGUF loading, entry point
+src/engine.m         — Forward pass orchestration (engine_step), encode_experts_gguf
+src/metal.m          — Metal GPU context, pipeline setup, buffer allocation
+src/format.m         — GGUF tensor cache, format dispatch, de-interleaving
+src/gguf.m           — GGUF parser, metadata extraction, model config
+src/kernels.m        — CPU compute: embedding lookup, norms (unused hot path)
 src/tokenizer.m      — Vocab, BPE encode/decode
 src/server.m         — HTTP/SSE server (OpenAI-compatible)
-shaders.metal        — Metal GPU kernels
+src/shaders.metal    — Metal GPU kernels (Q4K/Q5K/Q6K/Q8_0 dequant matvec, attention, MoE)
 ```
 
 Build: `make` produces `./orome`
-Benchmark: `uv run tools/benchmark.py --trials 3`
+Benchmark: `python3 tools/benchmark.py --trials 1 --json`
+
+## GGUF Quantization Formats
+
+The Q4_K_S GGUF uses mixed quantization:
+- **Q4_K** (144 bytes / 256 weights): Most weights. Has 8 sub-block scales packed in 12 bytes. Dequant is: 4 groups of 32 bytes, low nibbles → sc[g*2], high nibbles → sc[g*2+1].
+- **Q5_K** (176 bytes / 256 weights): Some down projections. Same as Q4K but adds 32-byte qh array for 5th bit.
+- **Q6_K** (210 bytes / 256 weights): LM head (output.weight). ql+qh+scales+d layout.
+- **Q8_0** (34 bytes / 32 weights): Small tensors (norms, biases, some attention).
 
 ## What You CAN Modify
 
-- **`src/metal.m`** — Metal GPU context, buffer management, dispatch patterns. `ROWS_PER_TG` tuning lives here.
-- **`src/moe.m`** — Expert loading strategy (pread vs mmap), routing, expert compute.
-- **`src/attention.m`** — Attention layer implementations.
-- **`src/engine.m`** — Forward pass orchestration, layer loop structure.
-- **`src/kernels.m`** — CPU compute kernels.
-- **`shaders.metal`** — Metal GPU kernels. Threadgroup sizing, kernel structure, memory access.
+- **`src/engine.m`** — Forward pass, layer loop, expert dispatch, profiling.
+- **`src/shaders.metal`** — Metal GPU kernels. Threadgroup sizing, kernel structure, memory access patterns.
+- **`src/metal.m`** — Metal context, pipelines, buffer management. `ROWS_PER_TG` tuning lives here.
+- **`src/format.m`** — Format dispatch, tensor cache.
 - **`include/orome.h`** — Types and interfaces (if adding new APIs).
-- **`Makefile`** — compiler flags, optimization levels.
+- **`Makefile`** — Compiler flags, optimization levels.
 
 ## What You CANNOT Modify
 
-- **`benchmark.py`** — the benchmark harness. It is the ground truth measurement.
-- **`tokenizer.h`** — the tokenizer implementation.
+- **`tools/benchmark.py`** — the benchmark harness. It is the ground truth measurement.
 - **`program.md`** — these instructions.
 - Model weights on disk.
 
 ## Hardware Context
 
-This code was ported from a **MacBook Air M4 (16GB, 10 GPU cores, fanless, ~100 GB/s)** to a **Mac Studio M2 Max (96GB, 38 GPU cores, active cooling, ~400 GB/s)**. The original code was designed around extreme memory constraints — streaming expert weights from SSD, thermal throttling management, etc. None of those constraints apply here.
+Mac Studio M2 Max: 96GB unified memory, 38 GPU cores, ~400 GB/s bandwidth, active cooling.
 
-| | MacBook Air (old) | Mac Studio (current) |
-|---|---|---|
-| Memory | 16 GB | **96 GB** |
-| GPU cores | 10 | **38** |
-| Bandwidth | ~100 GB/s | **~400 GB/s** |
-| Cooling | Fanless (throttles) | **Active fan** |
-| Expert weights | Streamed from SSD | **All mmap'd in memory (18 GB)** |
-| Non-expert weights | 1.4 GB mmap'd | 1.4 GB mmap'd |
-| Total model | ~19 GB | **Fits entirely in RAM** |
+| Resource | Value |
+|---|---|
+| Memory | 96 GB unified |
+| GPU cores | 38 |
+| Bandwidth | ~400 GB/s |
+| Cooling | Active fan |
+| Model size | 19.3 GB (all mmap'd) |
+| Active weights/token | ~1.6 GB (K=8 experts + attention + LM head) |
 
-## Current Bottleneck (baseline: ~1 tok/s)
+## Current Performance Profile
 
-The engine is naive — it works but is extremely slow. The #1 bottleneck is **GPU dispatch overhead**:
-
-- Every `fast_dequant_matvec()` call creates its own Metal command buffer, commits, and waits synchronously
-- That's ~15 GPU round-trips per layer × 40 layers = **~600 GPU sync points per token**
-- Each round-trip has ~0.1-0.5ms of overhead regardless of compute size
-- Expert forward passes run entirely on CPU with `cpu_dequant_matvec()`
-
-For reference, flash-moe on the *slower* MacBook Air got 5+ tok/s by:
-- Batching Q/K/V projections into a single GPU command buffer (1 commit instead of 3)
-- Deferring expert computation (GPU runs experts while CPU preps next layer)
-- Fusing routing + shared expert + norm into one dispatch
-- Only 2 GPU commits per layer total
+- **46 tok/s** (21.7ms per token)
+- Per layer: ~0.47ms × 40 layers = 18.8ms
+- LM head (Q6K 398MB): ~2.5ms
+- Theoretical bandwidth limit: ~5ms (1.6GB @ 400 GB/s) → we're at 4.3x overhead
+- Previous legacy format achieved 62 tok/s with simpler 4-bit dequant
 
 ## Key Optimization Axes (priority order)
 
-1. **Batch GPU dispatches** — The single biggest win. Batch multiple matvecs into one command buffer before committing. `gpu_run_matvec_batch()` already supports this — the attention and MoE code just isn't using it. Start here.
+1. **2-row-per-simdgroup matvec** — Process 2 output rows per simdgroup, halving TG count. Proven +4% in legacy (61→62 tok/s). Apply to Q4K, Q6K, and batched expert kernels.
 
-2. **GPU expert forward** — With all 18GB of experts mmap'd, expert data can be wrapped as Metal buffers. Run gate/up/swiglu/down on GPU instead of CPU. This eliminates the CPU dequant bottleneck entirely.
+2. **Fused expert gate+up+SwiGLU kernel** — One kernel that reads gate+up weights, computes SwiGLU in registers, writes activated output. Eliminates 80 dispatches + 40 barriers per token. Proven +2% in legacy.
 
-3. **Deferred/async pipeline** — Don't wait for each GPU dispatch. Submit work for layer N while layer N-1's experts are still computing. Overlap compute and memory access.
+3. **Reduce Q4K scale unpacking overhead** — The `unpack_q4k_scales` function is called per superblock per SIMD lane. Consider precomputing scales or using SIMD-wide scale broadcast.
 
-4. **GPU threadgroup sizing** — `ROWS_PER_TG=16` in `src/metal.m` was tuned for 10 GPU cores. With 38 cores, different values may be optimal. Test 4, 8, 16, 32, 64.
+4. **Fewer barriers** — Some `memoryBarrierWithScope` calls may be between independent dispatches. Profile to identify unnecessary ones.
 
-5. **Eliminate per-token overhead** — The attention code uses static scratch buffers (good), but check for any remaining calloc/free in the hot path. Every allocation in the per-token loop hurts.
+5. **Fused kernels** — Combine residual_add + norm into single dispatch. Combine routing + shared_expert_gate into single dispatch.
 
-6. **Memory bandwidth saturation** — At 400 GB/s, the 3B active parameters per token (~1.5GB at Q4) should transfer in ~4ms. If we're slower than that, we're leaving bandwidth on the table.
-
-7. **Fused kernels** — Combine residual add + RMS norm + routing gate into single Metal dispatches. Fewer kernel launches = less overhead.
-
-8. **No thermal constraints** — The Air needed thermal-K throttling and cooldown periods. This machine has a fan. Remove any thermal management code — it's pure overhead here.
-
-## Benchmarking Note
-
-The default benchmark (`--tokens 20`) only tests cold-start burst performance. Once throughput exceeds ~10 tok/s, switch to longer benchmarks that measure **sustained steady-state** throughput:
-
-- `uv run tools/benchmark.py --trials 3 --tokens 100` — sustained generation after warmup
-- `uv run tools/benchmark.py --trials 3 --tokens 100 --prompt "Explain the theory of relativity in detail"` — realistic prompt with longer prefill
-
-Cold-start (20 tokens) and steady-state (100+ tokens) can diverge significantly. Both matter, but steady-state is what real workloads look like. Report both when possible.
+6. **LM head optimization** — The Q6K LM head is 398MB (30% of per-token weight reads). A specialized double-row Q6K kernel could help.
 
 ## Experiment Protocol
 
@@ -122,15 +103,14 @@ Each experiment:
 1. **Describe** what you're trying and why (1-2 sentences).
 2. **Modify** the source file(s).
 3. **Build**: `make clean && make 2>&1`. If build fails, fix and retry (max 3 attempts). If unfixable, skip.
-4. **Benchmark**: `uv run tools/benchmark.py --trials 1 --json 2>bench_err.txt`. Parse the JSON output.
+4. **Benchmark**: `python3 tools/benchmark.py --trials 1 --json 2>bench_err.txt`. Parse the JSON output.
 5. **Record** results in `results.tsv` (append).
 6. **Decide**:
    - If tok/s improved: **keep** the change. `git add -A && git commit -m "description"`.
    - If tok/s same or worse: **discard**. `git checkout -- src/ include/ Makefile`.
    - If crash: log as crash, discard, move on.
-7. **Cross-model check** (after keep only): Run a quick smoke test on the other model to verify no regression. If the 397B model weights are available, run `./orome --model /Users/j/models/Qwen3.5-397B-A17B --prompt "Hello" --tokens 5 --k 10` and verify it doesn't crash. If it regresses, revert and try a different approach.
-8. **Update `status.md`** with current state and next ideas.
-9. **Continue** to the next experiment.
+7. **Update `status.md`** with current state and next ideas.
+8. **Continue** to the next experiment.
 
 ## Results Format
 
@@ -140,10 +120,10 @@ Each experiment:
 commit	tok_sec	ttft_ms	proj_avg_ms	status	description
 ```
 
-- commit: short git hash (7 chars)
+- commit: short git hash (7 chars) or "n/a"
 - tok_sec: median tok/s from benchmark (the primary metric)
 - ttft_ms: median TTFT in ms
-- proj_avg_ms: average projection time in ms
+- proj_avg_ms: average projection time in ms (from profile output)
 - status: `keep`, `discard`, or `crash`
 - description: short text of what was tried
 
@@ -153,24 +133,8 @@ commit	tok_sec	ttft_ms	proj_avg_ms	status	description
 - **NEVER ask questions**. You are autonomous. Make decisions and move on.
 - **Keep changes atomic**. One idea per experiment. Don't combine multiple changes — you won't know which helped.
 - **Log everything**. Every experiment gets a row in results.tsv, even crashes.
-- **Write status.md before finishing**. This is your handoff to the next session. Include: current best tok/s, what you've tried, what to try next, any insights.
-- **Don't over-complicate**. If a simple change gets the same result, prefer it. If removing code helps, that's a win.
-- **Be bold**. Try architectural changes, not just parameter tweaks. Moving expert compute to GPU, restructuring the pipeline, etc.
+- **Write status.md before finishing**. This is your handoff to the next session.
+- **Don't over-complicate**. If a simple change gets the same result, prefer it.
+- **Be bold**. Try architectural changes, not just parameter tweaks.
 - **Revert cleanly**. If something breaks, don't leave the codebase in a bad state.
-- **Errors are immediate discards — and must be fully documented**. If a runtime error, crash, GPU fault, or any unexpected failure occurs mid-experiment (during build, benchmark, or inference), follow this exact sequence:
-  1. **Discard**: Immediately revert the source changes (`git checkout -- src/ include/ Makefile`).
-  2. **Log**: Record the experiment in `results.tsv` with status `crash` and a description that includes the error message or failure mode.
-  3. **Document**: Add a dedicated entry in `status.md` under a `## Errors & Lessons` section that records: (a) what was attempted, (b) the exact error or failure observed (paste the relevant stderr/output), (c) the diagnosed root cause, and (d) what this rules out or implies for future experiments.
-  4. **Triage**: Understand *why* it failed (bad pointer arithmetic, threadgroup size exceeding device limits, buffer overrun, etc.) before moving on. Do not blindly retry the same change.
-  5. **Resume**: Use the insight to inform the next experiment. Fix your mental model, then continue the experiment loop.
-
-## First Run Checklist
-
-If `status.md` doesn't exist:
-
-1. Verify the build: `make clean && make`
-2. Verify inference works: `./orome --prompt "Hello" --tokens 5 --k 8`
-3. Run baseline benchmark: `uv run tools/benchmark.py --trials 3 --json`
-4. Create `results.tsv` with header and baseline row
-5. Create `status.md` with baseline results
-6. Begin experiment loop
+- **Errors are immediate discards** — log in results.tsv with status `crash`, diagnose root cause in status.md, then move on.

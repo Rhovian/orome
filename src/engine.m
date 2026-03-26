@@ -11,13 +11,6 @@
 
 #include "orome.h"
 
-// ============================================================================
-// (Legacy LayerWeightCache removed — all weight resolution via LayerTensorCache)
-// ============================================================================
-
-// (Legacy build_weight_cache, build_weight_cache_gguf_impl, build_weight_cache_gguf_ext removed
-//  — tensor cache is built via format.m)
-
 static void thermal_k_reset(ThermalKState *t) {
     t->proj_ema_ms = 0.0;
     t->generated = 0;
@@ -62,11 +55,7 @@ Engine *engine_create(ModelConfig *cfg, MetalCtx *ctx, int active_experts) {
     eng->thermal.proj_threshold_ms = 85.0;
     thermal_k_reset(&eng->thermal);
 
-    int H = cfg->hidden_dim;
-    eng->hidden   = calloc(H, sizeof(float));
-    eng->residual = calloc(H, sizeof(float));
-    eng->logits   = calloc(cfg->vocab_size, sizeof(float));
-
+    eng->hidden = calloc(cfg->hidden_dim, sizeof(float));
     eng->pos = 0;
     return eng;
 }
@@ -74,22 +63,18 @@ Engine *engine_create(ModelConfig *cfg, MetalCtx *ctx, int active_experts) {
 void engine_free(Engine *eng) {
     if (!eng) return;
     free(eng->hidden);
-    free(eng->residual);
-    free(eng->logits);
     free(eng);
 }
 
 // Profiling accumulators (reset in engine_reset)
-static double t_attn_total = 0, t_moe_total = 0, t_norm_total = 0, t_lmhead_total = 0;
+static double t_attn_total = 0, t_moe_total = 0, t_lmhead_total = 0;
 static int profile_count = 0;
 
 void engine_reset(Engine *eng) {
     eng->pos = 0;
     thermal_k_reset(&eng->thermal);
-    // GPU KV caches and linear states are managed by Metal buffers (buf_kv_k/v, buf_conv_state, buf_linear_state)
-    // and are reset via metal_reset_state() if needed.
-    // Reset profile accumulators so they don't bleed across requests
-    t_attn_total = 0; t_moe_total = 0; t_norm_total = 0; t_lmhead_total = 0;
+    // Reset profile accumulators
+    t_attn_total = 0; t_moe_total = 0; t_lmhead_total = 0;
     profile_count = 0;
 }
 
@@ -169,14 +154,11 @@ static void embed_lookup_gguf(GGUFFile *gf, const ModelConfig *cfg,
 // Shared expert gate+up must already be in buf_shared_gate/buf_shared_up.
 // Shared expert gate score must be at buf_output[n_experts] (from Phase K dispatch).
 
-static void encode_experts_gguf(id<MTLComputeCommandEncoder> __strong *enc_ptr,
-                                 id<MTLCommandBuffer> __strong *cmd_ptr,
+static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
                                  MetalCtx *ctx, const ModelConfig *cfg,
                                  const ExpertLayerRef *elr,
                                  const LayerTensorCache *lt,
                                  int K) {
-    id<MTLComputeCommandEncoder> enc = *enc_ptr;
-    id<MTLCommandBuffer> cmd = *cmd_ptr;
     int H = cfg->hidden_dim;
     int M = cfg->moe_intermediate;
     int S = cfg->shared_intermediate;
@@ -188,7 +170,6 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> __strong *enc_ptr,
 
     // --- 1. GPU softmax + topK routing ---
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
     [enc setComputePipelineState:ctx->softmax_topk];
     [enc setBuffer:ctx->buf_output offset:0 atIndex:0];
     [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:1];
@@ -199,74 +180,37 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> __strong *enc_ptr,
       [enc setBytes:&sgg length:sizeof(uint) atIndex:5]; }
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-    // --- 2. Batched gate projection ---
-    if (elr->gate.format == QFMT_GGUF_Q4_K) {
-        uint es = (uint)elr->gate.expert_stride;
-        uint od = (uint)M, id_ = (uint)H, nrt = num_row_tgs_M;
-        [enc setComputePipelineState:ctx->batch_expert_mv_q4k_dyn];
-        [enc setBuffer:elr->buffer offset:elr->gate.offset atIndex:0];
-        [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
-        [enc setBuffer:ctx->buf_batch_expert_gate offset:0 atIndex:2];
-        [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
-        [enc setBytes:&es length:sizeof(uint) atIndex:4];
-        [enc setBytes:&od length:sizeof(uint) atIndex:5];
-        [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
-        [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
-    } else {
-        // Fallback: per-expert dispatch via format_dispatch_matvec
-        // Read topk indices from GPU (requires commit+wait)
-        [enc endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
-        uint32_t *topk = (uint32_t *)[ctx->buf_topk_indices contents];
-        cmd = [ctx->queue commandBuffer];
-        enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-        for (int k = 0; k < K; k++) {
-            TensorRef ref = { .buffer = elr->buffer,
-                .offset = elr->gate.offset + (size_t)topk[k] * elr->gate.expert_stride,
-                .format = elr->gate.format, .out_dim = (uint32_t)M, .in_dim = (uint32_t)H };
-            ref.pipeline = format_pipeline_for(ctx, ref.format);
-            format_dispatch_matvec(enc, ctx, &ref, ctx->buf_input, 0,
-                ctx->buf_batch_expert_gate, (size_t)k * M * sizeof(float));
-        }
-    }
+    // --- 2. Batched gate projection (Q4K) ---
+    { uint es = (uint)elr->gate.expert_stride;
+      uint od = (uint)M, id_ = (uint)H, nrt = num_row_tgs_M;
+      [enc setComputePipelineState:ctx->batch_expert_mv_q4k_dyn];
+      [enc setBuffer:elr->buffer offset:elr->gate.offset atIndex:0];
+      [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
+      [enc setBuffer:ctx->buf_batch_expert_gate offset:0 atIndex:2];
+      [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
+      [enc setBytes:&es length:sizeof(uint) atIndex:4];
+      [enc setBytes:&od length:sizeof(uint) atIndex:5];
+      [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+      [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
+      [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
 
-    // --- 3. Batched up projection ---
-    if (elr->up.format == QFMT_GGUF_Q4_K) {
-        uint es = (uint)elr->up.expert_stride;
-        uint od = (uint)M, id_ = (uint)H, nrt = num_row_tgs_M;
-        [enc setComputePipelineState:ctx->batch_expert_mv_q4k_dyn];
-        [enc setBuffer:elr->buffer offset:elr->up.offset atIndex:0];
-        [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
-        [enc setBuffer:ctx->buf_batch_expert_up offset:0 atIndex:2];
-        [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
-        [enc setBytes:&es length:sizeof(uint) atIndex:4];
-        [enc setBytes:&od length:sizeof(uint) atIndex:5];
-        [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
-        [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
-    } else {
-        // Same fallback for non-Q4K formats
-        if (elr->gate.format == QFMT_GGUF_Q4_K) {
-            // Only need commit if we haven't already done it for gate
-            [enc endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
-            cmd = [ctx->queue commandBuffer];
-            enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-        }
-        uint32_t *topk = (uint32_t *)[ctx->buf_topk_indices contents];
-        for (int k = 0; k < K; k++) {
-            TensorRef ref = { .buffer = elr->buffer,
-                .offset = elr->up.offset + (size_t)topk[k] * elr->up.expert_stride,
-                .format = elr->up.format, .out_dim = (uint32_t)M, .in_dim = (uint32_t)H };
-            ref.pipeline = format_pipeline_for(ctx, ref.format);
-            format_dispatch_matvec(enc, ctx, &ref, ctx->buf_input, 0,
-                ctx->buf_batch_expert_up, (size_t)k * M * sizeof(float));
-        }
-    }
+    // --- 3. Batched up projection (Q4K) ---
+    { uint es = (uint)elr->up.expert_stride;
+      uint od = (uint)M, id_ = (uint)H, nrt = num_row_tgs_M;
+      [enc setComputePipelineState:ctx->batch_expert_mv_q4k_dyn];
+      [enc setBuffer:elr->buffer offset:elr->up.offset atIndex:0];
+      [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
+      [enc setBuffer:ctx->buf_batch_expert_up offset:0 atIndex:2];
+      [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
+      [enc setBytes:&es length:sizeof(uint) atIndex:4];
+      [enc setBytes:&od length:sizeof(uint) atIndex:5];
+      [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+      [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
+      [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
 
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -290,11 +234,9 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> __strong *enc_ptr,
 
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-    // --- 6. Expert down projection ---
-    if (elr->down.format == QFMT_GGUF_Q4_K || elr->down.format == QFMT_GGUF_Q5_K) {
-      id<MTLComputePipelineState> down_pipe = (elr->down.format == QFMT_GGUF_Q5_K)
+    // --- 6. Expert down projection (Q4K or Q5K) ---
+    { id<MTLComputePipelineState> down_pipe = (elr->down.format == QFMT_GGUF_Q5_K)
           ? ctx->batch_expert_down_q5k_dyn : ctx->batch_expert_down_q4k_dyn;
-
       uint es = (uint)elr->down.expert_stride;
       uint od = (uint)H, id_ = (uint)M, nrt = num_row_tgs_H;
       [enc setComputePipelineState:down_pipe];
@@ -307,20 +249,7 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> __strong *enc_ptr,
       [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
       [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
       [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_H * K, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
-    } else {
-        // Fallback: per-expert down projection
-        uint32_t *topk = (uint32_t *)[ctx->buf_topk_indices contents];
-        for (int k = 0; k < K; k++) {
-            TensorRef ref = { .buffer = elr->buffer,
-                .offset = elr->down.offset + (size_t)topk[k] * elr->down.expert_stride,
-                .format = elr->down.format, .out_dim = (uint32_t)H, .in_dim = (uint32_t)M };
-            ref.pipeline = format_pipeline_for(ctx, ref.format);
-            format_dispatch_matvec(enc, ctx, &ref, ctx->buf_batch_expert_act,
-                (size_t)k * M * sizeof(float),
-                ctx->buf_batch_expert_out, (size_t)k * H * sizeof(float));
-        }
-    }
+          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
 
     // --- 7. Shared expert down projection ---
     format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_down,
@@ -343,9 +272,7 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> __strong *enc_ptr,
     [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
-    // Write back encoder/cmd in case they changed (fallback paths create new ones)
-    *enc_ptr = enc;
-    *cmd_ptr = cmd;
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
 // ============================================================================
@@ -378,10 +305,9 @@ int engine_step(Engine *eng, int token_id) {
     // Hidden state stays on GPU (in buf_moe_hidden) throughout all layers.
     memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
 
-    // Per-layer command buffers with compute copy (no blit encoder transition).
-    id<MTLCommandBuffer> fwd_cmd = nil;
-    id<MTLComputeCommandEncoder> fwd_enc = nil;
-    // fwd_enc = nil means per-layer CBs will be used
+    // Single command buffer for all layers — eliminates per-layer CB overhead
+    id<MTLCommandBuffer> fwd_cmd = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> fwd_enc = [fwd_cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
 
     for (int layer = 0; layer < cfg->num_layers; layer++) {
         int n_experts = cfg->num_experts;
@@ -400,34 +326,16 @@ int engine_step(Engine *eng, int token_id) {
             int key_dim = cfg->linear_key_dim;
             int value_dim = cfg->linear_value_dim;
 
-            // For layers > 0 with moe_combine_copy_sq: residual + sum_sq already computed
             bool skip_copy_norm = (layer > 0 && ctx->moe_combine_copy_sq);
-
-            id<MTLCommandBuffer> cmd = nil;
-            id<MTLComputeCommandEncoder> enc = nil;
-            if (fwd_enc) {
-                enc = fwd_enc;
-                if (!skip_copy_norm) {
-                    [enc setComputePipelineState:ctx->copy_buffer];
-                    [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-                    [enc setBuffer:ctx->buf_residual offset:0 atIndex:1];
-                    { uint c = (uint)H; [enc setBytes:&c length:sizeof(uint) atIndex:2]; }
-                    [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                }
-            } else {
-                cmd = [ctx->queue commandBuffer];
-                enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-                if (!skip_copy_norm) {
-                    [enc setComputePipelineState:ctx->copy_buffer];
-                    [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-                    [enc setBuffer:ctx->buf_residual offset:0 atIndex:1];
-                    { uint c = (uint)H; [enc setBytes:&c length:sizeof(uint) atIndex:2]; }
-                    [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                }
+            id<MTLComputeCommandEncoder> enc = fwd_enc;
+            if (!skip_copy_norm) {
+                [enc setComputePipelineState:ctx->copy_buffer];
+                [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
+                [enc setBuffer:ctx->buf_residual offset:0 atIndex:1];
+                { uint c = (uint)H; [enc setBytes:&c length:sizeof(uint) atIndex:2]; }
+                [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
 
             // --- Phase A: Input norm → buf_input ---
@@ -487,7 +395,7 @@ int engine_step(Engine *eng, int token_id) {
 
             // --- Phase C: Conv1d step ---
             // buf_conv_input → buf_conv_output, updates buf_conv_state[linear_idx]
-            [enc setComputePipelineState:ctx->conv1d_f32 ? ctx->conv1d_f32 : ctx->conv1d];
+            [enc setComputePipelineState:ctx->conv1d_f32];
             [enc setBuffer:ctx->buf_conv_state[linear_idx] offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_conv_input offset:0 atIndex:1];
             [enc setBuffer:tcache[layer].lin.conv.buffer
@@ -513,7 +421,7 @@ int engine_step(Engine *eng, int token_id) {
             // --- Phase E: Compute decay + beta gate ---
             // alpha from buf_linear_decay (reused), beta from buf_linear_beta
             // A_log and dt_bias from weights
-            [enc setComputePipelineState:ctx->decay_beta_f32 ? ctx->decay_beta_f32 : ctx->decay_beta];
+            [enc setComputePipelineState:ctx->decay_beta_f32];
             [enc setBuffer:ctx->buf_linear_decay offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_linear_beta offset:0 atIndex:1];
             [enc setBuffer:tcache[layer].lin.A_log.buffer
@@ -566,7 +474,7 @@ int engine_step(Engine *eng, int token_id) {
 
             // DIAG: all phase outputs for layer 0
             if (eng->pos == 0 && layer == 0) {
-                [enc endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+                [enc endEncoding]; [fwd_cmd commit]; [fwd_cmd waitUntilCompleted];
                 float *co = (float *)[ctx->buf_conv_output contents];
                 float *dout = (float *)[ctx->buf_linear_v contents];
                 float *gn = (float *)[ctx->buf_linear_q contents];
@@ -582,8 +490,9 @@ int engine_step(Engine *eng, int token_id) {
                 for (int i=0;i<H;i++) osum+=fabsf(op[i]);
                 fprintf(stderr, "[L0] conv=%.4f delta=%.6f gated=%.4f(mean=%.6f) oproj=%.4f(mean=%.6f)\n",
                         cmx, dmx, gmx, gsum/tv, omx, osum/H);
-                cmd = [ctx->queue commandBuffer];
-                enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                fwd_cmd = [ctx->queue commandBuffer];
+                fwd_enc = [fwd_cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                enc = fwd_enc;
             }
             // --- Phase I+J: Fused residual add + sum_sq → buf_moe_hidden ---
             { uint num_tgs = ((uint)H + 255) / 256;
@@ -627,16 +536,13 @@ int engine_step(Engine *eng, int token_id) {
                     ctx->buf_input, 0, ctx->buf_output, sgg_off);
             }
 
-            // GGUF GPU-resident expert forward (no CPU readback)
-            encode_experts_gguf(&enc, &cmd, ctx, cfg,
+            // GPU-resident expert forward
+            double moe_t0 = now_ms();
+            encode_experts_gguf(enc, ctx, cfg,
                                 &eng->expert_layer_cache[layer],
                                 &tcache[layer], effective_k);
-            if (!fwd_enc) {
-                [enc endEncoding];
-                [cmd commit];
-            }
-
             t1 = now_ms();
+            t_moe_total += t1 - moe_t0;
             t_attn_total += t1 - t0;
 
             linear_idx++;
@@ -656,34 +562,16 @@ int engine_step(Engine *eng, int token_id) {
             int kv_dim = cfg->kv_dim;
             int seq_len = pos + 1;
 
-            // For layers > 0 with moe_combine_copy_sq: residual + sum_sq already computed
             bool skip_copy_norm = (layer > 0 && ctx->moe_combine_copy_sq);
-
-            id<MTLCommandBuffer> cmd = nil;
-            id<MTLComputeCommandEncoder> enc = nil;
-            if (fwd_enc) {
-                enc = fwd_enc;
-                if (!skip_copy_norm) {
-                    [enc setComputePipelineState:ctx->copy_buffer];
-                    [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-                    [enc setBuffer:ctx->buf_residual offset:0 atIndex:1];
-                    { uint c = (uint)H; [enc setBytes:&c length:sizeof(uint) atIndex:2]; }
-                    [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                }
-            } else {
-                cmd = [ctx->queue commandBuffer];
-                enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-                if (!skip_copy_norm) {
-                    [enc setComputePipelineState:ctx->copy_buffer];
-                    [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
-                    [enc setBuffer:ctx->buf_residual offset:0 atIndex:1];
-                    { uint c = (uint)H; [enc setBytes:&c length:sizeof(uint) atIndex:2]; }
-                    [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                }
+            id<MTLComputeCommandEncoder> enc = fwd_enc;
+            if (!skip_copy_norm) {
+                [enc setComputePipelineState:ctx->copy_buffer];
+                [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
+                [enc setBuffer:ctx->buf_residual offset:0 atIndex:1];
+                { uint c = (uint)H; [enc setBytes:&c length:sizeof(uint) atIndex:2]; }
+                [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
 
             // --- Phase A: Input norm → buf_input ---
@@ -919,37 +807,25 @@ int engine_step(Engine *eng, int token_id) {
                     ctx->buf_input, 0, ctx->buf_output, sgg_off);
             }
 
-            // GGUF GPU-resident expert forward (no CPU readback)
-            encode_experts_gguf(&enc, &cmd, ctx, cfg,
+            // GPU-resident expert forward
+            double moe_t0 = now_ms();
+            encode_experts_gguf(enc, ctx, cfg,
                                 &eng->expert_layer_cache[layer],
                                 &tcache[layer], effective_k);
-            if (!fwd_enc) {
-                [enc endEncoding];
-                [cmd commit];
-            }
-
             t1 = now_ms();
+            t_moe_total += t1 - moe_t0;
             t_attn_total += t1 - t0;
 
             full_idx++;
             continue;
         }
 
-        // (CPU fallback path removed — GPU-resident GGUF is the only path)
     }
 
     // Sync GPU + final norm + LM head
     t0 = now_ms();
     {
-        // Use shared forward-pass encoder if available
-        id<MTLCommandBuffer> cmd = nil;
-        id<MTLComputeCommandEncoder> enc = nil;
-        if (fwd_enc) {
-            enc = fwd_enc;
-        } else {
-            cmd = [ctx->queue commandBuffer];
-            enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-        }
+        id<MTLComputeCommandEncoder> enc = fwd_enc;
 
         // RMS norm: buf_moe_hidden → buf_input
         if (ctx->moe_combine_copy_sq) {
@@ -997,10 +873,9 @@ int engine_step(Engine *eng, int token_id) {
         format_dispatch_matvec(enc, ctx, (TensorRef *)&eng->globals.lm_head,
             ctx->buf_input, 0, ctx->buf_output, 0);
 
-        // GPU argmax: find max index without copying 993KB logits to CPU
-        if (ctx->argmax && ctx->buf_argmax_result) {
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            [enc setComputePipelineState:ctx->argmax];
+        // GPU argmax
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        {   [enc setComputePipelineState:ctx->argmax];
             [enc setBuffer:ctx->buf_output offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_argmax_result offset:0 atIndex:1];
             { uint v = (uint)cfg->vocab_size;
@@ -1010,22 +885,15 @@ int engine_step(Engine *eng, int token_id) {
         }
 
         [enc endEncoding];
-        id<MTLCommandBuffer> wait_cmd = fwd_cmd ? fwd_cmd : cmd;
-        [wait_cmd commit];
-        [wait_cmd waitUntilCompleted];
+        [fwd_cmd commit];
+        [fwd_cmd waitUntilCompleted];
 
     }
     t1 = now_ms();
     t_lmhead_total += t1 - t0;
 
-    // 5. Sample (greedy argmax)
-    int next_token;
-    if (ctx->argmax && ctx->buf_argmax_result) {
-        // GPU argmax already computed — just read the 4-byte result
-        next_token = (int)(*(uint32_t *)[ctx->buf_argmax_result contents]);
-    } else {
-        next_token = cpu_argmax(eng->logits, cfg->vocab_size);
-    }
+    // 5. Sample (GPU argmax — read 4-byte result)
+    int next_token = (int)(*(uint32_t *)[ctx->buf_argmax_result contents]);
 
     eng->pos++;
     profile_count++;
@@ -1034,9 +902,8 @@ int engine_step(Engine *eng, int token_id) {
     if (profile_count % 10 == 0) {
         double inv = 1.0 / profile_count;
         double attn_only = t_attn_total - t_moe_total;
-        fprintf(stderr, "[profile] avg/tok: attn=%.1fms moe=%.1fms norm=%.2fms lmhead=%.1fms\n",
-                attn_only * inv, t_moe_total * inv, t_norm_total * inv, t_lmhead_total * inv);
-        // (legacy moe_print_layer_stats removed)
+        fprintf(stderr, "[profile] avg/tok: attn=%.1fms moe=%.1fms lmhead=%.1fms\n",
+                attn_only * inv, t_moe_total * inv, t_lmhead_total * inv);
     }
 
     double step_ms = now_ms() - step_start;

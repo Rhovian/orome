@@ -169,7 +169,6 @@ Vocabulary *vocab_load(const char *path) {
 
     Vocabulary *v = calloc(1, sizeof(Vocabulary));
     v->num_tokens = (int)count;
-    v->max_id = (int)max_id;
     v->tokens = calloc(count, sizeof(char *));
     v->lengths = calloc(count, sizeof(int));
 

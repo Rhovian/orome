@@ -111,13 +111,7 @@ static void sse_send_done(int fd, const char *req_id) {
 
 static int sample_next(Engine *eng, int token_id, float temperature, int top_k) {
     engine_step(eng, token_id);
-    // Read logits directly from GPU shared buffer (no copy on unified memory)
-    const float *logits;
-    if (eng->ctx && eng->ctx->buf_output) {
-        logits = (const float *)[eng->ctx->buf_output contents];
-    } else {
-        logits = eng->logits;
-    }
+    const float *logits = (const float *)[eng->ctx->buf_output contents];
     return cpu_sample_topk(logits, eng->cfg->vocab_size, top_k, temperature);
 }
 
@@ -277,9 +271,7 @@ void serve_loop(Engine *eng, Vocabulary *vocab, int port) {
 
             // Re-sample the first token after prefill
             if (temperature > 0) {
-                const float *logits = (eng->ctx && eng->ctx->buf_output)
-                    ? (const float *)[eng->ctx->buf_output contents]
-                    : eng->logits;
+                const float *logits = (const float *)[eng->ctx->buf_output contents];
                 next_token = cpu_sample_topk(logits, eng->cfg->vocab_size,
                                              top_k, temperature);
             }

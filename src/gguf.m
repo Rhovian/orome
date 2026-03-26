@@ -469,10 +469,6 @@ GGUFTensorInfo *gguf_find_tensor(GGUFFile *gf, const char *name) {
     return &gf->tensors[idx];
 }
 
-void *gguf_tensor_data(GGUFFile *gf, GGUFTensorInfo *ti) {
-    if (!gf || !ti) return NULL;
-    return (uint8_t *)gf->mmap_base + gf->data_offset + ti->offset;
-}
 
 size_t gguf_tensor_size(GGUFTensorInfo *ti) {
     if (!ti) return 0;
