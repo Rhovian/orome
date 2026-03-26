@@ -514,8 +514,41 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
             // Conv1d weights: GGUF stores [ne0=kernel_size, ne1=conv_dim] F32
             // Already in [conv_dim, kernel_size] memory order (ne0 contiguous per channel)
             // Use F32 conv1d kernel directly — no conversion needed
+            // Conv1d: F32, [kernel_size=4, conv_dim=8192] = [4, Q(2048)+K(2048)+V(4096)]
+            // V-portion channels (4096-8191) are head-interleaved like other V-head tensors
             snprintf(name, sizeof(name), "blk.%d.ssm_conv1d.weight", i);
-            c->lin.conv = G_RAW_F32(name);
+            {
+                GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
+                if (ti && ti->type == 0 && ti->dims[0] == 4) {
+                    int cd = (int)ti->dims[1];  // 8192
+                    int qk_ch = 2 * cfg->linear_num_k_heads * cfg->linear_key_dim;  // 4096
+                    int v_ch = total_value;  // 4096
+                    int hd = cfg->linear_value_dim;  // 128
+                    size_t bytes = cd * 4 * sizeof(float);  // 4 taps per channel
+
+                    id<MTLBuffer> db = [ctx->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+                    float *s = (float *)((uint8_t *)[buf contents] + gf->data_offset + ti->offset);
+                    float *d = (float *)[db contents];
+
+                    // Copy Q+K channels unchanged
+                    memcpy(d, s, (size_t)qk_ch * 4 * sizeof(float));
+
+                    // De-interleave V channels
+                    int v_half = v_ch / 2;
+                    for (int ch = 0; ch < v_ch; ch++) {
+                        int half = ch / v_half;
+                        int within = ch % v_half;
+                        int head_idx = within / hd;
+                        int pos = within % hd;
+                        int ref_ch = (head_idx * 2 + half) * hd + pos;
+                        memcpy(d + (qk_ch + ref_ch) * 4, s + (qk_ch + ch) * 4, 4 * sizeof(float));
+                    }
+
+                    c->lin.conv = (TensorRef){ .buffer = db, .offset = 0, .format = QFMT_F32 };
+                } else {
+                    c->lin.conv = G_RAW_F32(name);
+                }
+            }
             // A_log and dt_bias: F32, 32 elements, head-interleaved
             // De-interleave: deint[r*2] = gguf[r], deint[r*2+1] = gguf[half+r] for r<half
             #define DEINTERLEAVE_F32_RAW(tname, out_ref) do { \
