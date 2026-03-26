@@ -89,3 +89,7 @@ n/a	60.85	1384.0	0.0	discard	per-head attn scores kernel — 2% regression vs tr
 n/a	60.06	1420.0	0.0	discard	inline decay_beta into delta_net: data race (missing barrier after QK norm) + 3% regression
 e82b32a	62.39	1369.0	0.0	keep	GPU argmax: eliminate 993KB logits readback + CPU argmax scan
 n/a	62.53	1362.0	0.0	discard	fused QK weighted norm + RoPE kernel (full attn) — within noise, shared memory overhead offsets saved dispatches
+6320eff	48.51	2206.2	1.1011	keep	baseline: re-benchmark current GGUF HEAD before K=8 moe_combine specialization
+n/a	48.30	2111.5	1.1011	discard	specialize moe_combine_copy_sq for live K=8 and hoist shared_gate via threadgroup broadcast
+48ce29e	48.87	2101.6	1.1011	keep	specialize moe_combine_copy_sq for live K=8 without extra synchronization
+n/a	48.48	2136.9	1.1011	discard	precompute shared gate sigmoid in softmax_topk_route and consume it directly in combine

@@ -1,17 +1,16 @@
 # Orome Optimization Status — GGUF Q4_K / Q8_0 Era
 
 ## Current Best
-- **48.73 tok/s** (Q4_K_S GGUF, 100 tokens sustained)
-- TTFT: **2096.2 ms**
+- **48.87 tok/s** (Q4_K_S GGUF, 100 tokens sustained)
+- TTFT: **2101.6 ms**
 - `proj_avg_ms`: **1.1011**
 - Branch: `autoresearch/orome`
-- Best keep commit: `e2f98ff`
-- Current HEAD: `169939a` (log-only; source state still matches `e2f98ff`)
+- Best keep commit: `48ce29e`
+- Source state: matches `48ce29e`
 - Model: `/Users/j/Code/lllm/models/Qwen3.5-35B-A3B-Q4_K_S.gguf`
 
 ## Current Campaign Reality
-- This GGUF is **not** a Q5_K mix in practice.
-- Tensor counts from `--gguf-info`:
+- This GGUF is still the same live-format mix:
   - `Q8_0`: 311 tensors
   - `F32`: 301 tensors
   - `Q4_K`: 120 tensors
@@ -21,35 +20,46 @@
   - shared expert `gate/up/down`: **Q8_0**
   - `routing_gate`: **F32**
   - `shared_expert_gate`: **F32**
-- Consequence: old Q5_K-focused hypotheses are historical context only, not primary live-path targets for this model.
+- Consequence: the best remaining wins are still in **live GGUF MoE dispatches and combine work**, not old packed-format ideas or Q5-focused hypotheses.
 
 ## Important GGUF-Era Wins
 1. `a386dbf` — specialize Q4_K scale unpack in the hot GGUF kernels: **48.22 tok/s**
 2. `456acce` — fuse `F32 routing_gate + shared_expert_gate` into one dispatch: **48.44 tok/s**
-3. `e2f98ff` — fuse `Q8_0 shared gate + up + SwiGLU` for the live shared-expert path: **48.61 tok/s**
-4. `44c47ea` is still useful context, but later tensor inspection showed its `Q5_K` win is not a real live-path effect for this GGUF.
+3. `e2f98ff` — fuse `Q8_0 shared gate + up + SwiGLU` for the live shared expert path: **48.61 tok/s**
+4. `48ce29e` — specialize `moe_combine_copy_sq` for the live `K=8` path without extra synchronization: **48.87 tok/s**
 
 ## Latest Session
-1. Re-bench current HEAD at `169939a`: **48.73 tok/s**, TTFT `2096.2 ms`
-   - Confirms the current code still sits in the established `48.6-48.7 tok/s` GGUF regime
-2. `n/a` — schedule fused `shared_down` earlier to overlap with routing and routed expert work: **48.54 tok/s**, TTFT `2121.5 ms`
-   - Regression versus the fresh baseline; discarded and source reverted
-3. No new source change beat the current source-state baseline
-   - The best live code path is still the `e2f98ff` shared `Q8_0 gate + up + SwiGLU` fusion, with `169939a` only carrying log updates
-
-## What Failed
-1. `n/a` — 2-row GGUF `Q8_0` general matvec: **48.60 tok/s**, TTFT `2105.1 ms`
-2. `n/a` — dedicated 2-row `Q8_0 shared_down` kernel: **48.57 tok/s**, TTFT `2098.5 ms`
-3. `n/a` — early `shared_down` overlap scheduling: **48.54 tok/s**, TTFT `2121.5 ms`
-4. Conclusion: both standalone `Q8_0` micro-kernel variants and the simple early-scheduling `shared_down` overlap idea are below the current best and should be treated as exhausted unless a trace reveals a more specific dependency issue.
+1. Re-bench current pre-session source state: **48.51 tok/s**, TTFT `2206.2 ms`
+   - Confirms the branch was still in the established `48.5-48.7 tok/s` GGUF regime before new edits
+2. `n/a` — specialize `moe_combine_copy_sq` for live `K=8` and hoist `shared_gate` via threadgroup broadcast: **48.30 tok/s**
+   - Regression; the added intra-kernel synchronization cost more than it saved
+3. `48ce29e` — specialize `moe_combine_copy_sq` for live `K=8` without extra synchronization: **48.87 tok/s**
+   - New best result; fixed-`K` unrolling in combine is a real live-path win
+4. `n/a` — precompute shared gate sigmoid in `softmax_topk_route` and consume it directly in combine: **48.48 tok/s**
+   - Regression; moving the scalar sigmoid upstream did not translate into end-to-end throughput
 
 ## Interpretation
-- The branch is stable around **48.5-48.7 tok/s**, and `proj_avg_ms` is still pinned at `1.1011`.
-- The new failed test matters because it weakens the simplest remaining `shared_down` scheduling hypothesis: launching it earlier did not expose useful overlap and slightly hurt TTFT.
-- The real wins in the GGUF era are still **dispatch elimination/fusion on live MoE side paths**, not projection micro-metrics or naive reordering by themselves.
+- The first real improvement past the prior `48.73 tok/s` plateau came from the **MoE combine kernel**, not projection kernels.
+- The useful part of the combine hypothesis was **fixed-`K=8` specialization**; the harmful part was adding synchronization or redistributing the shared-gate scalar work.
+- `proj_avg_ms` stayed pinned at `1.1011`, so this gain sits outside the benchmark's projection timing and reinforces that the MoE tail is still a live optimization target.
+
+## What Failed
+1. `n/a` — specialize `moe_combine_copy_sq` for live `K=8` and hoist `shared_gate` via threadgroup broadcast: **48.30 tok/s**
+2. `n/a` — precompute shared gate sigmoid in `softmax_topk_route` and consume it directly in combine: **48.48 tok/s**
+3. `n/a` — 2-row GGUF `Q8_0` general matvec: **48.60 tok/s**
+4. `n/a` — dedicated 2-row `Q8_0 shared_down` kernel: **48.57 tok/s**
+5. `n/a` — early `shared_down` overlap scheduling: **48.54 tok/s**
 
 ## Next Best Ideas
-1. Revisit `shared_down` only as a **true fusion/writeback elimination** problem, not a scheduling problem: test folding the shared contribution into `moe_combine_copy_sq` or otherwise removing the extra `buf_shared_out` write.
-2. Specialize `moe_combine_copy_sq` for the live `K=8` benchmark path and hoist the scalar shared-gate work out of the per-element hot loop.
-3. Use Metal System Trace if available to identify the top post-fusion kernels before touching more shader code.
-4. Audit the live GGUF tensor map for other low-occupancy or scalar-like dispatches similar to the earlier `shared_expert_gate` waste.
+1. Revisit `shared_down` only as a **true writeback-elimination / fusion** problem: fold the shared contribution into combine or otherwise remove the extra `buf_shared_out` traffic.
+2. If staying on the combine path, prefer **instruction-level** changes that add no new threadgroup barriers: fixed-slot parameter handling, constant-address-space experiments, or other no-sync simplifications.
+3. Use Metal System Trace to confirm whether `moe_combine_copy_sq_k8`, `softmax_topk_route`, or `shared_down` is the top post-`48ce29e` target before making a larger shader change.
+4. Audit the live GGUF tensor map again for other small scalar-like dispatches analogous to the earlier `shared_expert_gate` fusion win.
+
+## Current Log
+- `48ce29e` is the retained source commit.
+- `results.tsv` has been updated with:
+  - the fresh `48.51 tok/s` session baseline,
+  - the discarded broadcast-hoist combine variant,
+  - the kept `48.87 tok/s` `K=8` combine specialization,
+  - the discarded route-side shared-gate hoist.
