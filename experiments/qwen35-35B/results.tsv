@@ -101,3 +101,6 @@ n/a	46.91	1999.8	1.1011	discard	fuse live Q8_0 shared_down into the K=8 combine 
 4954529	47.68	1986.2	1.1011	keep	baseline: re-benchmark current GGUF HEAD before simplifying live routing top-k
 88553c3	57.50	1944.5	1.1011	keep	select top-K directly from routing logits and normalize only the chosen experts
 n/a	57.44	1950.8	1.1011	discard	shrink softmax_topk_route launch from 256 threads to a single 32-thread simdgroup
+b23b089	57.36	1924.4	1.1011	keep	baseline: re-benchmark current HEAD after latest 35B status update
+44eeb52	57.63	1923.3	1.1011	keep	defer shared expert gate/up past routing so softmax waits only on routing logits
+bd669d4	58.45	1947.4	1.1011	keep	hoist K=8 combine shared-gate sigmoid per simdgroup without extra synchronization

@@ -1,12 +1,12 @@
 # Orome Optimization Status — GGUF Q4_K / Q8_0 Era
 
 ## Current Best
-- **57.50 tok/s** (Q4_K_S GGUF, 100 tokens sustained)
-- TTFT: **1944.5 ms**
+- **58.45 tok/s** (Q4_K_S GGUF, 100 tokens sustained)
+- TTFT: **1947.4 ms**
 - `proj_avg_ms`: **1.1011**
 - Branch: `autoresearch/orome`
-- Best keep commit: `88553c3`
-- Source state: matches `88553c3`
+- Best keep commit: `bd669d4`
+- Source state: matches `bd669d4`
 - Model: `/Users/j/Code/lllm/models/Qwen3.5-35B-A3B-Q4_K_S.gguf`
 
 ## Current Campaign Reality
@@ -23,27 +23,25 @@
 - Consequence: the best remaining wins are still in **live GGUF MoE dispatches and combine work**, not old packed-format ideas or Q5-focused hypotheses.
 
 ## Important GGUF-Era Wins
-1. `88553c3` — select top-K directly from routing logits and normalize only the chosen experts: **57.50 tok/s**
-2. `a386dbf` — specialize Q4_K scale unpack in the hot GGUF kernels: **48.22 tok/s**
-3. `456acce` — fuse `F32 routing_gate + shared_expert_gate` into one dispatch: **48.44 tok/s**
-4. `e2f98ff` — fuse `Q8_0 shared gate + up + SwiGLU` for the live shared expert path: **48.61 tok/s**
-5. `48ce29e` — specialize `moe_combine_copy_sq` for the live `K=8` path without extra synchronization: **48.87 tok/s**
+1. `bd669d4` — hoist the live `K=8` combine shared-gate sigmoid once per simdgroup without extra sync: **58.45 tok/s**
+2. `44eeb52` — defer shared expert gate/up past routing so softmax waits only on routing logits: **57.63 tok/s**
+3. `88553c3` — select top-K directly from routing logits and normalize only the chosen experts: **57.50 tok/s**
+4. `48ce29e` — specialize `moe_combine_copy_sq` for the live `K=8` path without extra synchronization: **48.87 tok/s**
+5. `e2f98ff` — fuse `Q8_0 shared gate + up + SwiGLU` for the live shared expert path: **48.61 tok/s**
 
 ## Latest Session
-1. Re-bench current branch head `4954529`: **47.68 tok/s**, TTFT `1986.2 ms`
-   - Fresh session baseline before touching routing; confirms the post-`48ce29e` code was still in the same `47-48 tok/s` GGUF regime
-2. `88553c3` — select top-K directly from raw routing logits and softmax only the chosen experts: **57.50 tok/s**
-   - This keeps the MoE math equivalent for the live path because the old kernel renormalized the selected experts after a full softmax; the global denominator canceled out
-   - Sanity run reached `[tok 100]`, so the gain was not an early-EOS benchmark artifact
-3. `n/a` — shrink `softmax_topk_route` launch from 256 threads to one 32-thread simdgroup: **57.44 tok/s**
-   - Slight regression versus `88553c3`; once the redundant full-softmax work was removed, reducing the launch width alone did not buy additional end-to-end throughput
+1. Re-bench current branch head `b23b089`: **57.36 tok/s**, TTFT `1924.4 ms`
+   - Fresh same-session baseline on the retained routing path before new MoE-tail follow-ups
+2. `44eeb52` — defer shared expert gate/up past routing so the first MoE barrier waits only on routing logits: **57.63 tok/s**
+   - Moving the live shared expert projection out of the initial routing barrier bought a small but real gain while keeping the same dependency structure
+3. `bd669d4` — hoist the live `K=8` combine shared-gate sigmoid once per simdgroup via `simd_broadcast_first`: **58.45 tok/s**
+   - This revisits an old negative shared-gate-hoist idea, but without the threadgroup synchronization that previously erased the benefit
 
 ## Interpretation
-- The prior GGUF-era focus on `shared_down` and combine was too narrow. The live routing kernel was still paying for a full 256-way softmax even though the selected expert weights were renormalized immediately afterward.
-- For this inference path, selecting top-K on raw logits and normalizing only the chosen experts is mathematically equivalent to the old full-softmax-plus-renorm behavior, and it removed a large amount of redundant work from every layer.
-- The jump from `47.68` to `57.50 tok/s` with `proj_avg_ms` still pinned at `1.1011` is strong evidence that a major remaining bottleneck was outside the benchmark's projection timer and inside the MoE routing tail.
-- The discarded 32-thread follow-up suggests the main win was the removed math and reduction work, not simply the original 256-thread launch shape.
-- The old `shared_down+combine` fusion regression is still relevant: overlap-sensitive MoE work remains real, but routing now has to be treated as a first-class hot path alongside combine and shared expert tail work.
+- Routing was not the end of the GGUF MoE story. After `88553c3`, there was still measurable time in overlap-sensitive shared-expert and combine-side work even though `proj_avg_ms` stayed pinned at `1.1011`.
+- `44eeb52` is positive evidence that the initial MoE routing barrier was still too conservative: letting shared expert gate/up overlap with routed expert work is better than making routing softmax wait on it.
+- `bd669d4` is positive evidence that combine-side scalar hoists can help, but only when they preserve the current overlap structure. The old threadgroup-broadcast shared-gate experiment was negative; the barrier-free simdgroup-broadcast version is positive.
+- A short Metal System Trace on `44eeb52` completed successfully, but the current command buffers and encoders are effectively unlabeled for this workload, so the trace was not yet sufficient to cleanly identify which individual `orome` dispatch replaced routing as the next dominant cost.
 
 ## What Failed
 1. `n/a` — shrink `softmax_topk_route` launch from 256 threads to a single 32-thread simdgroup: **57.44 tok/s**
@@ -57,15 +55,16 @@
 9. `n/a` — early `shared_down` overlap scheduling: **48.54 tok/s**
 
 ## Next Best Ideas
-1. Use Metal System Trace on `88553c3` to see what replaced routing as the dominant MoE-tail cost: `moe_combine_copy_sq_k8`, `shared_down`, expert down, or some other dispatch outside `proj_avg_ms`.
-2. Re-audit the MoE path for other places where the live inference math cancels or renormalizes away work the kernels still perform, analogous to the removed full-softmax denominator in routing.
-3. If routing still shows up in trace, try a shape-specific `K=8`, `n_experts=256` specialization that preserves the current 256-thread launch but trims remaining per-threadgroup overhead without changing overlap structure.
-4. Revisit combine-side simplifications only if they preserve the existing standalone `shared_down` overlap; the earlier fused consumer-side versions are still negative evidence against serializing that path.
+1. Add temporary Metal labels around `orome` compute command buffers and encoders before another Metal System Trace pass, so the trace can attribute the remaining MoE-tail cost to a specific dispatch instead of anonymous `Compute Command 0` work.
+2. Try a shape-specific `softmax_topk_route` specialization for `K=8`, `n_experts=256` that preserves the current 256-thread launch but trims the remaining top-k overhead without changing overlap structure.
+3. Revisit early `shared_down` overlap from the new `44eeb52` scheduling baseline; the old negative evidence predates deferring shared gate/up past routing.
+4. Look for other combine-side scalar or reduction hoists that can use simdgroup broadcast without threadgroup barriers, following the positive `bd669d4` result.
 
 ## Current Log
-- `88553c3` is the retained source commit and current best result.
-- Source code was restored after the discarded 32-thread `softmax_topk_route` launch experiment; the working tree build matches `88553c3` again.
+- `bd669d4` is the retained source commit and current best result.
+- `44eeb52` remains retained underneath it as the first scheduling win of this session.
+- A short Metal System Trace was captured on `44eeb52`, but unlabeled `orome` compute work limited per-dispatch attribution.
 - `results.tsv` has been updated with:
-  - the fresh `47.68 tok/s` branch-head baseline on `4954529`,
-  - the retained `57.50 tok/s` routing-kernel simplification on `88553c3`,
-  - the discarded `57.44 tok/s` 32-thread routing launch follow-up.
+  - the fresh `57.36 tok/s` baseline on `b23b089`,
+  - the retained `57.63 tok/s` shared-gate-up scheduling change on `44eeb52`,
+  - the retained `58.45 tok/s` barrier-free combine shared-gate hoist on `bd669d4`.
