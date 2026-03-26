@@ -1015,9 +1015,10 @@ kernel void compute_decay_beta(
 ) {
     float a_val = alpha_out[idx];
     float dt_b = bf16_to_f32(dt_bias[idx]);
-    float A_val = exp(A_log[idx]);
+    // GGUF ssm_a stores -exp(A_log), not A_log itself
+    float neg_A = A_log[idx];  // = -exp(A_log) = -A
     float softplus_val = log(1.0f + exp(a_val + dt_b));
-    g_decay[idx] = exp(-A_val * softplus_val);
+    g_decay[idx] = exp(neg_A * softplus_val);  // exp(-A * softplus)
     beta_gate[idx] = 1.0f / (1.0f + exp(-beta_out[idx]));
 }
 
@@ -1034,9 +1035,10 @@ kernel void compute_decay_beta_f32(
 ) {
     float a_val = alpha_out[idx];
     float dt_b = dt_bias[idx];
-    float A_val = exp(A_log[idx]);
+    // GGUF ssm_a stores -exp(A_log), not A_log itself
+    float neg_A = A_log[idx];  // = -exp(A_log) = -A
     float softplus_val = log(1.0f + exp(a_val + dt_b));
-    g_decay[idx] = exp(-A_val * softplus_val);
+    g_decay[idx] = exp(neg_A * softplus_val);  // exp(-A * softplus)
     beta_gate[idx] = 1.0f / (1.0f + exp(-beta_out[idx]));
 }
 
