@@ -561,10 +561,15 @@ int engine_step(Engine *eng, int token_id) {
                     && lt->routing_gate.out_dim == (uint32_t)n_experts
                     && lt->shared_expert_gate.out_dim == 1
                     && lt->routing_gate.in_dim == lt->shared_expert_gate.in_dim;
-                bool fuse_shared_gate_up =
-                    ctx->shared_gate_up_swiglu_q4k
-                    && lt->shared_gate.format == QFMT_GGUF_Q4_K
-                    && lt->shared_up.format == QFMT_GGUF_Q4_K;
+                id<MTLComputePipelineState> shared_gate_up_pipe = nil;
+                if (lt->shared_gate.format == QFMT_GGUF_Q4_K
+                        && lt->shared_up.format == QFMT_GGUF_Q4_K) {
+                    shared_gate_up_pipe = ctx->shared_gate_up_swiglu_q4k;
+                } else if (lt->shared_gate.format == QFMT_GGUF_Q8_0
+                               && lt->shared_up.format == QFMT_GGUF_Q8_0) {
+                    shared_gate_up_pipe = ctx->shared_gate_up_swiglu_q8_0;
+                }
+                bool fuse_shared_gate_up = shared_gate_up_pipe != nil;
                 if (fuse_routing_shared_gate) {
                     uint od = (uint)lt->routing_gate.out_dim;
                     uint id_ = (uint)lt->routing_gate.in_dim;
@@ -586,7 +591,7 @@ int engine_step(Engine *eng, int token_id) {
                 }
                 if (fuse_shared_gate_up) {
                     NSUInteger shared_tg_size = ENGINE_ROWS_PER_TG * 32;
-                    [enc setComputePipelineState:ctx->shared_gate_up_swiglu_q4k];
+                    [enc setComputePipelineState:shared_gate_up_pipe];
                     [enc setBuffer:lt->shared_gate.buffer offset:lt->shared_gate.offset atIndex:0];
                     [enc setBuffer:lt->shared_up.buffer offset:lt->shared_up.offset atIndex:1];
                     [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
@@ -873,10 +878,15 @@ int engine_step(Engine *eng, int token_id) {
                     && lt->routing_gate.out_dim == (uint32_t)n_experts
                     && lt->shared_expert_gate.out_dim == 1
                     && lt->routing_gate.in_dim == lt->shared_expert_gate.in_dim;
-                bool fuse_shared_gate_up =
-                    ctx->shared_gate_up_swiglu_q4k
-                    && lt->shared_gate.format == QFMT_GGUF_Q4_K
-                    && lt->shared_up.format == QFMT_GGUF_Q4_K;
+                id<MTLComputePipelineState> shared_gate_up_pipe = nil;
+                if (lt->shared_gate.format == QFMT_GGUF_Q4_K
+                        && lt->shared_up.format == QFMT_GGUF_Q4_K) {
+                    shared_gate_up_pipe = ctx->shared_gate_up_swiglu_q4k;
+                } else if (lt->shared_gate.format == QFMT_GGUF_Q8_0
+                               && lt->shared_up.format == QFMT_GGUF_Q8_0) {
+                    shared_gate_up_pipe = ctx->shared_gate_up_swiglu_q8_0;
+                }
+                bool fuse_shared_gate_up = shared_gate_up_pipe != nil;
                 if (fuse_routing_shared_gate) {
                     uint od = (uint)lt->routing_gate.out_dim;
                     uint id_ = (uint)lt->routing_gate.in_dim;
@@ -898,7 +908,7 @@ int engine_step(Engine *eng, int token_id) {
                 }
                 if (fuse_shared_gate_up) {
                     NSUInteger shared_tg_size = ENGINE_ROWS_PER_TG * 32;
-                    [enc setComputePipelineState:ctx->shared_gate_up_swiglu_q4k];
+                    [enc setComputePipelineState:shared_gate_up_pipe];
                     [enc setBuffer:lt->shared_gate.buffer offset:lt->shared_gate.offset atIndex:0];
                     [enc setBuffer:lt->shared_up.buffer offset:lt->shared_up.offset atIndex:1];
                     [enc setBuffer:ctx->buf_input offset:0 atIndex:2];

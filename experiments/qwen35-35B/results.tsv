@@ -12,6 +12,7 @@ n/a	47.81	2100.8	1.1011	discard	threadgroup-cache x in matvec_f32 for <=2048-dim
 3626e09	47.77	2103.2	1.1011	keep	baseline: re-benchmark current GGUF HEAD before 2-row GGUF Q5_K matvec experiment
 n/a	48.10	2094.4	1.1011	keep	2-row GGUF Q5_K matvec: halve threadgroups for general Q5_K dispatches
 n/a	48.44	2103.6	1.1011	keep	fuse F32 routing_gate + shared_expert_gate into one dispatch
+n/a	48.61	2108.9	1.1011	keep	fuse Q8_0 shared gate+up+SwiGLU for live shared expert path
 4cb4516	1.04	3016.0	0.0	keep	baseline: naive single-dispatch GPU, CPU experts
 499b87b	1.05	76440.0	0.0	keep	batch linear attn projections (qkv/z/a/b) into single GPU commit
 e259b59	1.06	75388.0	0.0	keep	batch MoE routing+shared expert gate/up/shared_gate into single GPU commit

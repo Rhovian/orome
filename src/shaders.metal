@@ -1602,6 +1602,65 @@ kernel void shared_gate_up_swiglu_q4k(
     }
 }
 
+kernel void shared_gate_up_swiglu_q8_0(
+    device const uint8_t*       gate_data       [[buffer(0)]],
+    device const uint8_t*       up_data         [[buffer(1)]],
+    device const float*         x               [[buffer(2)]],
+    device float*               out             [[buffer(3)]],
+    constant uint&              out_dim         [[buffer(4)]],
+    constant uint&              in_dim          [[buffer(5)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = half(x[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= out_dim) return;
+
+    uint num_blocks = in_dim / 32;
+    uint bytes_per_row = num_blocks * 34;
+    device const uint8_t* gate_row_data = gate_data + row * bytes_per_row;
+    device const uint8_t* up_row_data = up_data + row * bytes_per_row;
+
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    for (uint blk = simd_lane; blk < num_blocks; blk += 32) {
+        uint x_base = blk * 32;
+
+        device const uint8_t* gate_block = gate_row_data + blk * 34;
+        float gate_d = float(as_type<half>(ushort(ushort(gate_block[0]) | (ushort(gate_block[1]) << 8))));
+        device const int8_t* gate_qs = (device const int8_t*)(gate_block + 2);
+        float gate_local = 0.0f;
+        for (uint j = 0; j < 32; j++) {
+            gate_local += gate_d * float(gate_qs[j]) * float(x_shared[x_base + j]);
+        }
+        gate_acc += gate_local;
+
+        device const uint8_t* up_block = up_row_data + blk * 34;
+        float up_d = float(as_type<half>(ushort(ushort(up_block[0]) | (ushort(up_block[1]) << 8))));
+        device const int8_t* up_qs = (device const int8_t*)(up_block + 2);
+        float up_local = 0.0f;
+        for (uint j = 0; j < 32; j++) {
+            up_local += up_d * float(up_qs[j]) * float(x_shared[x_base + j]);
+        }
+        up_acc += up_local;
+    }
+
+    float gate_sum = simd_sum(gate_acc);
+    float up_sum = simd_sum(up_acc);
+    if (simd_lane == 0) {
+        float silu_gate = gate_sum / (1.0f + exp(-gate_sum));
+        out[row] = silu_gate * up_sum;
+    }
+}
+
 // ============================================================================
 // Dynamic Q4_K batched expert down projection (per-expert packed input)
 // ============================================================================

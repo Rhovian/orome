@@ -122,6 +122,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->batch_expert_mv_q4k_dyn = make_pipeline(ctx, @"batch_expert_mv_q4k_dyn");
     ctx->batch_expert_gate_up_swiglu_q4k_dyn = make_pipeline(ctx, @"batch_expert_gate_up_swiglu_q4k_dyn");
     ctx->shared_gate_up_swiglu_q4k = make_pipeline(ctx, @"shared_gate_up_swiglu_q4k");
+    ctx->shared_gate_up_swiglu_q8_0 = make_pipeline(ctx, @"shared_gate_up_swiglu_q8_0");
     ctx->batch_expert_down_q4k_dyn = make_pipeline(ctx, @"batch_expert_down_q4k_dyn");
     ctx->batch_expert_down_q5k_dyn = make_pipeline(ctx, @"batch_expert_down_q5k_dyn");
     ctx->conv1d_f32 = make_pipeline(ctx, @"conv1d_step_f32");
