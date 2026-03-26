@@ -791,9 +791,14 @@ kernel void moe_combine_copy_sq_k8(
 ) {
     (void)K;
 
+    float shared_gate = 0.0f;
+    if (simd_lane == 0) {
+        shared_gate = 1.0f / (1.0f + exp(-params[8]));
+    }
+    shared_gate = simd_broadcast_first(shared_gate);
+
     float val = 0.0f;
     if (tid < dim) {
-        float shared_gate = 1.0f / (1.0f + exp(-params[8]));
         float moe =
             params[0] * expert_out[tid] +
             params[1] * expert_out[dim + tid] +
