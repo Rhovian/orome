@@ -183,46 +183,70 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-    // --- 2. Batched gate projection (Q4K) ---
-    { uint es = (uint)elr->gate.expert_stride;
-      uint od = (uint)M, id_ = (uint)H, nrt = num_row_tgs_M;
-      [enc setComputePipelineState:ctx->batch_expert_mv_q4k_dyn];
-      [enc setBuffer:elr->buffer offset:elr->gate.offset atIndex:0];
-      [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
-      [enc setBuffer:ctx->buf_batch_expert_gate offset:0 atIndex:2];
-      [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
-      [enc setBytes:&es length:sizeof(uint) atIndex:4];
-      [enc setBytes:&od length:sizeof(uint) atIndex:5];
-      [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
-      [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
-      [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
+    bool can_fuse_expert_gate_up =
+        ctx->batch_expert_gate_up_swiglu_q4k_dyn
+        && elr->gate.format == QFMT_GGUF_Q4_K
+        && elr->up.format == QFMT_GGUF_Q4_K;
 
-    // --- 3. Batched up projection (Q4K) ---
-    { uint es = (uint)elr->up.expert_stride;
-      uint od = (uint)M, id_ = (uint)H, nrt = num_row_tgs_M;
-      [enc setComputePipelineState:ctx->batch_expert_mv_q4k_dyn];
-      [enc setBuffer:elr->buffer offset:elr->up.offset atIndex:0];
-      [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
-      [enc setBuffer:ctx->buf_batch_expert_up offset:0 atIndex:2];
-      [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
-      [enc setBytes:&es length:sizeof(uint) atIndex:4];
-      [enc setBytes:&od length:sizeof(uint) atIndex:5];
-      [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
-      [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
-      [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
+    if (can_fuse_expert_gate_up) {
+        uint gate_es = (uint)elr->gate.expert_stride;
+        uint up_es = (uint)elr->up.expert_stride;
+        uint od = (uint)M, id_ = (uint)H, nrt = num_row_tgs_M;
+        [enc setComputePipelineState:ctx->batch_expert_gate_up_swiglu_q4k_dyn];
+        [enc setBuffer:elr->buffer offset:elr->gate.offset atIndex:0];
+        [enc setBuffer:elr->buffer offset:elr->up.offset atIndex:1];
+        [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
+        [enc setBuffer:ctx->buf_batch_expert_act offset:0 atIndex:3];
+        [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:4];
+        [enc setBytes:&gate_es length:sizeof(uint) atIndex:5];
+        [enc setBytes:&up_es length:sizeof(uint) atIndex:6];
+        [enc setBytes:&od length:sizeof(uint) atIndex:7];
+        [enc setBytes:&id_ length:sizeof(uint) atIndex:8];
+        [enc setBytes:&nrt length:sizeof(uint) atIndex:9];
+        [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    } else {
+        // --- 2. Batched gate projection ---
+        { uint es = (uint)elr->gate.expert_stride;
+          uint od = (uint)M, id_ = (uint)H, nrt = num_row_tgs_M;
+          [enc setComputePipelineState:ctx->batch_expert_mv_q4k_dyn];
+          [enc setBuffer:elr->buffer offset:elr->gate.offset atIndex:0];
+          [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
+          [enc setBuffer:ctx->buf_batch_expert_gate offset:0 atIndex:2];
+          [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
+          [enc setBytes:&es length:sizeof(uint) atIndex:4];
+          [enc setBytes:&od length:sizeof(uint) atIndex:5];
+          [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+          [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
+          [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
 
-    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        // --- 3. Batched up projection ---
+        { uint es = (uint)elr->up.expert_stride;
+          uint od = (uint)M, id_ = (uint)H, nrt = num_row_tgs_M;
+          [enc setComputePipelineState:ctx->batch_expert_mv_q4k_dyn];
+          [enc setBuffer:elr->buffer offset:elr->up.offset atIndex:0];
+          [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
+          [enc setBuffer:ctx->buf_batch_expert_up offset:0 atIndex:2];
+          [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
+          [enc setBytes:&es length:sizeof(uint) atIndex:4];
+          [enc setBytes:&od length:sizeof(uint) atIndex:5];
+          [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+          [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
+          [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
 
-    // --- 4. Batched SwiGLU ---
-    [enc setComputePipelineState:ctx->batch_swiglu];
-    [enc setBuffer:ctx->buf_batch_expert_gate offset:0 atIndex:0];
-    [enc setBuffer:ctx->buf_batch_expert_up offset:0 atIndex:1];
-    [enc setBuffer:ctx->buf_batch_expert_act offset:0 atIndex:2];
-    { uint td = (uint)(K * M); [enc setBytes:&td length:sizeof(uint) atIndex:3]; }
-    [enc dispatchThreadgroups:MTLSizeMake(((uint)(K * M) + 255) / 256, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        // --- 4. Batched SwiGLU ---
+        [enc setComputePipelineState:ctx->batch_swiglu];
+        [enc setBuffer:ctx->buf_batch_expert_gate offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_batch_expert_up offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_batch_expert_act offset:0 atIndex:2];
+        { uint td = (uint)(K * M); [enc setBytes:&td length:sizeof(uint) atIndex:3]; }
+        [enc dispatchThreadgroups:MTLSizeMake(((uint)(K * M) + 255) / 256, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
 
     // --- 5. Shared expert SwiGLU ---
     [enc setComputePipelineState:ctx->swiglu];
