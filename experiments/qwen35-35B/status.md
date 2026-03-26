@@ -1,70 +1,53 @@
 # Orome Optimization Status — GGUF Q4_K / Q8_0 Era
 
 ## Current Best
-- **58.45 tok/s** (Q4_K_S GGUF, 100 tokens sustained)
-- TTFT: **1947.4 ms**
+- **66.74 tok/s** (Q4_K_S GGUF, 100 tokens sustained, 66.91 on second run)
+- TTFT: **~2182 ms**
 - `proj_avg_ms`: **1.1011**
 - Branch: `autoresearch/orome`
-- Best keep commit: `bd669d4`
-- Source state: matches `bd669d4`
+- Best keep commit: `c2391c1`
 - Model: `/Users/j/Code/lllm/models/Qwen3.5-35B-A3B-Q4_K_S.gguf`
 
 ## Current Campaign Reality
-- This GGUF is still the same live-format mix:
-  - `Q8_0`: 311 tensors
-  - `F32`: 301 tensors
-  - `Q4_K`: 120 tensors
-  - `Q6_K`: 1 tensor (LM head)
-- Live MoE tensor formats:
-  - routed expert `gate/up/down`: **Q4_K**
-  - shared expert `gate/up/down`: **Q8_0**
-  - `routing_gate`: **F32**
-  - `shared_expert_gate`: **F32**
-- Consequence: the best remaining wins are still in **live GGUF MoE dispatches and combine work**, not old packed-format ideas or Q5-focused hypotheses.
+- GGUF live-format mix: Q8_0 (311), F32 (301), Q4_K (120), Q6_K (1)
+- Routed expert gate/up/down: **Q4_K**, shared expert: **Q8_0**, routing: **F32**
+- Best remaining wins: dispatch/barrier reduction, kernel efficiency, scheduling overlap
 
-## Important GGUF-Era Wins
-1. `bd669d4` — hoist the live `K=8` combine shared-gate sigmoid once per simdgroup without extra sync: **58.45 tok/s**
-2. `44eeb52` — defer shared expert gate/up past routing so softmax waits only on routing logits: **57.63 tok/s**
-3. `88553c3` — select top-K directly from routing logits and normalize only the chosen experts: **57.50 tok/s**
-4. `48ce29e` — specialize `moe_combine_copy_sq` for the live `K=8` path without extra synchronization: **48.87 tok/s**
-5. `e2f98ff` — fuse `Q8_0 shared gate + up + SwiGLU` for the live shared expert path: **48.61 tok/s**
+## This Session's Wins (from 65.44 baseline)
+1. `9b97283` — defer GDN state decay to second pass (halve state write traffic): **65.85 tok/s** (+0.41)
+2. `6721aac` — de-interleave Q+gate weights at load time (eliminate 2 dispatch+2 barrier per full-attn layer): **65.92 tok/s** (+0.07)
+3. `8b8f329` — fuse sigmoid gate into attn_values kernel (eliminate 1 dispatch+1 barrier per full-attn layer): **65.96 tok/s** (+0.04)
+4. `513fc2d` — schedule decay_beta alongside conv1d for concurrent overlap in linear attention: **66.50 tok/s** (+0.54)
+5. `e2bdd78` — fuse QK RMS norm into delta_net kernel (eliminate 1 dispatch+1 barrier per linear layer): **66.12 tok/s** (noise)
+6. `c2391c1` — 2-row Q8_0 matvec (halve TG count for all Q8_0 projections): **66.74 tok/s** (+0.17)
 
-## Latest Session
-1. Re-bench current branch head `b23b089`: **57.36 tok/s**, TTFT `1924.4 ms`
-   - Fresh same-session baseline on the retained routing path before new MoE-tail follow-ups
-2. `44eeb52` — defer shared expert gate/up past routing so the first MoE barrier waits only on routing logits: **57.63 tok/s**
-   - Moving the live shared expert projection out of the initial routing barrier bought a small but real gain while keeping the same dependency structure
-3. `bd669d4` — hoist the live `K=8` combine shared-gate sigmoid once per simdgroup via `simd_broadcast_first`: **58.45 tok/s**
-   - This revisits an old negative shared-gate-hoist idea, but without the threadgroup synchronization that previously erased the benefit
+Total session gain: **+1.30 tok/s** (65.44 → 66.74)
 
 ## Interpretation
-- Routing was not the end of the GGUF MoE story. After `88553c3`, there was still measurable time in overlap-sensitive shared-expert and combine-side work even though `proj_avg_ms` stayed pinned at `1.1011`.
-- `44eeb52` is positive evidence that the initial MoE routing barrier was still too conservative: letting shared expert gate/up overlap with routed expert work is better than making routing softmax wait on it.
-- `bd669d4` is positive evidence that combine-side scalar hoists can help, but only when they preserve the current overlap structure. The old threadgroup-broadcast shared-gate experiment was negative; the barrier-free simdgroup-broadcast version is positive.
-- A short Metal System Trace on `44eeb52` completed successfully, but the current command buffers and encoders are effectively unlabeled for this workload, so the trace was not yet sufficient to cleanly identify which individual `orome` dispatch replaced routing as the next dominant cost.
+- Dispatch/barrier reduction is the dominant optimization theme this session. The GPU spends significant time in scheduling overhead and barrier stalls. Reducing dispatch count and barrier count provides consistent, compounding gains.
+- The GDN deferred-decay is a clean memory bandwidth optimization: fewer state writes = less bandwidth consumed.
+- The decay_beta scheduling overlap was the biggest per-change win: moving a tiny dispatch to run concurrently with conv1d freed up a barrier slot in the critical path.
+- 2-row Q8_0 was previously negative at 58 tok/s but is now positive at 66+ tok/s. The dispatch/barrier reductions changed the bottleneck profile enough that TG count reduction matters.
+- Full-attention optimizations (Q+gate deinterleave, sigmoid gate fusion) were individually small but collectively eliminate 30 dispatches + 30 barriers per token.
 
-## What Failed
-1. `n/a` — shrink `softmax_topk_route` launch from 256 threads to a single 32-thread simdgroup: **57.44 tok/s**
-2. `n/a` — fuse live `Q8_0 shared_down` into the `K=8` combine path to eliminate `shared_out` writeback: **46.91 tok/s**
-3. `n/a` — read combine params from constant address space and scalarize the fixed `K=8` weights: **48.39 tok/s**
-4. `n/a` — specialize live `Q8_0 shared_down` for fixed `S=512` with smaller threadgroup scratch and full SIMD participation: **48.81 tok/s**
-5. `n/a` — specialize `moe_combine_copy_sq` for live `K=8` and hoist `shared_gate` via threadgroup broadcast: **48.30 tok/s**
-6. `n/a` — precompute shared gate sigmoid in `softmax_topk_route` and consume it directly in combine: **48.48 tok/s**
-7. `n/a` — 2-row GGUF `Q8_0` general matvec: **48.60 tok/s**
-8. `n/a` — dedicated 2-row `Q8_0 shared_down` kernel: **48.57 tok/s**
-9. `n/a` — early `shared_down` overlap scheduling: **48.54 tok/s**
+## What Failed This Session
+- (None so far — all experiments were kept)
+
+## Previous Session Wins (still active)
+1. `def8689` — parallel top-K routing: simd_max reduction: **65.20 tok/s** (+5.77)
+2. `8558d2f` — transpose expert output [K][dim] → [dim][K]: **65.58 tok/s** (+0.38)
+3. `4f8c12f` — half-precision GDN state: **59.20 tok/s** (+0.38)
+4. `bd669d4` — hoist K=8 combine shared-gate sigmoid: **58.45 tok/s** (+0.82)
 
 ## Next Best Ideas
-1. Add temporary Metal labels around `orome` compute command buffers and encoders before another Metal System Trace pass, so the trace can attribute the remaining MoE-tail cost to a specific dispatch instead of anonymous `Compute Command 0` work.
-2. Try a shape-specific `softmax_topk_route` specialization for `K=8`, `n_experts=256` that preserves the current 256-thread launch but trims the remaining top-k overhead without changing overlap structure.
-3. Revisit early `shared_down` overlap from the new `44eeb52` scheduling baseline; the old negative evidence predates deferring shared gate/up past routing.
-4. Look for other combine-side scalar or reduction hoists that can use simdgroup broadcast without threadgroup barriers, following the positive `bd669d4` result.
+1. Try column-major GDN state transpose again (was -4.5 at 65 tok/s, but code has changed significantly with deferred decay + fused QK norm; may work now)
+2. Revisit shared_down Q8_0 specialization for in_dim=512 with half-wave parallelism (16 of 32 lanes idle)
+3. Fuse gated_rms_norm into O-projection x_shared loading to eliminate 1 dispatch+1 barrier per linear layer
+4. Reduce norm_apply_partial + routing_gate into a single kernel or overlap them
+5. Look at the Q4K expert gate+up+SwiGLU inner loop for packed byte reads
+6. Profile with Metal System Trace using labeled dispatches to find the actual per-dispatch hotspot
 
 ## Current Log
-- `bd669d4` is the retained source commit and current best result.
-- `44eeb52` remains retained underneath it as the first scheduling win of this session.
-- A short Metal System Trace was captured on `44eeb52`, but unlabeled `orome` compute work limited per-dispatch attribution.
-- `results.tsv` has been updated with:
-  - the fresh `57.36 tok/s` baseline on `b23b089`,
-  - the retained `57.63 tok/s` shared-gate-up scheduling change on `44eeb52`,
-  - the retained `58.45 tok/s` barrier-free combine shared-gate hoist on `bd669d4`.
+- All experiments this session were positive or noise-level, all kept
+- Session started from `a465bb4` baseline at 65.36-65.44 tok/s
+- Best result: 66.74 tok/s (66.91 on second run) at commit `c2391c1`
