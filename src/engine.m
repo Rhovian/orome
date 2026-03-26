@@ -564,6 +564,27 @@ int engine_step(Engine *eng, int token_id) {
                 ctx->buf_linear_q, 0, ctx->buf_h_mid, 0);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
+            // DIAG: all phase outputs for layer 0
+            if (eng->pos == 0 && layer == 0) {
+                [enc endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+                float *co = (float *)[ctx->buf_conv_output contents];
+                float *dout = (float *)[ctx->buf_linear_v contents];
+                float *gn = (float *)[ctx->buf_linear_q contents];
+                float *op = (float *)[ctx->buf_h_mid contents];
+                float cmx=0, dmx=0, gmx=0, omx=0;
+                int tv = n_v_heads * value_dim;
+                for (int i=0;i<conv_dim;i++) { float a=fabsf(co[i]); if(a>cmx) cmx=a; }
+                for (int i=0;i<tv;i++) { float a=fabsf(dout[i]); if(a>dmx) dmx=a; }
+                for (int i=0;i<tv;i++) { float a=fabsf(gn[i]); if(a>gmx) gmx=a; }
+                for (int i=0;i<H;i++) { float a=fabsf(op[i]); if(a>omx) omx=a; }
+                float gsum=0, osum=0;
+                for (int i=0;i<tv;i++) gsum+=fabsf(gn[i]);
+                for (int i=0;i<H;i++) osum+=fabsf(op[i]);
+                fprintf(stderr, "[L0] conv=%.4f delta=%.6f gated=%.4f(mean=%.6f) oproj=%.4f(mean=%.6f)\n",
+                        cmx, dmx, gmx, gsum/tv, omx, osum/H);
+                cmd = [ctx->queue commandBuffer];
+                enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+            }
             // --- Phase I+J: Fused residual add + sum_sq → buf_moe_hidden ---
             { uint num_tgs = ((uint)H + 255) / 256;
             [enc setComputePipelineState:ctx->residual_add_sq];
