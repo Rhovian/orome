@@ -911,7 +911,7 @@ kernel void conv1d_step(
 
 // Conv1d with F32 weights (for GGUF models)
 kernel void conv1d_step_f32(
-    device float *conv_state,
+    device float *conv_state,         // [kernel_size * conv_dim] = [4 * conv_dim]
     device const float *input,
     device const float *weights,      // [conv_dim * 4] F32
     device float *output,
@@ -920,22 +920,22 @@ kernel void conv1d_step_f32(
 ) {
     if (idx >= conv_dim) return;
 
+    // Compute conv from state (4 slots: the current input is NOT yet in the state)
     uint w_base = idx * 4;
     float acc = 0.0f;
     acc += conv_state[0 * conv_dim + idx] * weights[w_base + 0];
     acc += conv_state[1 * conv_dim + idx] * weights[w_base + 1];
     acc += conv_state[2 * conv_dim + idx] * weights[w_base + 2];
-
-    float inp = input[idx];
-    acc += inp * weights[w_base + 3];
+    acc += conv_state[3 * conv_dim + idx] * weights[w_base + 3];
 
     // SiLU activation
     output[idx] = acc / (1.0f + exp(-acc));
 
-    // Shift history
+    // Shift state and push current input (for next timestep)
     conv_state[0 * conv_dim + idx] = conv_state[1 * conv_dim + idx];
     conv_state[1 * conv_dim + idx] = conv_state[2 * conv_dim + idx];
-    conv_state[2 * conv_dim + idx] = inp;
+    conv_state[2 * conv_dim + idx] = conv_state[3 * conv_dim + idx];
+    conv_state[3 * conv_dim + idx] = input[idx];
 }
 
 // ============================================================================

@@ -206,7 +206,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->buf_conv_state = (__strong id<MTLBuffer> *)calloc(n_lin, sizeof(id<MTLBuffer>));
     size_t delta_size = (size_t)cfg->linear_num_v_heads * cfg->linear_value_dim
                         * cfg->linear_key_dim * sizeof(float);  // float32 state
-    size_t conv_size = (size_t)(cfg->conv_kernel_size - 1) * cfg->linear_conv_dim * sizeof(float);
+    size_t conv_size = (size_t)cfg->conv_kernel_size * cfg->linear_conv_dim * sizeof(float);
     for (int i = 0; i < n_lin; i++) {
         ctx->buf_linear_state[i] = [ctx->device newBufferWithLength:delta_size
                                                             options:MTLResourceStorageModeShared];
