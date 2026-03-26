@@ -2013,9 +2013,9 @@ kernel void dequant_matvec_q4k(
 
             for (uint j = 0; j < 16; j++) {
                 uint8_t byte = qsub[j];
-                uint xi = x_base + sub * 32 + j * 2;
-                acc += (sub_sc * float(byte & 0xF) - sub_mn) * x[xi];
-                acc += (sub_sc * float(byte >> 4) - sub_mn) * x[xi + 1];
+                uint xi = x_base + sub * 32;
+                acc += (sub_sc * float(byte & 0xF) - sub_mn) * x[xi + j];
+                acc += (sub_sc * float(byte >> 4) - sub_mn) * x[xi + j + 16];
             }
         }
     }
@@ -2305,9 +2305,9 @@ kernel void batch_expert_matvec_q4k(
 
             for (uint j = 0; j < 16; j++) {
                 uint8_t byte = qsub[j];
-                uint xi = x_base + sub * 32 + j * 2;
-                acc += (sub_sc * float(byte & 0xF) - sub_mn) * x[xi];
-                acc += (sub_sc * float(byte >> 4) - sub_mn) * x[xi + 1];
+                uint xi = x_base + sub * 32;
+                acc += (sub_sc * float(byte & 0xF) - sub_mn) * x[xi + j];
+                acc += (sub_sc * float(byte >> 4) - sub_mn) * x[xi + j + 16];
             }
         }
     }
@@ -2373,9 +2373,9 @@ kernel void batch_expert_down_q4k(
 
             for (uint j = 0; j < 16; j++) {
                 uint8_t byte = qsub[j];
-                uint xi = x_base + sub * 32 + j * 2;
-                acc += (sub_sc * float(byte & 0xF) - sub_mn) * ex[xi];
-                acc += (sub_sc * float(byte >> 4) - sub_mn) * ex[xi + 1];
+                uint xi = x_base + sub * 32;
+                acc += (sub_sc * float(byte & 0xF) - sub_mn) * ex[xi + j];
+                acc += (sub_sc * float(byte >> 4) - sub_mn) * ex[xi + j + 16];
             }
         }
     }
@@ -2439,9 +2439,9 @@ kernel void batch_expert_mv_q4k_dyn(
             device const uint8_t* qsub = qs + sub * 16;
             for (uint j = 0; j < 16; j++) {
                 uint8_t byte = qsub[j];
-                uint xi = x_base + sub * 32 + j * 2;
-                acc += (sub_sc * float(byte & 0xF) - sub_mn) * x[xi];
-                acc += (sub_sc * float(byte >> 4) - sub_mn) * x[xi + 1];
+                uint xi = x_base + sub * 32;
+                acc += (sub_sc * float(byte & 0xF) - sub_mn) * x[xi + j];
+                acc += (sub_sc * float(byte >> 4) - sub_mn) * x[xi + j + 16];
             }
         }
     }
@@ -2498,9 +2498,9 @@ kernel void batch_expert_down_q4k_dyn(
             device const uint8_t* qsub = qs + sub * 16;
             for (uint j = 0; j < 16; j++) {
                 uint8_t byte = qsub[j];
-                uint xi = x_base + sub * 32 + j * 2;
-                acc += (sub_sc * float(byte & 0xF) - sub_mn) * ex[xi];
-                acc += (sub_sc * float(byte >> 4) - sub_mn) * ex[xi + 1];
+                uint xi = x_base + sub * 32;
+                acc += (sub_sc * float(byte & 0xF) - sub_mn) * ex[xi + j];
+                acc += (sub_sc * float(byte >> 4) - sub_mn) * ex[xi + j + 16];
             }
         }
     }
