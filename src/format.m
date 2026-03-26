@@ -355,10 +355,35 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
             c->lin.qkv = G_REF(name, conv_dim, H);
             snprintf(name, sizeof(name), "blk.%d.attn_gate.weight", i);
             c->lin.z = G_REF(name, total_value, H);
-            snprintf(name, sizeof(name), "blk.%d.ssm_alpha.weight", i);
-            c->lin.a = G_REF(name, n_v, H);
-            snprintf(name, sizeof(name), "blk.%d.ssm_beta.weight", i);
-            c->lin.b = G_REF(name, n_v, H);
+            // Alpha, beta, A_log, dt_bias: GGUF stores with head-interleaved rows.
+            // GGUF order: [head0, head2, head4, ..., head30, head1, head3, ..., head31]
+            // De-interleave by building new buffers/tensors with sequential head order.
+
+            // Helper: de-interleave a Q8_0 weight tensor with n_v rows
+            #define DEINTERLEAVE_Q8_ROWS(tname, out_ref) do { \
+                snprintf(name, sizeof(name), "blk.%d." tname, i); \
+                GGUFTensorInfo *_ti = gguf_find_tensor(gf, name); \
+                if (_ti && _ti->n_dims >= 2 && _ti->dims[1] == (uint64_t)n_v) { \
+                    int _rows = n_v, _half = _rows / 2; \
+                    int _bpr = ((int)_ti->dims[0] / 32) * 34; \
+                    size_t _total = (size_t)_rows * _bpr; \
+                    id<MTLBuffer> _db = [ctx->device newBufferWithLength:_total options:MTLResourceStorageModeShared]; \
+                    uint8_t *_s = (uint8_t *)[buf contents] + gf->data_offset + _ti->offset; \
+                    uint8_t *_d = (uint8_t *)[_db contents]; \
+                    for (int _r = 0; _r < _half; _r++) { \
+                        memcpy(_d + (_r*2) * _bpr, _s + _r * _bpr, _bpr); \
+                        memcpy(_d + (_r*2+1) * _bpr, _s + (_half+_r) * _bpr, _bpr); \
+                    } \
+                    QuantFormat _fmt = format_from_ggml_type(_ti->type); \
+                    out_ref = (TensorRef){ .buffer = _db, .offset = 0, \
+                        .pipeline = format_pipeline_for(ctx, _fmt), \
+                        .format = _fmt, .out_dim = (uint32_t)n_v, .in_dim = (uint32_t)H }; \
+                } else { out_ref = G_REF(name, n_v, H); } \
+            } while(0)
+
+            DEINTERLEAVE_Q8_ROWS("ssm_alpha.weight", c->lin.a);
+            DEINTERLEAVE_Q8_ROWS("ssm_beta.weight", c->lin.b);
+            #undef DEINTERLEAVE_Q8_ROWS
             // Output projection (ssm_out in GGUF)
             // The GGUF stores ssm_out with head-interleaved Q8_0 blocks along in_dim.
             // 32 v-heads × 4 blocks each (128 values), interleaved in 2 groups of 16 heads.
@@ -422,10 +447,28 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
             // Use F32 conv1d kernel directly — no conversion needed
             snprintf(name, sizeof(name), "blk.%d.ssm_conv1d.weight", i);
             c->lin.conv = G_RAW_F32(name);
-            snprintf(name, sizeof(name), "blk.%d.ssm_a", i);
-            c->lin.A_log = G_RAW_F32(name);  // decay_beta kernel expects F32
-            snprintf(name, sizeof(name), "blk.%d.ssm_dt.bias", i);
-            c->lin.dt_bias = G_RAW_F32(name); // F32 decay_beta kernel
+            // A_log and dt_bias: F32, 32 elements, head-interleaved
+            // De-interleave: deint[r*2] = gguf[r], deint[r*2+1] = gguf[half+r] for r<half
+            #define DEINTERLEAVE_F32_RAW(tname, out_ref) do { \
+                snprintf(name, sizeof(name), "blk.%d." tname, i); \
+                GGUFTensorInfo *_ti = gguf_find_tensor(gf, name); \
+                if (_ti && _ti->dims[0] == (uint64_t)n_v) { \
+                    int _half = n_v / 2; \
+                    size_t _bytes = n_v * sizeof(float); \
+                    id<MTLBuffer> _db = [ctx->device newBufferWithLength:_bytes options:MTLResourceStorageModeShared]; \
+                    float *_s = (float *)((uint8_t *)[buf contents] + gf->data_offset + _ti->offset); \
+                    float *_d = (float *)[_db contents]; \
+                    for (int _r = 0; _r < _half; _r++) { \
+                        _d[_r*2] = _s[_r]; \
+                        _d[_r*2+1] = _s[_half+_r]; \
+                    } \
+                    out_ref = (TensorRef){ .buffer = _db, .offset = 0, .format = QFMT_F32 }; \
+                } else { out_ref = G_RAW_F32(name); } \
+            } while(0)
+
+            DEINTERLEAVE_F32_RAW("ssm_a", c->lin.A_log);
+            DEINTERLEAVE_F32_RAW("ssm_dt.bias", c->lin.dt_bias);
+            #undef DEINTERLEAVE_F32_RAW
             // Output norm (ssm_norm in GGUF)
             snprintf(name, sizeof(name), "blk.%d.ssm_norm.weight", i);
             c->lin.o_norm = G_RAW(name);     // gated_rms_norm expects BF16
