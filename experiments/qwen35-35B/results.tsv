@@ -1,4 +1,6 @@
 commit	tok_sec	ttft_ms	proj_avg_ms	status	description
+169939a	48.73	2096.2	1.1011	keep	baseline: re-benchmark current GGUF HEAD before early shared_down overlap experiment
+n/a	48.54	2121.5	1.1011	discard	schedule fused shared_down earlier to overlap with routing and routed expert work
 0dd5b00	46.88	2252.4	1.1011	keep	baseline: current GGUF-only HEAD before 2-row matvec experiment
 ccd21c7	47.19	2241.2	1.1011	keep	2-row-per-simdgroup GGUF Q4_K/Q6_K matvec: halve projection and LM-head TG count
 3a2d882	47.24	2143.7	1.1011	keep	2-row-per-simdgroup expert down kernels for GGUF Q4_K/Q5_K
