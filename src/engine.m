@@ -150,16 +150,14 @@ static void embed_lookup_gguf(GGUFFile *gf, const ModelConfig *cfg,
 // GPU-resident expert forward for GGUF (Q4K/Q5K format)
 // ============================================================================
 // All work stays on the GPU encoder — no CPU readback, no memcpy.
-// Routing logits must already be in buf_output (from Phase K dispatch).
-// Shared expert gate+up must already be in buf_shared_gate/buf_shared_up.
-// Shared expert gate score must be at buf_output[n_experts] (from Phase K dispatch).
+// Routing logits and shared expert gate score must already be in buf_output
+// (from the routing dispatch in the current layer).
 
 static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
                                  MetalCtx *ctx, const ModelConfig *cfg,
                                  const ExpertLayerRef *elr,
                                  const LayerTensorCache *lt,
-                                 int K,
-                                 bool shared_gate_up_fused) {
+                                 int K) {
     int H = cfg->hidden_dim;
     int M = cfg->moe_intermediate;
     int S = cfg->shared_intermediate;
@@ -188,6 +186,15 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
         ctx->batch_expert_gate_up_swiglu_q4k_dyn
         && elr->gate.format == QFMT_GGUF_Q4_K
         && elr->up.format == QFMT_GGUF_Q4_K;
+    id<MTLComputePipelineState> shared_gate_up_pipe = nil;
+    if (lt->shared_gate.format == QFMT_GGUF_Q4_K
+            && lt->shared_up.format == QFMT_GGUF_Q4_K) {
+        shared_gate_up_pipe = ctx->shared_gate_up_swiglu_q4k;
+    } else if (lt->shared_gate.format == QFMT_GGUF_Q8_0
+                   && lt->shared_up.format == QFMT_GGUF_Q8_0) {
+        shared_gate_up_pipe = ctx->shared_gate_up_swiglu_q8_0;
+    }
+    bool fuse_shared_gate_up = shared_gate_up_pipe != nil;
 
     if (can_fuse_expert_gate_up) {
         uint gate_es = (uint)elr->gate.expert_stride;
@@ -249,8 +256,32 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     }
 
+    // Shared expert gate/up is independent of routing softmax and expert top-k.
+    // Schedule it here so the initial routing barrier only waits on routing.
+    if (fuse_shared_gate_up) {
+        [enc setComputePipelineState:shared_gate_up_pipe];
+        [enc setBuffer:lt->shared_gate.buffer offset:lt->shared_gate.offset atIndex:0];
+        [enc setBuffer:lt->shared_up.buffer offset:lt->shared_up.offset atIndex:1];
+        [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
+        [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:3];
+        { uint od = (uint)lt->shared_gate.out_dim, id_ = (uint)lt->shared_gate.in_dim;
+          [enc setBytes:&od length:sizeof(uint) atIndex:4];
+          [enc setBytes:&id_ length:sizeof(uint) atIndex:5]; }
+        NSUInteger num_tgs = (lt->shared_gate.out_dim + ENGINE_ROWS_PER_TG - 1)
+            / ENGINE_ROWS_PER_TG;
+        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    } else {
+        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_gate,
+            ctx->buf_input, 0, ctx->buf_shared_gate, 0);
+        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_up,
+            ctx->buf_input, 0, ctx->buf_shared_up, 0);
+    }
+
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
     // --- 5. Shared expert SwiGLU ---
-    if (!shared_gate_up_fused) {
+    if (!fuse_shared_gate_up) {
         [enc setComputePipelineState:ctx->swiglu];
         [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
         [enc setBuffer:ctx->buf_shared_up offset:0 atIndex:1];
@@ -258,9 +289,8 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
         { uint dim_val = (uint)S; [enc setBytes:&dim_val length:sizeof(uint) atIndex:3]; }
         [enc dispatchThreadgroups:MTLSizeMake(((uint)S + 255) / 256, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     }
-
-    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
     // --- 6. Expert down projection (Q4K or Q5K) ---
     { id<MTLComputePipelineState> down_pipe = (elr->down.format == QFMT_GGUF_Q5_K)
@@ -565,15 +595,6 @@ int engine_step(Engine *eng, int token_id) {
                     && lt->routing_gate.out_dim == (uint32_t)n_experts
                     && lt->shared_expert_gate.out_dim == 1
                     && lt->routing_gate.in_dim == lt->shared_expert_gate.in_dim;
-                id<MTLComputePipelineState> shared_gate_up_pipe = nil;
-                if (lt->shared_gate.format == QFMT_GGUF_Q4_K
-                        && lt->shared_up.format == QFMT_GGUF_Q4_K) {
-                    shared_gate_up_pipe = ctx->shared_gate_up_swiglu_q4k;
-                } else if (lt->shared_gate.format == QFMT_GGUF_Q8_0
-                               && lt->shared_up.format == QFMT_GGUF_Q8_0) {
-                    shared_gate_up_pipe = ctx->shared_gate_up_swiglu_q8_0;
-                }
-                bool fuse_shared_gate_up = shared_gate_up_pipe != nil;
                 if (fuse_routing_shared_gate) {
                     uint od = (uint)lt->routing_gate.out_dim;
                     uint id_ = (uint)lt->routing_gate.in_dim;
@@ -593,31 +614,11 @@ int engine_step(Engine *eng, int token_id) {
                     format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_expert_gate,
                         ctx->buf_input, 0, ctx->buf_output, sgg_off);
                 }
-                if (fuse_shared_gate_up) {
-                    NSUInteger shared_tg_size = ENGINE_ROWS_PER_TG * 32;
-                    [enc setComputePipelineState:shared_gate_up_pipe];
-                    [enc setBuffer:lt->shared_gate.buffer offset:lt->shared_gate.offset atIndex:0];
-                    [enc setBuffer:lt->shared_up.buffer offset:lt->shared_up.offset atIndex:1];
-                    [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
-                    [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:3];
-                    { uint od = (uint)lt->shared_gate.out_dim, id_ = (uint)lt->shared_gate.in_dim;
-                      [enc setBytes:&od length:sizeof(uint) atIndex:4];
-                      [enc setBytes:&id_ length:sizeof(uint) atIndex:5]; }
-                    uint rows_per_tg = ENGINE_ROWS_PER_TG;
-                    NSUInteger num_tgs = (lt->shared_gate.out_dim + rows_per_tg - 1) / rows_per_tg;
-                    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(shared_tg_size, 1, 1)];
-                } else {
-                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_gate,
-                        ctx->buf_input, 0, ctx->buf_shared_gate, 0);
-                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_up,
-                        ctx->buf_input, 0, ctx->buf_shared_up, 0);
-                }
                 // GPU-resident expert forward
                 double moe_t0 = now_ms();
                 encode_experts_gguf(enc, ctx, cfg,
                                     &eng->expert_layer_cache[layer],
-                                    &tcache[layer], effective_k, fuse_shared_gate_up);
+                                    &tcache[layer], effective_k);
                 t1 = now_ms();
                 t_moe_total += t1 - moe_t0;
                 t_attn_total += t1 - t0;
@@ -882,15 +883,6 @@ int engine_step(Engine *eng, int token_id) {
                     && lt->routing_gate.out_dim == (uint32_t)n_experts
                     && lt->shared_expert_gate.out_dim == 1
                     && lt->routing_gate.in_dim == lt->shared_expert_gate.in_dim;
-                id<MTLComputePipelineState> shared_gate_up_pipe = nil;
-                if (lt->shared_gate.format == QFMT_GGUF_Q4_K
-                        && lt->shared_up.format == QFMT_GGUF_Q4_K) {
-                    shared_gate_up_pipe = ctx->shared_gate_up_swiglu_q4k;
-                } else if (lt->shared_gate.format == QFMT_GGUF_Q8_0
-                               && lt->shared_up.format == QFMT_GGUF_Q8_0) {
-                    shared_gate_up_pipe = ctx->shared_gate_up_swiglu_q8_0;
-                }
-                bool fuse_shared_gate_up = shared_gate_up_pipe != nil;
                 if (fuse_routing_shared_gate) {
                     uint od = (uint)lt->routing_gate.out_dim;
                     uint id_ = (uint)lt->routing_gate.in_dim;
@@ -910,31 +902,11 @@ int engine_step(Engine *eng, int token_id) {
                     format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_expert_gate,
                         ctx->buf_input, 0, ctx->buf_output, sgg_off);
                 }
-                if (fuse_shared_gate_up) {
-                    NSUInteger shared_tg_size = ENGINE_ROWS_PER_TG * 32;
-                    [enc setComputePipelineState:shared_gate_up_pipe];
-                    [enc setBuffer:lt->shared_gate.buffer offset:lt->shared_gate.offset atIndex:0];
-                    [enc setBuffer:lt->shared_up.buffer offset:lt->shared_up.offset atIndex:1];
-                    [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
-                    [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:3];
-                    { uint od = (uint)lt->shared_gate.out_dim, id_ = (uint)lt->shared_gate.in_dim;
-                      [enc setBytes:&od length:sizeof(uint) atIndex:4];
-                      [enc setBytes:&id_ length:sizeof(uint) atIndex:5]; }
-                    uint rows_per_tg = ENGINE_ROWS_PER_TG;
-                    NSUInteger num_tgs = (lt->shared_gate.out_dim + rows_per_tg - 1) / rows_per_tg;
-                    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(shared_tg_size, 1, 1)];
-                } else {
-                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_gate,
-                        ctx->buf_input, 0, ctx->buf_shared_gate, 0);
-                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_up,
-                        ctx->buf_input, 0, ctx->buf_shared_up, 0);
-                }
                 // GPU-resident expert forward
                 double moe_t0 = now_ms();
                 encode_experts_gguf(enc, ctx, cfg,
                                     &eng->expert_layer_cache[layer],
-                                    &tcache[layer], effective_k, fuse_shared_gate_up);
+                                    &tcache[layer], effective_k);
                 t1 = now_ms();
                 t_moe_total += t1 - moe_t0;
                 t_attn_total += t1 - t0;
