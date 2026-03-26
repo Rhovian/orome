@@ -7,8 +7,8 @@ This is a continuation of the older 35B campaign, not a blank slate. The repo co
 ## Setup
 
 1. Read `status.md` first. It is your handoff note.
-2. Read `results.tsv` next. It is the full 35B experiment history.
-3. Read `docs/qwen-35b-a3b.md` for the old campaign narrative and major wins.
+2. Read `results.tsv` next. It is the current GGUF campaign log.
+3. Read `results.historical.tsv` and `docs/qwen-35b-a3b.md` for old 35B campaign context and prior wins when useful.
 4. Read the source files you plan to modify before changing anything.
 5. The runner will place you on branch `autoresearch/orome`.
 
@@ -30,8 +30,8 @@ Secondary goals:
 
 Treat the current HEAD baseline as approximately:
 
-- `46.5 tok/s`
-- `2.1-2.3 s` TTFT
+- `58.4 tok/s`
+- `1.9-2.0 s` TTFT
 - `~1.1 ms` average projection timing from benchmark output
 
 Use the benchmark harness as the source of truth:
@@ -51,10 +51,13 @@ These are the current facts that matter for optimization:
 - Hidden dim `2048`
 - 256 experts, with 8 routed experts per token plus 1 shared expert
 - Mixed GGUF quantization:
-  - Q4_K for most weights
-  - Q5_K for some expert down projections
+  - Q4_K for routed expert projections and most large live weights
+  - Q8_0 for shared expert gate/up/down tensors
   - Q6_K for LM head
-  - Q8_0 / F32 / BF16 for smaller tensors and norms
+  - F32 for routing_gate and shared_expert_gate
+  - F32 / BF16 for smaller tensors and norms
+
+There are no live Q5_K hot-path tensors in the current GGUF. Old Q5_K-specific wins are historical context, not current baseline assumptions.
 
 The model fits in unified memory, so this is still fundamentally a GPU dispatch and kernel-efficiency problem, not an SSD streaming problem.
 
@@ -84,7 +87,7 @@ Important runtime facts:
 
 ## How To Read The Old Experiment History
 
-`results.tsv` contains both old and still-relevant information. Use it intelligently.
+`results.tsv` is now the live GGUF campaign only. Older packed-format results live in `results.historical.tsv`. Use that historical file intelligently.
 
 Still relevant or likely relevant:
 
@@ -122,11 +125,11 @@ Use those as priors, not commandments.
 
 ## First-Session Guidance
 
-Because the codebase has changed and `results.tsv` spans multiple eras, start carefully:
+Because the codebase has changed quickly, start carefully:
 
 1. Re-benchmark current HEAD.
-2. If `results.tsv` does not already contain a clearly labeled GGUF-era baseline near the current `46.x tok/s`, append one before trying new optimizations.
-3. Identify one concrete hypothesis from the historical record that still matches the current architecture.
+2. If `results.tsv` does not already contain a clearly labeled baseline near the current `58.x tok/s`, append one before trying new optimizations.
+3. Identify one concrete hypothesis from `results.historical.tsv` or the recent GGUF log that still matches the current architecture.
 4. Run exactly one experiment.
 
 Good first candidates:

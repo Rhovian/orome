@@ -8,10 +8,11 @@
 #   4. This script launches the next session
 #
 # Recovery files (check these in the morning):
-#   experiments/<model>/errors.log   — Runner-level errors
-#   experiments/<model>/logs/        — Full session logs
-#   experiments/<model>/results.tsv  — All experiment results
-#   experiments/<model>/status.md    — Last session's handoff note
+#   experiments/<model>/errors.log            — Runner-level errors
+#   experiments/<model>/logs/                 — Full session logs
+#   experiments/<model>/results.tsv           — Current campaign results
+#   experiments/<model>/results.historical.tsv — Older historical context
+#   experiments/<model>/status.md             — Last session's handoff note
 #
 # Usage:
 #   ./run_experiments.sh <model>                               # run forever with Claude
@@ -104,7 +105,7 @@ SESSION_NUM=0
 CONSECUTIVE_FAILURES=0
 LOG_DIR="$EXPERIMENT_DIR/logs"
 ERROR_LOG="$EXPERIMENT_DIR/errors.log"
-RESULTS_SCOPE_FILE="$EXPERIMENT_DIR/results_scope.json"
+RESULTS_HISTORICAL_FILE="$EXPERIMENT_DIR/results.historical.tsv"
 mkdir -p "$LOG_DIR"
 
 # Trap Ctrl+C gracefully
@@ -159,36 +160,16 @@ else
     echo "[runner] No cross-model regression checks configured"
 fi
 
-CURRENT_BEST_LABEL=""
-CURRENT_BEST_END_BEFORE_COMMIT=""
-if [[ -f "$RESULTS_SCOPE_FILE" ]]; then
-    CURRENT_BEST_LABEL=$(python3 -c "import json; print(json.load(open('$RESULTS_SCOPE_FILE')).get('current_best_label', ''))")
-    CURRENT_BEST_END_BEFORE_COMMIT=$(python3 -c "import json; print(json.load(open('$RESULTS_SCOPE_FILE')).get('current_best_end_before_commit', ''))")
-fi
-
 best_results_row() {
     local results_file="$1"
-    local scope_mode="${2:-all}"
-    python3 - "$results_file" "$scope_mode" "$CURRENT_BEST_END_BEFORE_COMMIT" <<'PY'
+    python3 - "$results_file" <<'PY'
 import csv
 import sys
 
-path, scope_mode, end_before = sys.argv[1:]
+path = sys.argv[1]
 
 with open(path, newline="") as f:
     rows = list(csv.DictReader(f, delimiter="\t"))
-
-if scope_mode == "scoped" and end_before:
-    scoped = []
-    found = False
-    for row in rows:
-        if row.get("commit") == end_before:
-            found = True
-            break
-        scoped.append(row)
-    if not found:
-        sys.exit(2)
-    rows = scoped
 
 best = None
 for row in rows:
@@ -299,7 +280,7 @@ while true; do
     echo "[runner] === Session $SESSION_NUM ($MODEL) starting at $(date '+%H:%M:%S') ==="
     echo "[runner] Log: $SESSION_LOG"
 
-    # Build the prompt: program.md + current status + results history
+    # Build the prompt: program.md + current status + current campaign results
     PROMPT="$(cat "$EXPERIMENT_DIR/program.md")"
     if [[ -f "$EXPERIMENT_DIR/status.md" ]]; then
         PROMPT="$PROMPT
@@ -316,11 +297,22 @@ $(cat "$EXPERIMENT_DIR/status.md")"
 
 ---
 
-## Experiment History
+## Current Campaign Results
 
 \`\`\`
 $(cat "$EXPERIMENT_DIR/results.tsv")
 \`\`\`"
+    fi
+
+    if [[ -f "$RESULTS_HISTORICAL_FILE" ]]; then
+        PROMPT="$PROMPT
+
+---
+
+## Historical Context
+
+Older 35B packed-format results live in \`experiments/$MODEL/results.historical.tsv\`.
+Use them for hypotheses and prior art, not as the live GGUF baseline."
     fi
 
     # Tell the agent where its experiment files live
@@ -331,6 +323,7 @@ $(cat "$EXPERIMENT_DIR/results.tsv")
 ## Experiment Paths
 
 - Results: \`experiments/$MODEL/results.tsv\`
+- Historical results: \`experiments/$MODEL/results.historical.tsv\`
 - Status: \`experiments/$MODEL/status.md\`
 - Bench errors: \`experiments/$MODEL/bench_err.txt\`"
 
@@ -400,27 +393,11 @@ $(cat "$EXPERIMENT_DIR/results.tsv")
 
     # Show current best if results exist
     if [[ -f "$EXPERIMENT_DIR/results.tsv" ]]; then
-        BEST=""
-        if [[ -n "$CURRENT_BEST_END_BEFORE_COMMIT" ]]; then
-            if BEST=$(best_results_row "$EXPERIMENT_DIR/results.tsv" scoped); then
-                if [[ -n "$CURRENT_BEST_LABEL" ]]; then
-                    echo "[runner] Current best (${CURRENT_BEST_LABEL}): $BEST"
-                else
-                    echo "[runner] Current best: $BEST"
-                fi
-            else
-                echo "[runner] WARNING: Could not find scoped results boundary $CURRENT_BEST_END_BEFORE_COMMIT; falling back to all-time history"
-            fi
-        fi
-
-        if [[ -z "$BEST" ]]; then
-            BEST=$(best_results_row "$EXPERIMENT_DIR/results.tsv" all || echo "no results yet")
-            echo "[runner] Current best: $BEST"
-        fi
-
-        if [[ -n "$CURRENT_BEST_END_BEFORE_COMMIT" ]]; then
-            HISTORICAL_BEST=$(best_results_row "$EXPERIMENT_DIR/results.tsv" all || true)
-            if [[ -n "$HISTORICAL_BEST" && "$HISTORICAL_BEST" != "$BEST" ]]; then
+        BEST=$(best_results_row "$EXPERIMENT_DIR/results.tsv" || echo "no results yet")
+        echo "[runner] Current best: $BEST"
+        if [[ -f "$RESULTS_HISTORICAL_FILE" ]]; then
+            HISTORICAL_BEST=$(best_results_row "$RESULTS_HISTORICAL_FILE" || true)
+            if [[ -n "$HISTORICAL_BEST" ]]; then
                 echo "[runner] Historical context: $HISTORICAL_BEST"
             fi
         fi
