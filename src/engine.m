@@ -563,7 +563,6 @@ int engine_step(Engine *eng, int token_id) {
 
             t1 = now_ms();
             t_attn_total += t1 - t0;
-            // Note: t_attn_total includes moe time; true attn = t_attn_total - t_moe_total
 
             linear_idx++;
             continue;
@@ -878,7 +877,6 @@ int engine_step(Engine *eng, int token_id) {
         }
 
         // RMS norm: buf_moe_hidden → buf_input
-        // Use partial sums from last layer's moe_combine_copy_sq
         if (ctx->moe_combine_copy_sq) {
             uint num_tgs = ((uint)H + 255) / 256;
             [enc setComputePipelineState:ctx->norm_apply_partial];
@@ -940,6 +938,7 @@ int engine_step(Engine *eng, int token_id) {
         id<MTLCommandBuffer> wait_cmd = fwd_cmd ? fwd_cmd : cmd;
         [wait_cmd commit];
         [wait_cmd waitUntilCompleted];
+
     }
     t1 = now_ms();
     t_lmhead_total += t1 - t0;
