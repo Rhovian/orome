@@ -749,8 +749,10 @@ kernel void moe_combine_copy_sq(
     if (tid < dim) {
         float shared_gate = 1.0f / (1.0f + exp(-params[K]));
         float moe = 0.0f;
+        // Transposed layout: [dim][K] — contiguous reads per thread
+        device const float* exp_base = expert_out + tid * K;
         for (uint k = 0; k < K && k < 16; k++) {
-            moe += params[k] * expert_out[k * dim + tid];
+            moe += params[k] * exp_base[k];
         }
         val = h_mid[tid] + moe + shared_gate * shared_out[tid];
         hidden_out[tid] = val;
@@ -800,15 +802,17 @@ kernel void moe_combine_copy_sq_k8(
 
     float val = 0.0f;
     if (tid < dim) {
+        // Transposed layout: [dim][8] — 8 contiguous floats per element
+        uint base = tid * 8;
         float moe =
-            params[0] * expert_out[tid] +
-            params[1] * expert_out[dim + tid] +
-            params[2] * expert_out[2 * dim + tid] +
-            params[3] * expert_out[3 * dim + tid] +
-            params[4] * expert_out[4 * dim + tid] +
-            params[5] * expert_out[5 * dim + tid] +
-            params[6] * expert_out[6 * dim + tid] +
-            params[7] * expert_out[7 * dim + tid];
+            params[0] * expert_out[base] +
+            params[1] * expert_out[base + 1] +
+            params[2] * expert_out[base + 2] +
+            params[3] * expert_out[base + 3] +
+            params[4] * expert_out[base + 4] +
+            params[5] * expert_out[base + 5] +
+            params[6] * expert_out[base + 6] +
+            params[7] * expert_out[base + 7];
         val = h_mid[tid] + moe + shared_gate * shared_out[tid];
         hidden_out[tid] = val;
         residual_out[tid] = val;
@@ -1821,9 +1825,9 @@ kernel void batch_expert_down_q4k_dyn(
     float sum0 = simd_sum(acc0);
     float sum1 = simd_sum(acc1);
     if (simd_lane == 0) {
-        uint out_base = expert_k * out_dim;
-        out[out_base + row0] = sum0;
-        if (valid1) out[out_base + row1] = sum1;
+        // Transposed layout: [dim][K] instead of [K][dim]
+        out[row0 * 8 + expert_k] = sum0;
+        if (valid1) out[row1 * 8 + expert_k] = sum1;
     }
 }
 
@@ -1913,8 +1917,8 @@ kernel void batch_expert_down_q5k_dyn(
     float sum0 = simd_sum(acc0);
     float sum1 = simd_sum(acc1);
     if (simd_lane == 0) {
-        uint out_base = expert_k * out_dim;
-        out[out_base + row0] = sum0;
-        if (valid1) out[out_base + row1] = sum1;
+        // Transposed layout: [dim][K] instead of [K][dim]
+        out[row0 * 8 + expert_k] = sum0;
+        if (valid1) out[row1 * 8 + expert_k] = sum1;
     }
 }
