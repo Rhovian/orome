@@ -286,7 +286,11 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
     // --- 8. Combine: hidden += experts + shared, copy residual, compute partial sum_sq ---
-    [enc setComputePipelineState:ctx->moe_combine_copy_sq];
+    id<MTLComputePipelineState> combine_pipe =
+        (K == 8 && ctx->moe_combine_copy_sq_k8)
+        ? ctx->moe_combine_copy_sq_k8
+        : ctx->moe_combine_copy_sq;
+    [enc setComputePipelineState:combine_pipe];
     [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
     [enc setBuffer:ctx->buf_shared_out offset:0 atIndex:1];
     [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:2];

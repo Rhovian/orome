@@ -124,6 +124,7 @@ typedef struct {
     id<MTLComputePipelineState> residual_add_sq;
     id<MTLComputePipelineState> norm_apply_partial;
     id<MTLComputePipelineState> moe_combine_copy_sq;
+    id<MTLComputePipelineState> moe_combine_copy_sq_k8;
     id<MTLComputePipelineState> argmax;
     id<MTLComputePipelineState> deinterleave_qgate;
     id<MTLComputePipelineState> copy_tmp_to_buf;

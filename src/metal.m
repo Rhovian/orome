@@ -114,6 +114,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->residual_add_sq  = make_pipeline(ctx, @"residual_add_sum_sq");
     ctx->norm_apply_partial = make_pipeline(ctx, @"rms_norm_apply_partial");
     ctx->moe_combine_copy_sq = make_pipeline(ctx, @"moe_combine_copy_sq");
+    ctx->moe_combine_copy_sq_k8 = make_pipeline(ctx, @"moe_combine_copy_sq_k8");
     ctx->argmax           = make_pipeline(ctx, @"argmax_kernel");
     ctx->deinterleave_qgate = make_pipeline(ctx, @"deinterleave_qgate");
     ctx->copy_tmp_to_buf  = make_pipeline(ctx, @"copy_tmp_to_buf");
