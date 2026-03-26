@@ -328,6 +328,23 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> __strong *enc_ptr,
 
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
+    // DIAG: check expert output before combine
+    {   [enc endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+        float *eout = (float *)[ctx->buf_batch_expert_out contents];
+        float *sout = (float *)[ctx->buf_shared_out contents];
+        float *params_p = (float *)[ctx->buf_combine_params contents];
+        float emx = 0; for (int i = 0; i < K*H; i++) { float av = fabsf(eout[i]); if (av > emx) emx = av; }
+        float smx = 0; for (int i = 0; i < H; i++) { float av = fabsf(sout[i]); if (av > smx) smx = av; }
+        static int diag_count = 0;
+        if (diag_count < 3) {
+            fprintf(stderr, "[moe_diag] expert_out max=%.4f shared_out max=%.4f params=[%.3f,%.3f,%.3f,%.3f] sg=%.3f\n",
+                    emx, smx, params_p[0], params_p[1], params_p[2], params_p[3], params_p[K]);
+            diag_count++;
+        }
+        cmd = [ctx->queue commandBuffer];
+        enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+    }
+
     // --- 8. Combine: hidden += experts + shared, copy residual, compute partial sum_sq ---
     [enc setComputePipelineState:ctx->moe_combine_copy_sq];
     [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
