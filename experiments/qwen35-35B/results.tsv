@@ -48,3 +48,9 @@ def8689	65.20	2144.4	1.1011	keep	parallel top-K routing: simd_max reduction repl
 n/a	64.75	2153.0	1.1011	discard	fuse residual_add_sq + norm_apply_partial into single-TG dispatch
 n/a	65.45	2165.0	1.1011	discard	vectorize combine expert_out reads with float4 loads
 n/a	65.67	2133.0	1.1011	discard	unroll Q8_0 inner loop 4x with d hoisted outside accumulation
+a465bb4	65.36	2181.0	1.1011	keep	baseline: re-benchmark current HEAD before new experiments
+n/a	64.13	1914.3	1.1011	discard	fuse Q8_0 O-proj + residual add + partial sum_sq into single kernel
+n/a	65.59	2164.0	1.1011	discard	resource-specific memoryBarrierWithResources in MoE path (noise-level)
+n/a	60.84	2173.2	1.1011	discard	transpose GDN state from row-major to column-major for cross-thread coalescing
+n/a	65.44	2188.0	1.1011	keep	baseline: re-benchmark current HEAD before new experiments
+n/a	65.85	2203.0	1.1011	keep	defer GDN state decay to second pass: halve state write traffic by computing kv_mem from pre-decay state

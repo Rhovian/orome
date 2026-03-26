@@ -368,20 +368,21 @@ kernel void gated_delta_net_step(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 1+2: Decay state row and compute kv_mem = dot(S[vi][:], k[:])
-    // State stored as half to halve bandwidth; compute in float for accuracy.
+    // Step 1+2: Compute kv_mem from pre-decay state (read-only pass).
+    // kv_mem_decayed = g * sum(old_state[ki] * k[ki]) since g is per-head scalar.
+    // This avoids writing decayed state, halving state write traffic.
     float kv_mem = 0.0f;
     for (uint ki = 0; ki < 128; ki++) {
-        float s = float(state[state_base + ki]) * g;
-        state[state_base + ki] = half(s);
-        kv_mem += s * k_shared[ki];
+        kv_mem += float(state[state_base + ki]) * k_shared[ki];
     }
+    kv_mem *= g;  // apply decay to the dot product instead of to each state element
 
-    // Step 3+4+5: Delta update + output in one pass (saves 1 full state read)
+    // Step 3+4+5: Combined decay + delta update + output in one pass.
+    // s_new = old_state * g + k * delta = decayed + update
     float delta = (v[v_base + vi] - kv_mem) * beta;
     float out_val = 0.0f;
     for (uint ki = 0; ki < 128; ki++) {
-        float s = float(state[state_base + ki]) + k_shared[ki] * delta;
+        float s = float(state[state_base + ki]) * g + k_shared[ki] * delta;
         state[state_base + ki] = half(s);
         out_val += s * q_shared[ki];
     }
