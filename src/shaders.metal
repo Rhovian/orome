@@ -289,6 +289,7 @@ kernel void attn_values_batched(
     constant uint&      seq_len   [[buffer(5)]],
     constant uint&      seq_stride [[buffer(6)]],
     constant uint&      heads_per_kv [[buffer(7)]],
+    device const float* gate     [[buffer(8)]],  // [num_heads, head_dim] sigmoid gate
     uint tid [[thread_position_in_grid]]          // linearized: d + h * head_dim
 ) {
     uint d = tid % head_dim;
@@ -301,7 +302,9 @@ kernel void attn_values_batched(
     for (uint p = 0; p < seq_len; p++) {
         acc += s[p] * V_cache[p * kv_dim + kv_h * head_dim + d];
     }
-    out[h * head_dim + d] = acc;
+    // Fused sigmoid gate: out = attn_value * sigmoid(gate)
+    float g = 1.0f / (1.0f + exp(-gate[h * head_dim + d]));
+    out[h * head_dim + d] = acc * g;
 }
 
 

@@ -790,8 +790,8 @@ int engine_step(Engine *eng, int token_id) {
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // --- Phase H: Attention values (scores @ V) ---
-            // Output → buf_attn_output (reuse Q buffer, now overwritten with attn output)
+            // --- Phase H: Attention values (scores @ V) + fused sigmoid gate ---
+            // Output → buf_attn_output (reuse Q buffer, now overwritten with gated attn output)
             [enc setComputePipelineState:ctx->attn_values];
             [enc setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_kv_v[full_idx] offset:0 atIndex:1];
@@ -804,16 +804,7 @@ int engine_step(Engine *eng, int token_id) {
               [enc setBytes:&sl length:sizeof(uint) atIndex:5];
               [enc setBytes:&ss length:sizeof(uint) atIndex:6];
               [enc setBytes:&hpk length:sizeof(uint) atIndex:7]; }
-            [enc dispatchThreadgroups:MTLSizeMake(((uint)(n_heads * hd) + 255) / 256, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-            // --- Phase I-pre: Attention output gate (sigmoid) ---
-            [enc setComputePipelineState:ctx->sigmoid_gate];
-            [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_attn_output offset:n_heads * hd * sizeof(float) atIndex:1];
-            { uint gd = (uint)(n_heads * hd);
-              [enc setBytes:&gd length:sizeof(uint) atIndex:2]; }
+            [enc setBuffer:ctx->buf_attn_output offset:n_heads * hd * sizeof(float) atIndex:8];
             [enc dispatchThreadgroups:MTLSizeMake(((uint)(n_heads * hd) + 255) / 256, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
