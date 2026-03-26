@@ -151,7 +151,6 @@ typedef struct {
     id<MTLBuffer> buf_h_mid;
     id<MTLBuffer> buf_moe_hidden;
     id<MTLBuffer> buf_combine_params;
-    id<MTLBuffer> buf_weights;          // mmap'd weight file as MTL buffer
 
     // Batched expert buffers (K × dim)
     id<MTLBuffer> buf_batch_expert_gate;
@@ -272,7 +271,8 @@ typedef struct {
 
 
 // Build tensor cache from GGUF file
-LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
+LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
+                                           MetalCtx *ctx,
                                            const ModelConfig *cfg,
                                            GlobalTensorCache *globals);
 

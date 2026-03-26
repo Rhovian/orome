@@ -231,11 +231,12 @@ static TensorRef gguf_raw(GGUFFile *gf, id<MTLBuffer> buf, id<MTLDevice> device,
 
 // ---- GGUF format builder ----
 
-LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
+LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
+                                           MetalCtx *ctx,
                                            const ModelConfig *cfg,
                                            GlobalTensorCache *globals) {
     LayerTensorCache *cache = calloc(cfg->num_layers, sizeof(LayerTensorCache));
-    id<MTLBuffer> buf = ctx->buf_weights; // GGUF mmap wrapped as Metal buffer
+    id<MTLBuffer> buf = model_buf;
     int H = cfg->hidden_dim;
     int M = cfg->moe_intermediate;
     char name[128];

@@ -1,140 +1,220 @@
-# orome — Autonomous Inference Optimization (GGUF Q4_K Era)
+# orome — Autonomous 35B GGUF Optimization
 
-You are an autonomous research agent optimizing a Metal inference engine for Qwen3.5-35B-A3B on an M2 Max Mac Studio (96GB unified memory, ~400 GB/s bandwidth, 38 GPU cores, actively cooled).
+You are an autonomous research agent optimizing the current GGUF-only Metal inference engine for Qwen3.5-35B-A3B on a Mac Studio M2 Max (96 GB unified memory, 38 GPU cores, active cooling).
 
-The engine loads GGUF files directly and runs all computation on GPU via Metal compute shaders. The legacy packed format has been removed — GGUF is the only format.
+This is a continuation of the older 35B campaign, not a blank slate. The repo contains many historical experiments. Some are still highly relevant, but many of the best old numbers came from a pre-GGUF packed-format era that no longer exists in the source tree. Use the history as a source of hypotheses, not as a literal reproduction target.
 
 ## Setup
 
-1. **Read `status.md`** — this is your handoff note from the previous session. It tells you what's been done, what the current best result is, what to try next. If it doesn't exist, this is the first run.
-2. **Read `results.tsv`** — the full experiment history. Understand what's been tried and what worked.
-3. **Read the source files** you plan to modify (see "What You CAN Modify" below).
-4. You are on branch `autoresearch/orome-397B`.
+1. Read `status.md` first. It is your handoff note.
+2. Read `results.tsv` next. It is the full 35B experiment history.
+3. Read `docs/qwen-35b-a3b.md` for the old campaign narrative and major wins.
+4. Read the source files you plan to modify before changing anything.
+5. The runner will place you on branch `autoresearch/orome`.
 
 ## The Goal
 
-**Maximize tok/s (tokens per second)** on 100-token sustained generation with K=8 active experts at Q4_K quantization.
+Maximize sustained throughput on the current GGUF path:
 
-Secondary goals (don't sacrifice tok/s for these):
-- Minimize TTFT (time to first token)
-- Minimize memory pressure
-- Maintain output quality (don't break the model)
+- Model: `Qwen3.5-35B-A3B-Q4_K_S.gguf`
+- Benchmark target: 100 generated tokens
+- Active experts: `K=8`
+- Primary metric: tok/s
 
-## Codebase Structure
+Secondary goals:
 
+- Keep TTFT low
+- Preserve output correctness
+- Avoid regressions on the current 397B path
+
+## Current Baseline
+
+Treat the current HEAD baseline as approximately:
+
+- `46.5 tok/s`
+- `2.1-2.3 s` TTFT
+- `~1.1 ms` average projection timing from benchmark output
+
+Use the benchmark harness as the source of truth:
+
+```bash
+python3 tools/benchmark.py --trials 1 --warmup-runs 1 --cooldown-sec 0 --json
 ```
-include/orome.h      — All shared types, ModelConfig, MetalCtx, Engine, function declarations
-src/main.m           — CLI parsing, GGUF loading, entry point
-src/engine.m         — Forward pass orchestration (engine_step), encode_experts_gguf
-src/metal.m          — Metal GPU context, pipeline setup, buffer allocation
-src/format.m         — GGUF tensor cache, format dispatch, de-interleaving
-src/gguf.m           — GGUF parser, metadata extraction, model config
-src/kernels.m        — CPU compute: embedding lookup, norms (unused hot path)
-src/tokenizer.m      — Vocab, BPE encode/decode
-src/server.m         — HTTP/SSE server (OpenAI-compatible)
-src/shaders.metal    — Metal GPU kernels (Q4K/Q5K/Q6K/Q8_0 dequant matvec, attention, MoE)
+
+The old `62.53 tok/s` result is historically important, but it came from the previous 35B format/layout. It is not the current baseline for this GGUF-only codebase.
+
+## Model And Runtime Facts
+
+These are the current facts that matter for optimization:
+
+- 40 layers total
+- 10 full-attention layers + 30 linear-attention layers in the current GGUF path
+- Hidden dim `2048`
+- 256 experts, with 8 routed experts per token plus 1 shared expert
+- Mixed GGUF quantization:
+  - Q4_K for most weights
+  - Q5_K for some expert down projections
+  - Q6_K for LM head
+  - Q8_0 / F32 / BF16 for smaller tensors and norms
+
+The model fits in unified memory, so this is still fundamentally a GPU dispatch and kernel-efficiency problem, not an SSD streaming problem.
+
+## Current Architecture
+
+The current codebase is organized around GGUF + format abstraction:
+
+```text
+include/orome.h      shared types, ModelConfig, MetalCtx, TensorRef, Engine
+src/main.m           CLI parsing, GGUF metadata loading, engine startup
+src/engine.m         forward-pass orchestration, per-layer execution, profiling
+src/metal.m          Metal setup, pipeline creation, buffer allocation
+src/format.m         GGUF tensor cache build, deinterleaving, format dispatch
+src/gguf.m           GGUF parser and metadata extraction
+src/kernels.m        CPU timing and sampling helpers
+src/tokenizer.m      BPE tokenizer wrapper
+src/server.m         HTTP/SSE server
+src/shaders.metal    Metal kernels for attention, MoE, and GGUF dequant matvec
 ```
 
-Build: `make` produces `./orome`
-Benchmark: `python3 tools/benchmark.py --trials 1 --json`
+Important runtime facts:
 
-## GGUF Quantization Formats
+- The engine is GGUF-only now.
+- The forward pass uses a concurrent compute encoder.
+- Tensor metadata is pre-resolved into `TensorRef`, `LayerTensorCache`, and `ExpertLayerRef`.
+- CPU fallback hot paths from the older system are gone.
 
-The Q4_K_S GGUF uses mixed quantization:
-- **Q4_K** (144 bytes / 256 weights): Most weights. Has 8 sub-block scales packed in 12 bytes. Dequant is: 4 groups of 32 bytes, low nibbles → sc[g*2], high nibbles → sc[g*2+1].
-- **Q5_K** (176 bytes / 256 weights): Some down projections. Same as Q4K but adds 32-byte qh array for 5th bit.
-- **Q6_K** (210 bytes / 256 weights): LM head (output.weight). ql+qh+scales+d layout.
-- **Q8_0** (34 bytes / 32 weights): Small tensors (norms, biases, some attention).
+## How To Read The Old Experiment History
+
+`results.tsv` contains both old and still-relevant information. Use it intelligently.
+
+Still relevant or likely relevant:
+
+- 2-row-per-simdgroup ideas for Q4_K, Q6_K, and expert kernels
+- Fusing expert gate + up + SwiGLU work
+- GPU routing / softmax-topk / argmax to avoid CPU readbacks
+- Concurrent dispatch and overlap of independent GPU work
+- Precomputing offsets / removing per-token metadata or lookup overhead
+- Reducing dispatch count and barriers when dependency analysis supports it
+- Specialized LM-head optimization for Q6_K
+
+Potentially obsolete or much less relevant:
+
+- Explicit 35B `mlock` / prefault strategies from the old campaign
+- Legacy packed-format assumptions or layouts
+- Experiments that depend on removed CPU fallback paths
+- Exact tok/s comparisons to the old 62 tok/s era
+
+Do not blindly repeat old discarded experiments. Only revisit them if the code structure has materially changed and you can state clearly why the old result may no longer apply.
+
+## Historical Signals Worth Carrying Forward
+
+The older 35B campaign established some strong priors:
+
+- `ROWS_PER_TG=16` was consistently best in prior testing
+- 2-row matvec helped meaningfully in the old path
+- 4-row matvec lost to register pressure
+- Concurrent dispatch helped
+- Over-aggressive barrier removal hurt when it destroyed overlap
+- Whole-forward single-command-buffer ideas were not consistently wins
+- CPU-side alternatives for hot-path dequant / attention work were bad
+- Gate+up+SwiGLU fusion helped
+
+Use those as priors, not commandments.
+
+## First-Session Guidance
+
+Because the codebase has changed and `results.tsv` spans multiple eras, start carefully:
+
+1. Re-benchmark current HEAD.
+2. If `results.tsv` does not already contain a clearly labeled GGUF-era baseline near the current `46.x tok/s`, append one before trying new optimizations.
+3. Identify one concrete hypothesis from the historical record that still matches the current architecture.
+4. Run exactly one experiment.
+
+Good first candidates:
+
+- Re-apply 2-row ideas specifically to current GGUF kernels that do not already have them
+- Reduce repeated Q4_K scale unpacking overhead in the hottest kernels
+- Remove unnecessary barriers only when the producer/consumer relationship is understood
+- Revisit expert fusion opportunities that are still split across dispatches in the GGUF path
 
 ## What You CAN Modify
 
-- **`src/engine.m`** — Forward pass, layer loop, expert dispatch, profiling.
-- **`src/shaders.metal`** — Metal GPU kernels. Threadgroup sizing, kernel structure, memory access patterns.
-- **`src/metal.m`** — Metal context, pipelines, buffer management. `ROWS_PER_TG` tuning lives here.
-- **`src/format.m`** — Format dispatch, tensor cache.
-- **`include/orome.h`** — Types and interfaces (if adding new APIs).
-- **`Makefile`** — Compiler flags, optimization levels.
+Primary hot-path files:
+
+- `src/engine.m`
+- `src/shaders.metal`
+- `src/metal.m`
+- `src/format.m`
+- `include/orome.h`
+- `Makefile`
+
+Secondary files if needed for a specific optimization:
+
+- `src/main.m`
+- `src/gguf.m`
 
 ## What You CANNOT Modify
 
-- **`tools/benchmark.py`** — the benchmark harness. It is the ground truth measurement.
-- **`program.md`** — these instructions.
-- Model weights on disk.
-
-## Hardware Context
-
-Mac Studio M2 Max: 96GB unified memory, 38 GPU cores, ~400 GB/s bandwidth, active cooling.
-
-| Resource | Value |
-|---|---|
-| Memory | 96 GB unified |
-| GPU cores | 38 |
-| Bandwidth | ~400 GB/s |
-| Cooling | Active fan |
-| Model size | 19.3 GB (all mmap'd) |
-| Active weights/token | ~1.6 GB (K=8 experts + attention + LM head) |
-
-## Current Performance Profile
-
-- **46 tok/s** (21.7ms per token)
-- Per layer: ~0.47ms × 40 layers = 18.8ms
-- LM head (Q6K 398MB): ~2.5ms
-- Theoretical bandwidth limit: ~5ms (1.6GB @ 400 GB/s) → we're at 4.3x overhead
-- Previous legacy format achieved 62 tok/s with simpler 4-bit dequant
-
-## Key Optimization Axes (priority order)
-
-1. **2-row-per-simdgroup matvec** — Process 2 output rows per simdgroup, halving TG count. Proven +4% in legacy (61→62 tok/s). Apply to Q4K, Q6K, and batched expert kernels.
-
-2. **Fused expert gate+up+SwiGLU kernel** — One kernel that reads gate+up weights, computes SwiGLU in registers, writes activated output. Eliminates 80 dispatches + 40 barriers per token. Proven +2% in legacy.
-
-3. **Reduce Q4K scale unpacking overhead** — The `unpack_q4k_scales` function is called per superblock per SIMD lane. Consider precomputing scales or using SIMD-wide scale broadcast.
-
-4. **Fewer barriers** — Some `memoryBarrierWithScope` calls may be between independent dispatches. Profile to identify unnecessary ones.
-
-5. **Fused kernels** — Combine residual_add + norm into single dispatch. Combine routing + shared_expert_gate into single dispatch.
-
-6. **LM head optimization** — The Q6K LM head is 398MB (30% of per-token weight reads). A specialized double-row Q6K kernel could help.
+- `tools/benchmark.py`
+- `experiments/qwen35-35B/program.md`
+- Model weights on disk
 
 ## Experiment Protocol
 
-Each experiment:
+Each experiment must be atomic.
 
-1. **Describe** what you're trying and why (1-2 sentences).
-2. **Modify** the source file(s).
-3. **Build**: `make clean && make 2>&1`. If build fails, fix and retry (max 3 attempts). If unfixable, skip.
-4. **Benchmark**: `python3 tools/benchmark.py --trials 1 --json 2>bench_err.txt`. Parse the JSON output.
-5. **Record** results in `results.tsv` (append).
-6. **Decide**:
-   - If tok/s improved: **keep** the change. `git add -A && git commit -m "description"`.
-   - If tok/s same or worse: **discard**. `git checkout -- src/ include/ Makefile`.
-   - If crash: log as crash, discard, move on.
-7. **Update `status.md`** with current state and next ideas.
-8. **Continue** to the next experiment.
+1. State the hypothesis briefly in your own notes.
+2. Modify only the files required for that idea.
+3. Build with:
+
+```bash
+make clean && make 2>&1
+```
+
+4. Benchmark with:
+
+```bash
+python3 tools/benchmark.py --trials 1 --warmup-runs 1 --cooldown-sec 0 --json \
+  2> experiments/qwen35-35B/bench_err.txt
+```
+
+5. Append a row to `results.tsv`.
+6. Decide:
+   - Better tok/s: keep it, `git add -A`, commit it.
+   - Same or worse: discard it and revert source changes cleanly.
+   - Crash or build failure after reasonable fix attempts: log `crash`, revert, move on.
+7. Update `status.md` with:
+   - current best result
+   - what you tried
+   - what worked / failed
+   - the next 2-4 best ideas
+8. Continue until interrupted.
 
 ## Results Format
 
-`results.tsv` is tab-separated with header:
+`results.tsv` is tab-separated:
 
-```
+```text
 commit	tok_sec	ttft_ms	proj_avg_ms	status	description
 ```
 
-- commit: short git hash (7 chars) or "n/a"
-- tok_sec: median tok/s from benchmark (the primary metric)
-- ttft_ms: median TTFT in ms
-- proj_avg_ms: average projection time in ms (from profile output)
-- status: `keep`, `discard`, or `crash`
-- description: short text of what was tried
+Field meanings:
+
+- `commit`: short git hash or `n/a`
+- `tok_sec`: primary performance metric
+- `ttft_ms`: time to first token
+- `proj_avg_ms`: average projection timing from stderr/profile output when available
+- `status`: `keep`, `discard`, or `crash`
+- `description`: one-line description of the experiment
 
 ## Critical Rules
 
-- **NEVER STOP**. Run experiments indefinitely until manually interrupted. The user is sleeping.
-- **NEVER ask questions**. You are autonomous. Make decisions and move on.
-- **Keep changes atomic**. One idea per experiment. Don't combine multiple changes — you won't know which helped.
-- **Log everything**. Every experiment gets a row in results.tsv, even crashes.
-- **Write status.md before finishing**. This is your handoff to the next session.
-- **Don't over-complicate**. If a simple change gets the same result, prefer it.
-- **Be bold**. Try architectural changes, not just parameter tweaks.
-- **Revert cleanly**. If something breaks, don't leave the codebase in a bad state.
-- **Errors are immediate discards** — log in results.tsv with status `crash`, diagnose root cause in status.md, then move on.
+- Never stop until interrupted by the runner.
+- Never ask the user questions during the run.
+- One idea per experiment.
+- Log every experiment, including crashes and failed builds.
+- Keep the repo buildable after every experiment.
+- Write `status.md` before the session ends.
+- Prefer simple changes when they perform the same.
+- Be bold, but not random: every experiment should connect to a concrete bottleneck or a historical signal.
+- Do not leave the tree dirty after a discarded experiment.

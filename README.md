@@ -77,6 +77,7 @@ Two models, two completely different bottlenecks, two different optimization sto
 
 ```bash
 ./run_experiments.sh qwen35-397B --sessions 3
+./run_experiments.sh qwen35-397B --agent codex --sessions 3
 ```
 
-Launches Claude Code sessions that autonomously run experiments: modify source, build, benchmark, log results, commit or revert. Each session reads `status.md` for handoff, follows `program.md` for protocol, appends to `results.tsv`. 122 experiments logged across both campaigns.
+Launches Claude Code or Codex sessions that autonomously run experiments: modify source, build, benchmark, log results, commit or revert. Each session reads `status.md` for handoff, follows `program.md` for protocol, appends to `results.tsv`. 122 experiments logged across both campaigns.

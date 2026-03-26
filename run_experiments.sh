@@ -1,7 +1,7 @@
 #!/bin/bash
 # run_experiments.sh — Autonomous experiment runner for orome
 #
-# Launches Claude Code sessions in a loop. Each session:
+# Launches autonomous agent sessions in a loop. Each session:
 #   1. Reads status.md for handoff context
 #   2. Runs experiments (modify code, build, benchmark, log)
 #   3. Writes status.md before exiting
@@ -14,8 +14,10 @@
 #   experiments/<model>/status.md    — Last session's handoff note
 #
 # Usage:
-#   ./run_experiments.sh <model>                # run forever
-#   ./run_experiments.sh <model> --sessions 5   # run 5 sessions then stop
+#   ./run_experiments.sh <model>                               # run forever with Claude
+#   ./run_experiments.sh <model> --agent codex                # run forever with Codex
+#   ./run_experiments.sh <model> --sessions 5                 # run 5 Claude sessions then stop
+#   ./run_experiments.sh <model> --agent codex --sessions 5   # run 5 Codex sessions then stop
 #
 # Models:
 #   qwen35-35B   — Qwen3.5-35B-A3B (fits in RAM, mlock path)
@@ -34,7 +36,7 @@ cd "$SCRIPT_DIR"
 # ---- Parse arguments ----
 MODEL="${1:-}"
 if [[ -z "$MODEL" ]]; then
-    echo "Usage: $0 <model> [--sessions N]"
+    echo "Usage: $0 <model> [--agent claude|codex] [--sessions N]"
     echo ""
     echo "Available models:"
     for d in experiments/*/; do
@@ -60,12 +62,35 @@ fi
 
 shift  # consume model arg
 MAX_SESSIONS=0
+AGENT="claude"
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --sessions) MAX_SESSIONS="$2"; shift 2 ;;
+        --agent)
+            [[ $# -ge 2 ]] || { echo "ERROR: --agent requires a value"; exit 1; }
+            AGENT="$2"
+            shift 2
+            ;;
+        --sessions)
+            [[ $# -ge 2 ]] || { echo "ERROR: --sessions requires a value"; exit 1; }
+            MAX_SESSIONS="$2"
+            shift 2
+            ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
+
+case "$AGENT" in
+    claude|codex) ;;
+    *)
+        echo "ERROR: --agent must be 'claude' or 'codex' (got: $AGENT)"
+        exit 1
+        ;;
+esac
+
+if ! command -v "$AGENT" >/dev/null 2>&1; then
+    echo "ERROR: '$AGENT' is not installed or not on PATH"
+    exit 1
+fi
 
 # ---- Determine branch name ----
 BRANCH_NAME="autoresearch/orome"
@@ -89,6 +114,7 @@ echo "============================================"
 echo "  orome autonomous experiment runner"
 echo "  $(date '+%Y-%m-%d %H:%M:%S')"
 echo "  Model: $MODEL"
+echo "  Agent: $AGENT"
 echo "  Experiment dir: $EXPERIMENT_DIR"
 echo "  Working dir: $SCRIPT_DIR"
 echo "  Branch: $BRANCH_NAME"
@@ -172,6 +198,32 @@ run_cross_checks() {
     return $any_fail
 }
 
+run_agent_session() {
+    local prompt="$1"
+
+    case "$AGENT" in
+        claude)
+            # --output-format stream-json: streams output incrementally (visible in real-time)
+            # --dangerously-skip-permissions: no prompts (we trust the agent)
+            # --max-turns: limit turns per session to avoid runaway
+            claude --output-format stream-json \
+                --verbose \
+                --dangerously-skip-permissions \
+                --max-turns 80 \
+                -p "$prompt"
+            ;;
+        codex)
+            # --json: streams events incrementally (visible in real-time)
+            # --dangerously-bypass-approvals-and-sandbox: no prompts (we trust the agent)
+            codex exec \
+                --json \
+                --dangerously-bypass-approvals-and-sandbox \
+                -C "$SCRIPT_DIR" \
+                "$prompt"
+            ;;
+    esac
+}
+
 while true; do
     if [[ "$STOP" -eq 1 ]]; then
         echo "[runner] Stopping (interrupt received)."
@@ -229,16 +281,8 @@ $(cat "$EXPERIMENT_DIR/results.tsv")
     # Snapshot the codebase state before the session (for recovery)
     GIT_HEAD_BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
 
-    # Launch Claude Code session
-    # --output-format stream-json: streams output incrementally (visible in real-time)
-    # --dangerously-skip-permissions: no prompts (we trust the agent)
-    # --max-turns: limit turns per session to avoid runaway
-    claude --output-format stream-json \
-        --verbose \
-        --dangerously-skip-permissions \
-        --max-turns 80 \
-        -p "$PROMPT" \
-        2>&1 | tee "$SESSION_LOG"
+    # Launch agent session and stream output to the log in real time.
+    run_agent_session "$PROMPT" 2>&1 | tee "$SESSION_LOG"
 
     EXIT_CODE=${PIPESTATUS[0]}
     GIT_HEAD_AFTER=$(git rev-parse HEAD 2>/dev/null || echo "unknown")

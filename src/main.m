@@ -61,7 +61,7 @@ int main(int argc, char **argv) {
         int gguf_info = 0;
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:p:t:k:2K:P:G:H:ES:Th", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:p:t:k:K:P:G:S:TI:L:h", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_dir = optarg; break;
                 case 'p': prompt_text = optarg; break;
@@ -250,7 +250,6 @@ int main(int argc, char **argv) {
 
             // Create format provider (wraps GGUF mmap as Metal buffer)
             fp = format_provider_open_gguf(gf, ctx);
-            if (fp) ctx->buf_weights = fp->model_buf;  // share Metal buffer with ctx
             if (!fp) {
                 fprintf(stderr, "ERROR: Failed to create format provider\n");
                 return 1;
@@ -274,7 +273,8 @@ int main(int argc, char **argv) {
             eng->gf = gf;
 
             // Build format-agnostic tensor cache from GGUF
-            eng->tensor_cache = build_tensor_cache_gguf(gf, ctx, &cfg, &eng->globals);
+            eng->tensor_cache = build_tensor_cache_gguf(gf, fp->model_buf,
+                                                        ctx, &cfg, &eng->globals);
 
             // Pre-resolve expert layer refs (avoids per-token GGUF hash lookups)
             eng->expert_layer_cache = calloc(cfg.num_layers, sizeof(ExpertLayerRef));

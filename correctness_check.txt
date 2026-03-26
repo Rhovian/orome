@@ -1,4 +1,0 @@
-bpe_load: 248044 vocab, 247587 merges, 26 added tokens
-[profile] avg/tok: attn=484.1ms moe=0.0ms norm=0.00ms lmhead=2.6ms
-[profile] avg/tok: attn=396.2ms moe=0.0ms norm=0.00ms lmhead=2.5ms
-[profile] avg/tok: attn=376.8ms moe=0.0ms norm=0.00ms lmhead=2.6ms
