@@ -2385,3 +2385,186 @@ kernel void batch_expert_down_q4k(
         out[expert * out_dim + row] = sum;
     }
 }
+
+// ============================================================================
+// Dynamic Q4_K batched expert matvec (gate/up projections)
+// ============================================================================
+// Reads expert indices from GPU buffer (written by softmax_topk_route).
+// Buffer(0) bound with Metal offset = projection base (elr->gate.offset),
+// so kernel only needs expert_stride (uint32) to index within the projection.
+
+kernel void batch_expert_mv_q4k_dyn(
+    device const uint8_t*       layer_data      [[buffer(0)]],
+    device const float*         x               [[buffer(1)]],
+    device float*               out             [[buffer(2)]],
+    device const uint32_t*      expert_indices  [[buffer(3)]],
+    constant uint&              expert_stride   [[buffer(4)]],
+    constant uint&              out_dim         [[buffer(5)]],
+    constant uint&              in_dim          [[buffer(6)]],
+    constant uint&              num_row_tgs     [[buffer(7)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint expert_k = tgid / num_row_tgs;
+    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
+    if (row >= out_dim) return;
+
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = half(x[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint expert_id = expert_indices[expert_k];
+    uint num_superblocks = in_dim / 256;
+    uint bytes_per_row = num_superblocks * 144;
+    device const uint8_t* expert_data = layer_data + expert_id * expert_stride;
+    device const uint8_t* row_data = expert_data + row * bytes_per_row;
+
+    float acc = 0.0f;
+    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
+        device const uint8_t* sb = row_data + sb_idx * 144;
+        float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
+        float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
+        float sc[8], mn[8];
+        unpack_q4k_scales(sb + 4, sc, mn, 8);
+        device const uint8_t* qs = sb + 16;
+        uint x_base = sb_idx * 256;
+        for (uint sub = 0; sub < 8; sub++) {
+            float sub_sc = d * sc[sub];
+            float sub_mn = dmin * mn[sub];
+            device const uint8_t* qsub = qs + sub * 16;
+            for (uint j = 0; j < 16; j++) {
+                uint8_t byte = qsub[j];
+                uint xi = x_base + sub * 32 + j * 2;
+                acc += (sub_sc * float(byte & 0xF) - sub_mn) * x[xi];
+                acc += (sub_sc * float(byte >> 4) - sub_mn) * x[xi + 1];
+            }
+        }
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) { out[expert_k * out_dim + row] = sum; }
+}
+
+// ============================================================================
+// Dynamic Q4_K batched expert down projection (per-expert packed input)
+// ============================================================================
+
+kernel void batch_expert_down_q4k_dyn(
+    device const uint8_t*       layer_data      [[buffer(0)]],
+    device const float*         x               [[buffer(1)]],
+    device float*               out             [[buffer(2)]],
+    device const uint32_t*      expert_indices  [[buffer(3)]],
+    constant uint&              expert_stride   [[buffer(4)]],
+    constant uint&              out_dim         [[buffer(5)]],
+    constant uint&              in_dim          [[buffer(6)]],
+    constant uint&              num_row_tgs     [[buffer(7)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint expert_k = tgid / num_row_tgs;
+    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
+    if (row >= out_dim) return;
+
+    device const float* ex = x + expert_k * in_dim;
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
+    for (uint i = lid; i < in_dim; i += tg_size) { x_shared[i] = half(ex[i]); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint expert_id = expert_indices[expert_k];
+    uint num_superblocks = in_dim / 256;
+    uint bytes_per_row = num_superblocks * 144;
+    device const uint8_t* expert_data = layer_data + expert_id * expert_stride;
+    device const uint8_t* row_data = expert_data + row * bytes_per_row;
+
+    float acc = 0.0f;
+    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
+        device const uint8_t* sb = row_data + sb_idx * 144;
+        float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
+        float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
+        float sc[8], mn[8];
+        unpack_q4k_scales(sb + 4, sc, mn, 8);
+        device const uint8_t* qs = sb + 16;
+        uint x_base = sb_idx * 256;
+        for (uint sub = 0; sub < 8; sub++) {
+            float sub_sc = d * sc[sub];
+            float sub_mn = dmin * mn[sub];
+            device const uint8_t* qsub = qs + sub * 16;
+            for (uint j = 0; j < 16; j++) {
+                uint8_t byte = qsub[j];
+                uint xi = x_base + sub * 32 + j * 2;
+                acc += (sub_sc * float(byte & 0xF) - sub_mn) * ex[xi];
+                acc += (sub_sc * float(byte >> 4) - sub_mn) * ex[xi + 1];
+            }
+        }
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) { out[expert_k * out_dim + row] = sum; }
+}
+
+// ============================================================================
+// Dynamic Q5_K batched expert down projection (per-expert packed input)
+// ============================================================================
+
+kernel void batch_expert_down_q5k_dyn(
+    device const uint8_t*       layer_data      [[buffer(0)]],
+    device const float*         x               [[buffer(1)]],
+    device float*               out             [[buffer(2)]],
+    device const uint32_t*      expert_indices  [[buffer(3)]],
+    constant uint&              expert_stride   [[buffer(4)]],
+    constant uint&              out_dim         [[buffer(5)]],
+    constant uint&              in_dim          [[buffer(6)]],
+    constant uint&              num_row_tgs     [[buffer(7)]],
+    uint tgid    [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint expert_k = tgid / num_row_tgs;
+    uint row = (tgid % num_row_tgs) * ROWS_PER_TG + simd_group;
+    if (row >= out_dim) return;
+
+    device const float* ex = x + expert_k * in_dim;
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
+    for (uint i = lid; i < in_dim; i += tg_size) { x_shared[i] = half(ex[i]); }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint expert_id = expert_indices[expert_k];
+    uint num_superblocks = in_dim / 256;
+    uint bytes_per_row = num_superblocks * 176;
+    device const uint8_t* expert_data = layer_data + expert_id * expert_stride;
+    device const uint8_t* row_data = expert_data + row * bytes_per_row;
+
+    float acc = 0.0f;
+    for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
+        device const uint8_t* sb = row_data + sb_idx * 176;
+        float d    = float(as_type<half>(ushort(ushort(sb[0]) | (ushort(sb[1]) << 8))));
+        float dmin = float(as_type<half>(ushort(ushort(sb[2]) | (ushort(sb[3]) << 8))));
+        float sc[8], mn[8];
+        unpack_q4k_scales(sb + 4, sc, mn, 8);
+        device const uint8_t* qh = sb + 16;
+        device const uint8_t* ql = sb + 48;
+        uint x_base = sb_idx * 256;
+        for (uint sub = 0; sub < 8; sub++) {
+            float sub_sc = d * sc[sub];
+            float sub_mn = dmin * mn[sub];
+            uint sub_base = sub * 32;
+            for (uint j = 0; j < 32; j++) {
+                uint idx = sub_base + j;
+                uint8_t q_lo = (ql[idx / 2] >> (4 * (idx % 2))) & 0xF;
+                uint8_t q_hi = (qh[idx / 8] >> (idx % 8)) & 1;
+                float q5 = float(q_lo | (q_hi << 4));
+                acc += (sub_sc * q5 - sub_mn) * ex[x_base + idx];
+            }
+        }
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) { out[expert_k * out_dim + row] = sum; }
+}

@@ -257,6 +257,9 @@ typedef struct {
     id<MTLComputePipelineState> matvec_f16;
     id<MTLComputePipelineState> batch_expert_mv_q4k;
     id<MTLComputePipelineState> batch_expert_down_q4k;
+    id<MTLComputePipelineState> batch_expert_mv_q4k_dyn;
+    id<MTLComputePipelineState> batch_expert_down_q4k_dyn;
+    id<MTLComputePipelineState> batch_expert_down_q5k_dyn;
 
     // Shared buffers (allocated based on ModelConfig)
     id<MTLBuffer> buf_input;
@@ -691,6 +694,7 @@ typedef struct {
     // GGUF format support (NULL for legacy format)
     FormatProvider *fp;
     GGUFFile *gf;
+    ExpertLayerRef *expert_layer_cache;  // [num_layers], pre-resolved from FormatProvider
 } Engine;
 
 Engine *engine_create(ModelConfig *cfg, WeightFile *wf, MetalCtx *ctx,

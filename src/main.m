@@ -49,6 +49,7 @@ int main(int argc, char **argv) {
         int thermal_gen = 16;
         const char *hot_mask_path = NULL;
         int profile_experts = 0;
+        int max_layers = 0; // 0 = all layers
         static struct option long_options[] = {
             {"model",   required_argument, 0, 'm'},
             {"prompt",  required_argument, 0, 'p'},
@@ -63,6 +64,7 @@ int main(int argc, char **argv) {
             {"serve",   required_argument, 0, 'S'},
             {"timing",  no_argument,       0, 'T'},
             {"gguf-info", no_argument,     0, 'I'},
+            {"layers",   required_argument, 0, 'L'},
             {"help",    no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -77,6 +79,7 @@ int main(int argc, char **argv) {
                 case 'k': active_k = atoi(optarg); break;
                 case '2': use_2bit = 1; break;
                 case 'K': thermal_k = atoi(optarg); break;
+                case 'L': max_layers = atoi(optarg); break;
                 case 'P': thermal_proj_ms = atof(optarg); break;
                 case 'G': thermal_gen = atoi(optarg); break;
                 case 'H': hot_mask_path = optarg; break;
@@ -236,6 +239,18 @@ int main(int argc, char **argv) {
             }
             model_config_init_derived(&cfg);
 
+            if (max_layers > 0 && max_layers < cfg.num_layers) {
+                fprintf(stderr, "[main] Limiting to %d layers (was %d)\n", max_layers, cfg.num_layers);
+                cfg.num_layers = max_layers;
+                // Recount layer types
+                cfg.num_full_attn_layers = 0;
+                cfg.num_linear_layers = 0;
+                for (int i = 0; i < cfg.num_layers; i++) {
+                    if (cfg.layer_types[i] == ATTN_FULL) cfg.num_full_attn_layers++;
+                    else cfg.num_linear_layers++;
+                }
+            }
+
             fprintf(stderr, "[main] GGUF config: %s, %d layers (%d full + %d linear), "
                     "hidden=%d, experts=%d, K=%d\n",
                     cfg.name, cfg.num_layers, cfg.num_full_attn_layers,
@@ -299,6 +314,14 @@ int main(int argc, char **argv) {
 
             // Build format-agnostic tensor cache from GGUF
             eng->tensor_cache = build_tensor_cache_gguf(gf, ctx, &cfg, &eng->globals);
+
+            // Pre-resolve expert layer refs (avoids per-token GGUF hash lookups)
+            eng->expert_layer_cache = calloc(cfg.num_layers, sizeof(ExpertLayerRef));
+            for (int i = 0; i < cfg.num_layers; i++) {
+                eng->expert_layer_cache[i] = format_resolve_expert_layer(
+                    fp, i, cfg.hidden_dim, cfg.moe_intermediate, cfg.num_experts);
+            }
+            fprintf(stderr, "[main] Pre-resolved %d expert layer refs\n", cfg.num_layers);
 
         } else {
             // ==== Legacy loading path ====

@@ -137,6 +137,9 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->matvec_q8_0 = make_pipeline(ctx, @"dequant_matvec_q8_0");
     ctx->batch_expert_mv_q4k = make_pipeline(ctx, @"batch_expert_matvec_q4k");
     ctx->batch_expert_down_q4k = make_pipeline(ctx, @"batch_expert_down_q4k");
+    ctx->batch_expert_mv_q4k_dyn = make_pipeline(ctx, @"batch_expert_mv_q4k_dyn");
+    ctx->batch_expert_down_q4k_dyn = make_pipeline(ctx, @"batch_expert_down_q4k_dyn");
+    ctx->batch_expert_down_q5k_dyn = make_pipeline(ctx, @"batch_expert_down_q5k_dyn");
     ctx->conv1d_f32 = make_pipeline(ctx, @"conv1d_step_f32");
     ctx->decay_beta_f32 = make_pipeline(ctx, @"compute_decay_beta_f32");
     ctx->norm_apply_f32 = make_pipeline(ctx, @"rms_norm_apply_f32");
