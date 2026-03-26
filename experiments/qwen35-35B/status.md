@@ -29,37 +29,37 @@
 4. `48ce29e` — specialize `moe_combine_copy_sq` for the live `K=8` path without extra synchronization: **48.87 tok/s**
 
 ## Latest Session
-1. Re-bench current pre-session source state: **48.51 tok/s**, TTFT `2206.2 ms`
-   - Confirms the branch was still in the established `48.5-48.7 tok/s` GGUF regime before new edits
-2. `n/a` — specialize `moe_combine_copy_sq` for live `K=8` and hoist `shared_gate` via threadgroup broadcast: **48.30 tok/s**
-   - Regression; the added intra-kernel synchronization cost more than it saved
-3. `48ce29e` — specialize `moe_combine_copy_sq` for live `K=8` without extra synchronization: **48.87 tok/s**
-   - New best result; fixed-`K` unrolling in combine is a real live-path win
-4. `n/a` — precompute shared gate sigmoid in `softmax_topk_route` and consume it directly in combine: **48.48 tok/s**
-   - Regression; moving the scalar sigmoid upstream did not translate into end-to-end throughput
+1. Re-bench current pre-session source state: **48.63 tok/s**, TTFT `2119.0 ms`
+   - Confirms the retained `48ce29e` source still reruns in the established `48.6-48.8 tok/s` GGUF regime on this machine
+2. `n/a` — read combine params from constant address space and scalarize the fixed `K=8` weights: **48.39 tok/s**
+   - Regression; removing the small device-buffer reads in combine did not help the live path
+3. `n/a` — specialize live `Q8_0 shared_down` for fixed `S=512` with smaller threadgroup scratch and full SIMD participation: **48.81 tok/s**
+   - Better than the session rerun, but still below the retained `48.87 tok/s` best; not enough gain to justify extra code
 
 ## Interpretation
-- The first real improvement past the prior `48.73 tok/s` plateau came from the **MoE combine kernel**, not projection kernels.
-- The useful part of the combine hypothesis was **fixed-`K=8` specialization**; the harmful part was adding synchronization or redistributing the shared-gate scalar work.
-- `proj_avg_ms` stayed pinned at `1.1011`, so this gain sits outside the benchmark's projection timing and reinforces that the MoE tail is still a live optimization target.
+- The retained winner is still the **no-sync `K=8` combine specialization** in `48ce29e`.
+- The new constant-address-space combine attempt reinforces that the remaining combine cost is not a simple uniform-parameter fetch problem.
+- The `shared_down` shape-specific kernel likely improved that local dispatch, but not enough end-to-end to beat the retained best. That points to overlap and surrounding MoE scheduling still mattering more than a standalone `shared_down` micro-kernel.
+- `proj_avg_ms` stayed pinned at `1.1011` across the session, so the remaining headroom is still outside the benchmark's projection timer and inside the MoE tail / dispatch structure.
 
 ## What Failed
-1. `n/a` — specialize `moe_combine_copy_sq` for live `K=8` and hoist `shared_gate` via threadgroup broadcast: **48.30 tok/s**
-2. `n/a` — precompute shared gate sigmoid in `softmax_topk_route` and consume it directly in combine: **48.48 tok/s**
-3. `n/a` — 2-row GGUF `Q8_0` general matvec: **48.60 tok/s**
-4. `n/a` — dedicated 2-row `Q8_0 shared_down` kernel: **48.57 tok/s**
-5. `n/a` — early `shared_down` overlap scheduling: **48.54 tok/s**
+1. `n/a` — read combine params from constant address space and scalarize the fixed `K=8` weights: **48.39 tok/s**
+2. `n/a` — specialize live `Q8_0 shared_down` for fixed `S=512` with smaller threadgroup scratch and full SIMD participation: **48.81 tok/s**
+3. `n/a` — specialize `moe_combine_copy_sq` for live `K=8` and hoist `shared_gate` via threadgroup broadcast: **48.30 tok/s**
+4. `n/a` — precompute shared gate sigmoid in `softmax_topk_route` and consume it directly in combine: **48.48 tok/s**
+5. `n/a` — 2-row GGUF `Q8_0` general matvec: **48.60 tok/s**
+6. `n/a` — dedicated 2-row `Q8_0 shared_down` kernel: **48.57 tok/s**
+7. `n/a` — early `shared_down` overlap scheduling: **48.54 tok/s**
 
 ## Next Best Ideas
-1. Revisit `shared_down` only as a **true writeback-elimination / fusion** problem: fold the shared contribution into combine or otherwise remove the extra `buf_shared_out` traffic.
-2. If staying on the combine path, prefer **instruction-level** changes that add no new threadgroup barriers: fixed-slot parameter handling, constant-address-space experiments, or other no-sync simplifications.
-3. Use Metal System Trace to confirm whether `moe_combine_copy_sq_k8`, `softmax_topk_route`, or `shared_down` is the top post-`48ce29e` target before making a larger shader change.
-4. Audit the live GGUF tensor map again for other small scalar-like dispatches analogous to the earlier `shared_expert_gate` fusion win.
+1. Revisit `shared_down` only as a **consumer-side fusion / true writeback-elimination** problem, and only if overlap with routed expert down work is preserved or replaced with a bigger win.
+2. Use Metal System Trace to determine whether the local `shared_down` improvement is being hidden by existing overlap, or whether `moe_combine_copy_sq_k8` / routing dispatches remain the real top target post-`48ce29e`.
+3. Audit the live GGUF tensor map again for other small scalar-like or low-width dispatches analogous to the earlier `shared_expert_gate` fusion win.
+4. If staying on the combine path, try another no-sync simplification that does not move the shared-gate sigmoid upstream or just relocate uniform params.
 
 ## Current Log
-- `48ce29e` is the retained source commit.
+- `48ce29e` remains the retained source commit.
 - `results.tsv` has been updated with:
-  - the fresh `48.51 tok/s` session baseline,
-  - the discarded broadcast-hoist combine variant,
-  - the kept `48.87 tok/s` `K=8` combine specialization,
-  - the discarded route-side shared-gate hoist.
+  - the fresh `48.63 tok/s` session baseline,
+  - the discarded constant-address-space `K=8` combine variant,
+  - the discarded live `Q8_0 shared_down` `S=512` specialization.
