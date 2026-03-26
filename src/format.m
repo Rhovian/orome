@@ -360,8 +360,63 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
             snprintf(name, sizeof(name), "blk.%d.ssm_beta.weight", i);
             c->lin.b = G_REF(name, n_v, H);
             // Output projection (ssm_out in GGUF)
+            // The GGUF stores ssm_out with head-interleaved Q8_0 blocks along in_dim.
+            // 32 v-heads × 4 blocks each (128 values), interleaved in 2 groups of 16 heads.
+            // De-interleave at load time by creating a new buffer with correct block order.
             snprintf(name, sizeof(name), "blk.%d.ssm_out.weight", i);
-            c->lin.o = G_REF(name, H, total_value);
+            {
+                GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
+                if (ti && ti->n_dims >= 2) {
+                    int in_dim = (int)ti->dims[0];  // 4096 (total_value)
+                    int out_dim = (int)ti->dims[1];  // 2048 (H)
+                    int n_heads = cfg->linear_num_v_heads;  // 32
+                    int head_dim_vals = cfg->linear_value_dim;  // 128
+                    int blocks_per_head = head_dim_vals / 32;  // 4 Q8_0 blocks per head
+                    int total_blocks = in_dim / 32;  // 128 blocks per row
+                    int bytes_per_block = 34;  // Q8_0: 32 int8 + fp16 scale
+                    int bytes_per_row = total_blocks * bytes_per_block;
+                    size_t total_bytes = (size_t)out_dim * bytes_per_row;
+
+                    // Allocate de-interleaved buffer
+                    id<MTLBuffer> deint_buf = [ctx->device newBufferWithLength:total_bytes
+                                                                      options:MTLResourceStorageModeShared];
+                    uint8_t *src = (uint8_t *)[buf contents] + gf->data_offset + ti->offset;
+                    uint8_t *dst = (uint8_t *)[deint_buf contents];
+
+                    // For each row, rearrange blocks from interleaved to sequential order
+                    // GGUF block i maps to: ref_block = (i/blocks_per_head % (n_heads/2)) * (2*blocks_per_head)
+                    //                                 + (i / (total_blocks/2)) * blocks_per_head
+                    //                                 + (i % blocks_per_head)
+                    // Simplified: half = i / (total_blocks/2), group = (i % (total_blocks/2)) / blocks_per_head
+                    //             pos = i % blocks_per_head
+                    //             ref = group * (2*blocks_per_head) + half * blocks_per_head + pos
+                    int half_blocks = total_blocks / 2;
+                    for (int row = 0; row < out_dim; row++) {
+                        uint8_t *src_row = src + (size_t)row * bytes_per_row;
+                        uint8_t *dst_row = dst + (size_t)row * bytes_per_row;
+                        for (int gb = 0; gb < total_blocks; gb++) {
+                            int half = gb / half_blocks;
+                            int group = (gb % half_blocks) / blocks_per_head;
+                            int pos = gb % blocks_per_head;
+                            int ref_blk = group * (2 * blocks_per_head) + half * blocks_per_head + pos;
+                            memcpy(dst_row + ref_blk * bytes_per_block,
+                                   src_row + gb * bytes_per_block,
+                                   bytes_per_block);
+                        }
+                    }
+
+                    QuantFormat fmt = format_from_ggml_type(ti->type);
+                    c->lin.o = (TensorRef){
+                        .buffer = deint_buf, .offset = 0,
+                        .pipeline = format_pipeline_for(ctx, fmt),
+                        .format = fmt, .out_dim = (uint32_t)out_dim, .in_dim = (uint32_t)in_dim,
+                    };
+                    if (i == 0) fprintf(stderr, "[format] De-interleaved ssm_out (%d blocks/row, %d heads)\n",
+                                        total_blocks, n_heads);
+                } else {
+                    c->lin.o = G_REF(name, H, total_value);
+                }
+            }
             // Conv1d weights: GGUF stores [ne0=kernel_size, ne1=conv_dim] F32
             // Already in [conv_dim, kernel_size] memory order (ne0 contiguous per channel)
             // Use F32 conv1d kernel directly — no conversion needed
