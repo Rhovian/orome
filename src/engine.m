@@ -169,11 +169,14 @@ static void embed_lookup_gguf(GGUFFile *gf, const ModelConfig *cfg,
 // Shared expert gate+up must already be in buf_shared_gate/buf_shared_up.
 // Shared expert gate score must be at buf_output[n_experts] (from Phase K dispatch).
 
-static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
+static void encode_experts_gguf(id<MTLComputeCommandEncoder> __strong *enc_ptr,
+                                 id<MTLCommandBuffer> __strong *cmd_ptr,
                                  MetalCtx *ctx, const ModelConfig *cfg,
                                  const ExpertLayerRef *elr,
                                  const LayerTensorCache *lt,
                                  int K) {
+    id<MTLComputeCommandEncoder> enc = *enc_ptr;
+    id<MTLCommandBuffer> cmd = *cmd_ptr;
     int H = cfg->hidden_dim;
     int M = cfg->moe_intermediate;
     int S = cfg->shared_intermediate;
@@ -199,35 +202,71 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
 
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-    // --- 2. Batched gate projection (Q4K dynamic) ---
-    { uint es = (uint)elr->gate.expert_stride;
-      uint od = (uint)M, id_ = (uint)H, nrt = num_row_tgs_M;
-      [enc setComputePipelineState:ctx->batch_expert_mv_q4k_dyn];
-      [enc setBuffer:elr->buffer offset:elr->gate.offset atIndex:0];
-      [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
-      [enc setBuffer:ctx->buf_batch_expert_gate offset:0 atIndex:2];
-      [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
-      [enc setBytes:&es length:sizeof(uint) atIndex:4];
-      [enc setBytes:&od length:sizeof(uint) atIndex:5];
-      [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
-      [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
-      [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
+    // --- 2. Batched gate projection ---
+    if (elr->gate.format == QFMT_GGUF_Q4_K) {
+        uint es = (uint)elr->gate.expert_stride;
+        uint od = (uint)M, id_ = (uint)H, nrt = num_row_tgs_M;
+        [enc setComputePipelineState:ctx->batch_expert_mv_q4k_dyn];
+        [enc setBuffer:elr->buffer offset:elr->gate.offset atIndex:0];
+        [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_batch_expert_gate offset:0 atIndex:2];
+        [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
+        [enc setBytes:&es length:sizeof(uint) atIndex:4];
+        [enc setBytes:&od length:sizeof(uint) atIndex:5];
+        [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+        [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    } else {
+        // Fallback: per-expert dispatch via format_dispatch_matvec
+        // Read topk indices from GPU (requires commit+wait)
+        [enc endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+        uint32_t *topk = (uint32_t *)[ctx->buf_topk_indices contents];
+        cmd = [ctx->queue commandBuffer];
+        enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        for (int k = 0; k < K; k++) {
+            TensorRef ref = { .buffer = elr->buffer,
+                .offset = elr->gate.offset + (size_t)topk[k] * elr->gate.expert_stride,
+                .format = elr->gate.format, .out_dim = (uint32_t)M, .in_dim = (uint32_t)H };
+            ref.pipeline = format_pipeline_for(ctx, ref.format);
+            format_dispatch_matvec(enc, ctx, &ref, ctx->buf_input, 0,
+                ctx->buf_batch_expert_gate, (size_t)k * M * sizeof(float));
+        }
+    }
 
-    // --- 3. Batched up projection (Q4K dynamic) ---
-    { uint es = (uint)elr->up.expert_stride;
-      uint od = (uint)M, id_ = (uint)H, nrt = num_row_tgs_M;
-      [enc setComputePipelineState:ctx->batch_expert_mv_q4k_dyn];
-      [enc setBuffer:elr->buffer offset:elr->up.offset atIndex:0];
-      [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
-      [enc setBuffer:ctx->buf_batch_expert_up offset:0 atIndex:2];
-      [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
-      [enc setBytes:&es length:sizeof(uint) atIndex:4];
-      [enc setBytes:&od length:sizeof(uint) atIndex:5];
-      [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
-      [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
-      [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
+    // --- 3. Batched up projection ---
+    if (elr->up.format == QFMT_GGUF_Q4_K) {
+        uint es = (uint)elr->up.expert_stride;
+        uint od = (uint)M, id_ = (uint)H, nrt = num_row_tgs_M;
+        [enc setComputePipelineState:ctx->batch_expert_mv_q4k_dyn];
+        [enc setBuffer:elr->buffer offset:elr->up.offset atIndex:0];
+        [enc setBuffer:ctx->buf_input offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_batch_expert_up offset:0 atIndex:2];
+        [enc setBuffer:ctx->buf_topk_indices offset:0 atIndex:3];
+        [enc setBytes:&es length:sizeof(uint) atIndex:4];
+        [enc setBytes:&od length:sizeof(uint) atIndex:5];
+        [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
+        [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_M * K, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    } else {
+        // Same fallback for non-Q4K formats
+        if (elr->gate.format == QFMT_GGUF_Q4_K) {
+            // Only need commit if we haven't already done it for gate
+            [enc endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
+            cmd = [ctx->queue commandBuffer];
+            enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+        }
+        uint32_t *topk = (uint32_t *)[ctx->buf_topk_indices contents];
+        for (int k = 0; k < K; k++) {
+            TensorRef ref = { .buffer = elr->buffer,
+                .offset = elr->up.offset + (size_t)topk[k] * elr->up.expert_stride,
+                .format = elr->up.format, .out_dim = (uint32_t)M, .in_dim = (uint32_t)H };
+            ref.pipeline = format_pipeline_for(ctx, ref.format);
+            format_dispatch_matvec(enc, ctx, &ref, ctx->buf_input, 0,
+                ctx->buf_batch_expert_up, (size_t)k * M * sizeof(float));
+        }
+    }
 
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -251,12 +290,10 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
 
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-    // --- 6. Expert down projection (Q4K or Q5K dynamic) ---
-    { id<MTLComputePipelineState> down_pipe;
-      if (elr->down.format == QFMT_GGUF_Q5_K)
-          down_pipe = ctx->batch_expert_down_q5k_dyn;
-      else
-          down_pipe = ctx->batch_expert_down_q4k_dyn;
+    // --- 6. Expert down projection ---
+    if (elr->down.format == QFMT_GGUF_Q4_K || elr->down.format == QFMT_GGUF_Q5_K) {
+      id<MTLComputePipelineState> down_pipe = (elr->down.format == QFMT_GGUF_Q5_K)
+          ? ctx->batch_expert_down_q5k_dyn : ctx->batch_expert_down_q4k_dyn;
 
       uint es = (uint)elr->down.expert_stride;
       uint od = (uint)H, id_ = (uint)M, nrt = num_row_tgs_H;
@@ -270,7 +307,20 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
       [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
       [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
       [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_H * K, 1, 1)
-          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
+          threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
+    } else {
+        // Fallback: per-expert down projection
+        uint32_t *topk = (uint32_t *)[ctx->buf_topk_indices contents];
+        for (int k = 0; k < K; k++) {
+            TensorRef ref = { .buffer = elr->buffer,
+                .offset = elr->down.offset + (size_t)topk[k] * elr->down.expert_stride,
+                .format = elr->down.format, .out_dim = (uint32_t)H, .in_dim = (uint32_t)M };
+            ref.pipeline = format_pipeline_for(ctx, ref.format);
+            format_dispatch_matvec(enc, ctx, &ref, ctx->buf_batch_expert_act,
+                (size_t)k * M * sizeof(float),
+                ctx->buf_batch_expert_out, (size_t)k * H * sizeof(float));
+        }
+    }
 
     // --- 7. Shared expert down projection ---
     format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_down,
@@ -292,6 +342,10 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
     [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:8];
     [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    // Write back encoder/cmd in case they changed (fallback paths create new ones)
+    *enc_ptr = enc;
+    *cmd_ptr = cmd;
 }
 
 // ============================================================================
@@ -553,7 +607,7 @@ int engine_step(Engine *eng, int token_id) {
             }
 
             // GGUF GPU-resident expert forward (no CPU readback)
-            encode_experts_gguf(enc, ctx, cfg,
+            encode_experts_gguf(&enc, &cmd, ctx, cfg,
                                 &eng->expert_layer_cache[layer],
                                 &tcache[layer], effective_k);
             if (!fwd_enc) {
@@ -845,7 +899,7 @@ int engine_step(Engine *eng, int token_id) {
             }
 
             // GGUF GPU-resident expert forward (no CPU readback)
-            encode_experts_gguf(enc, ctx, cfg,
+            encode_experts_gguf(&enc, &cmd, ctx, cfg,
                                 &eng->expert_layer_cache[layer],
                                 &tcache[layer], effective_k);
             if (!fwd_enc) {
