@@ -166,7 +166,8 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
 
     NSUInteger tg_size = ENGINE_ROWS_PER_TG * 32;
     uint num_row_tgs_M = ((uint)M + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
-    uint num_row_tgs_H = ((uint)H + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
+    uint num_row_tgs_H_2row = ((uint)H + (ENGINE_ROWS_PER_TG * 2) - 1)
+        / (ENGINE_ROWS_PER_TG * 2);
 
     // --- 1. GPU softmax + topK routing ---
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -238,7 +239,7 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
     { id<MTLComputePipelineState> down_pipe = (elr->down.format == QFMT_GGUF_Q5_K)
           ? ctx->batch_expert_down_q5k_dyn : ctx->batch_expert_down_q4k_dyn;
       uint es = (uint)elr->down.expert_stride;
-      uint od = (uint)H, id_ = (uint)M, nrt = num_row_tgs_H;
+      uint od = (uint)H, id_ = (uint)M, nrt = num_row_tgs_H_2row;
       [enc setComputePipelineState:down_pipe];
       [enc setBuffer:elr->buffer offset:elr->down.offset atIndex:0];
       [enc setBuffer:ctx->buf_batch_expert_act offset:0 atIndex:1];
@@ -248,7 +249,7 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
       [enc setBytes:&od length:sizeof(uint) atIndex:5];
       [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
       [enc setBytes:&nrt length:sizeof(uint) atIndex:7];
-      [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_H * K, 1, 1)
+      [enc dispatchThreadgroups:MTLSizeMake(num_row_tgs_H_2row * K, 1, 1)
           threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)]; }
 
     // --- 7. Shared expert down projection ---
