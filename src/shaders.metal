@@ -841,47 +841,83 @@ kernel void softmax_topk_route(
     constant uint&      K            [[buffer(4)]],
     constant uint&      sgg_off_f    [[buffer(5)]],
     uint lid [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
-    threadgroup float vals[256];
-    for (uint i = lid; i < n_experts; i += tg_size) vals[i] = logits[i];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Each thread holds its own logit value (256 threads for 256 experts)
+    float my_val = (lid < n_experts) ? logits[lid] : -INFINITY;
+    uint my_idx = lid;
 
-    if (lid == 0) {
-        uint limit = (K < 8) ? K : 8;
-        float top_logits[8];
-        float top_weights[8];
-        uint top_indices[8];
-        for (uint k = 0; k < 8; k++) {
-            top_logits[k] = -INFINITY;
-            top_weights[k] = 0.0f;
-            top_indices[k] = 0;
-        }
+    // Parallel top-K via repeated max-finding with simd reductions
+    // Use threadgroup memory for cross-simdgroup max reduction
+    threadgroup float sg_max_vals[8];
+    threadgroup uint  sg_max_idxs[8];
+    threadgroup float found_logits[8];
+    threadgroup uint  found_indices[8];
 
-        for (uint i = 0; i < n_experts; i++) {
-            float v = vals[i];
-            if (v <= top_logits[limit - 1]) continue;
-            uint insert = limit - 1;
-            while (insert > 0 && v > top_logits[insert - 1]) {
-                top_logits[insert] = top_logits[insert - 1];
-                top_indices[insert] = top_indices[insert - 1];
-                insert--;
+    uint limit = (K < 8) ? K : 8;
+
+    for (uint round = 0; round < limit; round++) {
+        // Step 1: simdgroup-local max
+        float local_max = my_val;
+        uint local_idx = my_idx;
+        for (uint offset = 16; offset > 0; offset >>= 1) {
+            float other_val = simd_shuffle_down(local_max, offset);
+            uint other_idx = simd_shuffle_down(local_idx, offset);
+            if (other_val > local_max) {
+                local_max = other_val;
+                local_idx = other_idx;
             }
-            top_logits[insert] = v;
-            top_indices[insert] = i;
         }
 
-        float max_logit = top_logits[0];
+        // Step 2: cross-simdgroup reduction via threadgroup memory
+        if (simd_lane == 0) {
+            sg_max_vals[simd_group] = local_max;
+            sg_max_idxs[simd_group] = local_idx;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 3: first simdgroup reduces across all simdgroups
+        if (simd_group == 0) {
+            uint num_sgs = (tg_size + 31) / 32;
+            float val = (simd_lane < num_sgs) ? sg_max_vals[simd_lane] : -INFINITY;
+            uint idx = (simd_lane < num_sgs) ? sg_max_idxs[simd_lane] : 0;
+            for (uint offset = 16; offset > 0; offset >>= 1) {
+                float other_val = simd_shuffle_down(val, offset);
+                uint other_idx = simd_shuffle_down(idx, offset);
+                if (other_val > val) {
+                    val = other_val;
+                    idx = other_idx;
+                }
+            }
+            if (simd_lane == 0) {
+                found_logits[round] = val;
+                found_indices[round] = idx;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 4: winner invalidates its value for next round
+        if (lid == found_indices[round]) {
+            my_val = -INFINITY;
+        }
+    }
+
+    // Softmax normalize the top-K logits and write output (lane 0 only)
+    if (lid == 0) {
+        float max_logit = found_logits[0];
         float weight_sum = 0.0f;
+        float top_weights[8];
         for (uint k = 0; k < limit; k++) {
-            float w = exp(top_logits[k] - max_logit);
+            float w = exp(found_logits[k] - max_logit);
             top_weights[k] = w;
             weight_sum += w;
         }
         float inv_weight_sum = (weight_sum > 0.0f) ? (1.0f / weight_sum) : 0.0f;
 
         for (uint k = 0; k < limit; k++) {
-            out_indices[k] = top_indices[k];
+            out_indices[k] = found_indices[k];
             out_params[k] = top_weights[k] * inv_weight_sum;
         }
         for (uint k = limit; k < 8; k++) {
