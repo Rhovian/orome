@@ -33,3 +33,8 @@ n/a	57.44	1950.8	1.1011	discard	shrink softmax_topk_route launch from 256 thread
 b23b089	57.36	1924.4	1.1011	keep	baseline: re-benchmark current HEAD after latest 35B status update
 44eeb52	57.63	1923.3	1.1011	keep	defer shared expert gate/up past routing so softmax waits only on routing logits
 bd669d4	58.45	1947.4	1.1011	keep	hoist K=8 combine shared-gate sigmoid per simdgroup without extra synchronization
+f62f530	58.82	2180.0	1.1011	keep	baseline: re-benchmark current HEAD before new experiments
+n/a	58.58	2155.0	1.1011	discard	de-interleave Q+gate weights at load time to eliminate 2 dispatch+2 barrier per full-attn layer
+n/a	58.34	2148.3	1.1011	discard	vectorize GDN state accesses with float4 loads/stores
+n/a	58.08	2175.5	1.1011	discard	2-row GGUF Q8_0 matvec: halve threadgroups for general Q8_0 dispatches
+n/a	53.52	2191.6	1.1011	discard	lane-per-element Q8_0 parallelization: each lane processes 1 element per block
