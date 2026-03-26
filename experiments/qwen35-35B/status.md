@@ -1,59 +1,50 @@
-# Orome Optimization Status — GGUF Q4_K Era
+# Orome Optimization Status — GGUF Q4_K / Q8_0 Era
 
 ## Current Best
-- **48.22 tok/s** (Q4_K_S GGUF, 100 tokens sustained)
-- TTFT: 2099 ms
+- **48.61 tok/s** (Q4_K_S GGUF, 100 tokens sustained)
+- TTFT: **2108.9 ms**
+- `proj_avg_ms`: **1.1011**
 - Branch: `autoresearch/orome`
-- Model: `/Users/j/Code/lllm/models/Qwen3.5-35B-A3B-Q4_K_S.gguf` (19.3 GB)
+- Best keep commit: `e2f98ff`
+- Model: `/Users/j/Code/lllm/models/Qwen3.5-35B-A3B-Q4_K_S.gguf`
 
-## Historical Context
-- `results.tsv` spans multiple 35B eras. The old `62.53 tok/s` peak came from the previous packed-format path, not the current GGUF-only codebase.
-- Old wins are still useful as hypotheses, especially around 2-row kernels, expert fusion, GPU routing, concurrent dispatch, and barrier discipline.
-- Old residency / `mlock` experiments are much less actionable for the current source tree.
+## Model Format Reality
+- This GGUF is **not** a Q5_K mix in practice.
+- Tensor counts from `--gguf-info`:
+  - `Q8_0`: 311 tensors
+  - `F32`: 301 tensors
+  - `Q4_K`: 120 tensors
+  - `Q6_K`: 1 tensor (LM head)
+- Live MoE tensor formats:
+  - routed expert `gate/up/down`: **Q4_K**
+  - shared expert `gate/up/down`: **Q8_0**
+  - `routing_gate`: **F32**
+  - `shared_expert_gate`: **F32**
+- Consequence: old Q5_K-focused hypotheses should be deprioritized for this model.
 
-## Architecture (post-cleanup)
-- Legacy format removed entirely — GGUF-only, format-agnostic via TensorRef/LayerTensorCache
-- No fallback paths — all expert projections use batched Q4K/Q5K dynamic kernels
-- Single command buffer with concurrent dispatch for all 40 layers
-- GPU-resident hidden state from embedding to argmax (only 4 bytes cross GPU→CPU)
-- `moe_combine_copy_sq` fuses expert combine + residual copy + partial sum_sq
+## What Worked This Session
+1. Re-bench current HEAD at `3626e09`: **47.77 tok/s**, TTFT `2103.2 ms`
+2. `44c47ea` — 2-row GGUF `Q5_K` general matvec: **48.10 tok/s**
+   - Kept per benchmark protocol, but later metadata inspection showed the model has no `Q5_K` tensors, so treat this as noise rather than a real live-path win
+3. `456acce` — fused `F32 routing_gate + shared_expert_gate` into one dispatch: **48.44 tok/s**
+   - This was a real live-path win; the prior `shared_expert_gate` dispatch was wasting almost a full 512-thread group on a single output row
+4. `e2f98ff` — fused `Q8_0 shared gate + up + SwiGLU`: **48.61 tok/s**
+   - This is the current best and confirms that the old `Q4_K`-only shared fusion path was dead for this GGUF
 
-## What's Been Done (this session)
-1. Fixed Q4_K nibble ordering in all 7 kernels (GGML uses 4 groups of 32 bytes, NOT per-sub-block or global split)
-2. Fixed Q5_K qh bit extraction (qh[l] bit g*2 for low nibble, g*2+1 for high nibble)
-3. Intra-superblock SIMD distribution: 128 bytes/superblock → 32 lanes × 4 bytes = 100% utilization (was 6-25%)
-4. Shared memory input reads (x_shared half precision) in all dequant kernels
-5. Q6K LM head optimization (same intra-superblock pattern) — biggest single win
-6. Single CB with proper inter-layer barriers
-7. Removed all fallback paths (no per-expert dispatch, no cpu_argmax)
-8. Fixed MoE profiling instrumentation
-9. 2-row-per-simdgroup GGUF matvec for Q4_K + Q6_K projection path
-10. 2-row-per-simdgroup expert down kernels for GGUF Q4_K + Q5_K
-11. Fused routed expert gate+up+SwiGLU for GGUF Q4_K experts
-12. Fused shared expert gate+up+SwiGLU for GGUF Q4_K weights
-13. Specialized Q4_K packed scale/min unpack to decode only the two pairs each SIMD group actually consumes
+## What Failed
+1. `n/a` — 2-row GGUF `Q8_0` general matvec: **48.60 tok/s**, TTFT `2105.1 ms`
+   - Slightly worse than the `48.61` baseline
+   - Conclusion: broad 2-row `Q8_0` is not an automatic win even though `Q8_0` is a major live format
 
-## Performance Breakdown
-- Per additional layer: ~0.47ms (0.085ms theoretical at 400 GB/s → 5.5x overhead)
-- LM head (Q6K, 398MB): ~2.5ms
-- Benchmark `proj_avg_ms` remains ~1.101, so the latest gain is coming from non-projection GGUF Q4_K work rather than the main projection micro-metric
+## Interpretation
+- The best gains this session came from **removing live dispatches in the MoE side-path**, not from changing the benchmark’s projection micro-metric.
+- `proj_avg_ms` stayed pinned at `1.1011`, so the `48.44 -> 48.61` improvement is coming from non-projection work.
+- The old campaign’s historical signals remain useful, but only after checking the **actual tensor formats in the current GGUF**. Two dead assumptions surfaced immediately:
+  - there are no `Q5_K` tensors in this model
+  - shared expert `gate/up` are `Q8_0`, so the old `Q4_K` shared fusion path was never firing
 
-## Latest Experiment
-- Current kept baseline at `a386dbf`: **48.22 tok/s**, TTFT 2099 ms, proj avg 1.101 ms
-- Discarded: threadgroup-cache `x` in `matvec_f32` for `in_dim <= 2048`
-- Result: **47.81 tok/s**, TTFT 2101 ms, proj avg 1.101 ms
-- Interpretation: the extra threadgroup load + barrier cost is not amortized by the small F32 projection workload; routing/shared-gate F32 matvecs are not the next bottleneck
-
-## Key Bottleneck Analysis
-The Q4_K format has inherent overhead vs the old legacy 4-bit format:
-- 12 bytes of packed scales/mins per 256 weights → scale/min unpack remains a real cost, even after trimming it to the per-group pair actually consumed
-- 144 bytes per 256 weights (0.5625 B/w) vs ~128 bytes (0.5 B/w) in legacy
-- Q6K LM head is 398MB vs ~254MB for simple 4-bit
-
-The legacy system reached 62 tok/s with simpler dequant. The remaining 48→62 gap is still largely format overhead.
-
-## Next Experiments (priority order)
-1. Profile with Metal System Trace to confirm whether MoE-side Q4_K kernels now dominate after the scale-unpack trim
-2. Fuse `routing_gate` + `shared_expert_gate` if their tensor formats line up, since they are tiny same-input projections that still cost separate dispatches
-3. Specialize the Q5_K expert-down high-bit path next, because the Q4_K-scale trim likely increases the relative weight of Q5_K overhead
-4. Reduce barrier count only where producer/consumer relationships are proven safe under concurrent dispatch
+## Next Best Ideas
+1. Attack the live `Q8_0 shared_down` path next; it still runs as a separate matvec every MoE layer and is a stronger target than generic `Q8_0` 2-row.
+2. Profile or inspect other format-specific dead paths the same way; only chase optimizations that match the actual GGUF tensor map.
+3. If another `Q8_0` experiment is tried, prefer **specific fusion or dispatch elimination** over blanket 2-row kernel changes.
+4. Use Metal System Trace if available to confirm whether `shared_down` or broader `Q8_0` attention projections now dominate after the two dispatch fusions.
