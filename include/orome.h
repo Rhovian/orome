@@ -341,8 +341,6 @@ void metal_free(MetalCtx *ctx);
 // ============================================================================
 
 typedef enum {
-    QFMT_OROME_4BIT,    // legacy: packed uint32 W + BF16 scales + BF16 biases
-    QFMT_OROME_2BIT,    // legacy: packed uint32 W (2-bit) + BF16 scales + BF16 biases
     QFMT_GGUF_Q4_0,     // GGUF: 32 weights + fp16 scale per block
     QFMT_GGUF_Q4_K,     // GGUF: 256 weights in 144-byte super-block
     QFMT_GGUF_Q5_K,     // GGUF: 256 weights in 176-byte super-block
@@ -468,7 +466,7 @@ typedef struct {
     int in_dim;
     int group_size;
     bool is_2bit;
-    QuantFormat format;     // QFMT_OROME_4BIT (default/0) for legacy
+    QuantFormat format;
 } GpuMatvecJob;
 
 // Batch multiple matvecs in one command buffer. Returns after GPU completion.
@@ -660,45 +658,29 @@ typedef struct {
 
 typedef struct {
     ModelConfig     *cfg;
-    WeightFile      *wf;
-    MetalCtx        *ctx;       // NULL if CPU-only
-    ExpertFiles     *ef;
+    MetalCtx        *ctx;
 
     // Per-token state
     float *hidden;
     float *residual;
-    float *h_post;
     float *logits;
-
-    // Per-layer state
-    KVCache         **kv_caches;       // [num_full_attn_layers]
-    LinearAttnState **linear_states;   // [num_linear_layers]
 
     // Generation state
     int pos;
-    QuantType quant;
     int active_experts;     // runtime K (may differ from cfg default)
     ThermalKState thermal;
 
-
-
-
-
-    // Precomputed weight offsets (legacy, opaque, owned by engine.m)
-    void *weight_cache;
-
-    // Format-agnostic tensor cache (replaces weight_cache for new code paths)
+    // Format-agnostic tensor cache (built via format.m)
     LayerTensorCache *tensor_cache;
     GlobalTensorCache globals;
 
-    // GGUF format support (NULL for legacy format)
+    // GGUF format support
     FormatProvider *fp;
     GGUFFile *gf;
     ExpertLayerRef *expert_layer_cache;  // [num_layers], pre-resolved from FormatProvider
 } Engine;
 
-Engine *engine_create(ModelConfig *cfg, WeightFile *wf, MetalCtx *ctx,
-                      ExpertFiles *ef, QuantType quant, int active_experts);
+Engine *engine_create(ModelConfig *cfg, MetalCtx *ctx, int active_experts);
 void    engine_free(Engine *eng);
 void    engine_reset(Engine *eng);  // clear caches, reset pos
 

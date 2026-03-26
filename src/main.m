@@ -106,20 +106,19 @@ int main(int argc, char **argv) {
             return 0;
         }
 
-        // ---- Detect GGUF vs legacy format ----
-        bool is_gguf = model_dir && (strstr(model_dir, ".gguf") != NULL);
-
         ModelConfig cfg;
         MetalCtx *ctx = NULL;
-        WeightFile *wf = NULL;
-        ExpertFiles *ef = NULL;
         Vocabulary *vocab = NULL;
         GGUFFile *gf = NULL;
         FormatProvider *fp = NULL;
         Engine *eng = NULL;
 
-        if (is_gguf) {
+        {
             // ==== GGUF loading path ====
+            if (!model_dir || !strstr(model_dir, ".gguf")) {
+                fprintf(stderr, "ERROR: Model must be a .gguf file\n");
+                return 1;
+            }
             gf = gguf_open(model_dir);
             if (!gf) { fprintf(stderr, "ERROR: Cannot open GGUF: %s\n", model_dir); return 1; }
 
@@ -266,26 +265,11 @@ int main(int argc, char **argv) {
 
             // Create format provider (wraps GGUF mmap as Metal buffer)
             fp = format_provider_open_gguf(gf, ctx);
+            if (fp) ctx->buf_weights = fp->model_buf;  // share Metal buffer with ctx
             if (!fp) {
                 fprintf(stderr, "ERROR: Failed to create format provider\n");
                 return 1;
             }
-
-            // For GGUF, we create a minimal WeightFile that points to the GGUF mmap.
-            // The weight_cache will use GGUF offsets directly.
-            wf = calloc(1, sizeof(WeightFile));
-            wf->data = gf->mmap_base;
-            wf->size = gf->file_size;
-
-            // Wrap GGUF mmap as Metal weights buffer
-            metal_set_weights(ctx, wf);
-
-            // Expert files: for GGUF, experts are embedded in the file
-            // Create a minimal ExpertFiles for GPU-resident mode
-            ef = calloc(1, sizeof(ExpertFiles));
-            ef->all_resident = true;
-            ef->gpu_resident_safe = true;
-            ef->pread_mode = false;
 
             // Load tokenizer (try model directory, then fallback paths)
             // GGUF embeds vocab but we use our external tokenizer for now
@@ -305,9 +289,7 @@ int main(int argc, char **argv) {
             vocab = vocab_load(vocab_path);
 
             fprintf(stderr, "[main] GGUF: creating engine...\n");
-            // Create engine with GGUF weight cache
-            QuantType quant = QUANT_4BIT; // GGUF handles its own quantization
-            eng = engine_create(&cfg, wf, ctx, ef, quant,
+            eng = engine_create(&cfg, ctx,
                                 active_k > 0 ? active_k : 0);
             eng->fp = fp;
             eng->gf = gf;
@@ -323,65 +305,6 @@ int main(int argc, char **argv) {
             }
             fprintf(stderr, "[main] Pre-resolved %d expert layer refs\n", cfg.num_layers);
 
-        } else {
-            // ==== Legacy loading path ====
-
-            // ---- Load model config ----
-            if (model_dir && model_config_load(&cfg, model_dir) == 0) {
-                printf("[main] Config loaded from %s\n", model_dir);
-            } else {
-                printf("[main] Using default Qwen3.5-35B config\n");
-                model_config_qwen35_35b(&cfg);
-            }
-
-            if (active_k > 0) cfg.num_experts_per_tok = active_k;
-
-            // ---- Initialize Metal ----
-            ctx = metal_setup(&cfg);
-            if (!ctx) {
-                fprintf(stderr, "WARNING: Metal unavailable, running CPU-only\n");
-            }
-
-            // ---- Load weights ----
-            char weights_path[512], manifest_path[512], vocab_path[512];
-            if (model_dir) {
-                snprintf(weights_path, sizeof(weights_path), "%s/model_weights.bin", model_dir);
-                snprintf(manifest_path, sizeof(manifest_path), "%s/model_weights.json", model_dir);
-                snprintf(vocab_path, sizeof(vocab_path), "%s/vocab.bin", model_dir);
-            } else {
-                strncpy(weights_path, "model_weights.bin", sizeof(weights_path));
-                strncpy(manifest_path, "model_weights.json", sizeof(manifest_path));
-                strncpy(vocab_path, "vocab.bin", sizeof(vocab_path));
-            }
-
-            wf = weights_open(weights_path, manifest_path);
-            if (!wf) {
-                fprintf(stderr, "ERROR: Cannot load weights from %s\n", weights_path);
-                return 1;
-            }
-
-            if (ctx) metal_set_weights(ctx, wf);
-
-            // ---- Detect layer types from actual weights ----
-            model_config_detect_layers(&cfg, wf);
-
-            // ---- Load tokenizer ----
-            if (tokenizer_init(model_dir) != 0) {
-                fprintf(stderr, "WARNING: Tokenizer not loaded, decode will show token IDs\n");
-            }
-
-            vocab = vocab_load(vocab_path);
-
-            // ---- Open expert files ----
-            ef = expert_files_open(&cfg, model_dir ? model_dir : ".", hot_mask_path);
-
-            // ---- Wrap expert layer data as Metal buffers ----
-            if (ctx) metal_set_expert_weights(ctx, ef, &cfg);
-
-            // ---- Create engine ----
-            QuantType quant = use_2bit ? QUANT_2BIT : QUANT_4BIT;
-            eng = engine_create(&cfg, wf, ctx, ef, quant,
-                                active_k > 0 ? active_k : 0);
         }
         if (thermal_k > 0) {
             eng->thermal.enabled = true;
@@ -391,11 +314,8 @@ int main(int argc, char **argv) {
             printf("[main] Thermal-K enabled: K→%d when proj EMA > %.0fms (after %d tokens)\n",
                    thermal_k, thermal_proj_ms, thermal_gen);
         }
-        if (profile_experts) moe_set_profile_experts(true);
-
-        printf("[main] Engine ready: %s, %d layers, K=%d, %s\n",
-               cfg.name, cfg.num_layers, eng->active_experts,
-               use_2bit ? "2-bit" : "4-bit");
+        printf("[main] Engine ready: %s, %d layers, K=%d\n",
+               cfg.name, cfg.num_layers, eng->active_experts);
 
         // ---- Run ----
         if (serve_port > 0) {
@@ -422,10 +342,8 @@ int main(int argc, char **argv) {
             // Generate
             double gen_start = now_ms();
             int generated = 0;
-            if (is_gguf) {
-                fprintf(stderr, "[gguf] first predicted token: %d '%s' (eos=%d)\n",
-                        next_token, tokenizer_decode(next_token), is_eos_token(&cfg, next_token));
-            }
+            fprintf(stderr, "[gguf] first predicted token: %d '%s' (eos=%d)\n",
+                    next_token, tokenizer_decode(next_token), is_eos_token(&cfg, next_token));
             for (int i = 0; i < max_tokens; i++) {
                 if (is_eos_token(&cfg, next_token)) break;
 
@@ -453,9 +371,9 @@ int main(int argc, char **argv) {
 
         // ---- Cleanup ----
         engine_free(eng);
-        expert_files_close(ef, &cfg);
         if (vocab) vocab_free(vocab);
-        weights_close(wf);
+        if (fp) format_provider_close(fp);
+        if (gf) gguf_close(gf);
         metal_free(ctx);
         free(cfg.layer_types);
 

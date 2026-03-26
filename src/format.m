@@ -43,21 +43,6 @@ void format_dispatch_matvec(
     [enc setComputePipelineState:pipe];
 
     switch (ref->format) {
-        case QFMT_OROME_4BIT:
-        case QFMT_OROME_2BIT: {
-            // Legacy format: 3 separate buffer regions (weights, scales, biases)
-            [enc setBuffer:ref->buffer offset:ref->offset            atIndex:0]; // W
-            [enc setBuffer:ref->buffer offset:ref->scale_offset      atIndex:1]; // S
-            [enc setBuffer:ref->buffer offset:ref->bias_offset       atIndex:2]; // B
-            [enc setBuffer:in_buf      offset:in_off                 atIndex:3]; // input
-            [enc setBuffer:out_buf     offset:out_off                atIndex:4]; // output
-            uint od = ref->out_dim, id_ = ref->in_dim, gs = ref->group_size;
-            [enc setBytes:&od  length:sizeof(uint) atIndex:5];
-            [enc setBytes:&id_ length:sizeof(uint) atIndex:6];
-            [enc setBytes:&gs  length:sizeof(uint) atIndex:7];
-            break;
-        }
-
         case QFMT_GGUF_Q4_K:
         case QFMT_GGUF_Q5_K:
         case QFMT_GGUF_Q8_0:
@@ -99,8 +84,6 @@ void format_dispatch_matvec(
 
 id<MTLComputePipelineState> format_pipeline_for(MetalCtx *ctx, QuantFormat fmt) {
     switch (fmt) {
-        case QFMT_OROME_4BIT: return ctx->matvec_4bit;
-        case QFMT_OROME_2BIT: return ctx->matvec_2bit;
         case QFMT_GGUF_Q4_K:  return ctx->matvec_q4k;
         case QFMT_GGUF_Q5_K:  return ctx->matvec_q5k;
         case QFMT_GGUF_Q8_0:  return ctx->matvec_q8_0;
@@ -273,23 +256,6 @@ ExpertLayerRef format_resolve_expert_layer(FormatProvider *fp, int layer_idx,
 // Tensor cache builders — produce format-agnostic LayerTensorCache
 // ============================================================================
 
-// Helper: create a legacy TensorRef (our packed format, 3 separate regions)
-static TensorRef legacy_ref(id<MTLBuffer> buf, size_t w, size_t s, size_t b,
-                             MetalCtx *ctx, uint32_t out_dim, uint32_t in_dim,
-                             uint32_t group_size, bool is_2bit) {
-    return (TensorRef){
-        .buffer = buf, .offset = w, .scale_offset = s, .bias_offset = b,
-        .pipeline = is_2bit ? ctx->matvec_2bit : ctx->matvec_4bit,
-        .format = is_2bit ? QFMT_OROME_2BIT : QFMT_OROME_4BIT,
-        .out_dim = out_dim, .in_dim = in_dim, .group_size = group_size,
-    };
-}
-
-// Helper: create a TensorRef for a raw F32 tensor (norms, biases — not matvec'd)
-static TensorRef raw_ref(id<MTLBuffer> buf, size_t offset) {
-    return (TensorRef){ .buffer = buf, .offset = offset, .format = QFMT_F32 };
-}
-
 // Helper: create a GGUF TensorRef from a tensor name
 static TensorRef gguf_ref(GGUFFile *gf, id<MTLBuffer> buf, MetalCtx *ctx,
                            const char *name, uint32_t out_dim, uint32_t in_dim) {
@@ -329,77 +295,6 @@ static TensorRef gguf_raw(GGUFFile *gf, id<MTLBuffer> buf, id<MTLDevice> device,
     }
 
     return (TensorRef){ .buffer = buf, .offset = gf->data_offset + ti->offset, .format = QFMT_F32 };
-}
-
-// ---- Legacy format builder ----
-
-LayerTensorCache *build_tensor_cache_legacy(WeightFile *wf, MetalCtx *ctx,
-                                             const ModelConfig *cfg,
-                                             GlobalTensorCache *globals) {
-    LayerTensorCache *cache = calloc(cfg->num_layers, sizeof(LayerTensorCache));
-    id<MTLBuffer> buf = ctx->buf_weights;
-    uint8_t *base = (uint8_t *)wf->data;
-    uint32_t gs = cfg->group_size;
-    int H = cfg->hidden_dim;
-    int M = cfg->moe_intermediate;
-
-    #define L_OFF(layer, suffix) ((size_t)((uint8_t *)weights_layer_ptr(wf, layer, suffix) - base))
-    #define L_REF(layer, suffix, od, id) legacy_ref(buf, L_OFF(layer, suffix ".weight"), \
-        L_OFF(layer, suffix ".scales"), L_OFF(layer, suffix ".biases"), ctx, od, id, gs, false)
-    #define L_RAW(layer, suffix) raw_ref(buf, L_OFF(layer, suffix))
-
-    // Global tensors
-    if (globals) {
-        globals->embedding = raw_ref(buf, L_OFF(0, "../../model.embed_tokens.weight"));
-        globals->lm_head = legacy_ref(buf,
-            (size_t)((uint8_t *)weights_tensor_ptr(wf, "lm_head.weight") - base),
-            (size_t)((uint8_t *)weights_tensor_ptr(wf, "lm_head.scales") - base),
-            (size_t)((uint8_t *)weights_tensor_ptr(wf, "lm_head.biases") - base),
-            ctx, cfg->vocab_size, H, gs, false);
-        globals->final_norm = raw_ref(buf,
-            (size_t)((uint8_t *)weights_tensor_ptr(wf, "model.norm.weight") - base));
-    }
-
-    for (int i = 0; i < cfg->num_layers; i++) {
-        LayerTensorCache *c = &cache[i];
-        c->input_norm = L_RAW(i, "input_layernorm.weight");
-        c->post_norm = L_RAW(i, "post_attention_layernorm.weight");
-        c->routing_gate = L_REF(i, "mlp.gate", cfg->num_experts, H);
-        c->shared_gate = L_REF(i, "mlp.shared_expert.gate_proj", M, H);
-        c->shared_up = L_REF(i, "mlp.shared_expert.up_proj", M, H);
-        c->shared_down = L_REF(i, "mlp.shared_expert.down_proj", H, M);
-        c->shared_expert_gate = L_RAW(i, "mlp.shared_expert_gate.weight");
-
-        if (cfg->layer_types[i] == ATTN_LINEAR) {
-            int conv_dim = cfg->linear_conv_dim;
-            int total_value = cfg->linear_num_v_heads * cfg->linear_value_dim;
-            int n_v = cfg->linear_num_v_heads;
-
-            c->lin.qkv = L_REF(i, "linear_attn.in_proj_qkv", conv_dim, H);
-            c->lin.z = L_REF(i, "linear_attn.in_proj_z", total_value, H);
-            c->lin.a = L_REF(i, "linear_attn.in_proj_a", n_v, H);
-            c->lin.b = L_REF(i, "linear_attn.in_proj_b", n_v, H);
-            c->lin.o = L_REF(i, "linear_attn.out_proj", H, total_value);
-            c->lin.conv = L_RAW(i, "linear_attn.conv1d.weight");
-            c->lin.A_log = L_RAW(i, "linear_attn.A_log");
-            c->lin.dt_bias = L_RAW(i, "linear_attn.dt_bias");
-            c->lin.o_norm = L_RAW(i, "linear_attn.norm.weight");
-        } else {
-            int n_heads = cfg->num_attn_heads;
-            int n_kv = cfg->num_kv_heads;
-            int hd = cfg->head_dim;
-            c->full.q = L_REF(i, "self_attn.q_proj", n_heads * hd, H);
-            c->full.k = L_REF(i, "self_attn.k_proj", n_kv * hd, H);
-            c->full.v = L_REF(i, "self_attn.v_proj", n_kv * hd, H);
-            c->full.o = L_REF(i, "self_attn.o_proj", H, n_heads * hd);
-            c->full.q_norm = L_RAW(i, "self_attn.q_norm.weight");
-            c->full.k_norm = L_RAW(i, "self_attn.k_norm.weight");
-        }
-    }
-    #undef L_OFF
-    #undef L_REF
-    #undef L_RAW
-    return cache;
 }
 
 // ---- GGUF format builder ----

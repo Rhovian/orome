@@ -560,3 +560,37 @@ void gguf_print_summary(GGUFFile *gf) {
                 gguf_tensor_size(ti) / (1024.0 * 1024.0), ti->offset);
     }
 }
+
+// ============================================================================
+// Model config utilities (moved from weights.m)
+// ============================================================================
+
+void model_config_init_derived(ModelConfig *cfg) {
+    cfg->rotary_dim = (int)(cfg->head_dim * cfg->partial_rotary);
+    cfg->linear_total_key = cfg->linear_num_k_heads * cfg->linear_key_dim;
+    cfg->linear_total_value = cfg->linear_num_v_heads * cfg->linear_value_dim;
+    cfg->linear_conv_dim = cfg->linear_total_key * 2 + cfg->linear_total_value;
+    cfg->kv_dim = cfg->num_kv_heads * cfg->head_dim;
+
+    // Layer type array from full_attn_interval and full_attn_offset
+    if (cfg->full_attn_interval > 0) {
+        if (cfg->layer_types) free(cfg->layer_types);
+        cfg->layer_types = calloc(cfg->num_layers, sizeof(AttnLayerType));
+        int full_count = 0, lin_count = 0;
+        for (int i = 0; i < cfg->num_layers; i++) {
+            cfg->layer_types[i] = (i % cfg->full_attn_interval == cfg->full_attn_offset)
+                ? ATTN_FULL : ATTN_LINEAR;
+            if (cfg->layer_types[i] == ATTN_FULL) full_count++;
+            else lin_count++;
+        }
+        cfg->num_full_attn_layers = full_count;
+        cfg->num_linear_layers = lin_count;
+    }
+}
+
+bool is_eos_token(const ModelConfig *cfg, int token_id) {
+    for (int i = 0; i < 4 && cfg->eos_tokens[i] >= 0; i++) {
+        if (cfg->eos_tokens[i] == token_id) return true;
+    }
+    return false;
+}

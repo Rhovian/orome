@@ -5,8 +5,8 @@ LDFLAGS = -lpthread -lcompression
 
 # Multi-file build
 OROME_TARGET = orome
-OROME_SRCS = src/main.m src/engine.m src/metal.m src/attention.m src/moe.m \
-             src/weights.m src/kernels.m src/tokenizer.m src/server.m src/gguf.m src/format.m
+OROME_SRCS = src/main.m src/engine.m src/metal.m \
+             src/kernels.m src/tokenizer.m src/server.m src/gguf.m src/format.m
 OROME_OBJS = $(OROME_SRCS:.m=.o)
 
 # Metal shaders
