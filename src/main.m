@@ -321,11 +321,25 @@ int main(int argc, char **argv) {
         if (serve_port > 0) {
             serve_loop(eng, vocab, serve_port);
         } else {
-            // Tokenize prompt
-            PromptTokens *pt = tokenizer_encode(prompt_text);
-            if (!pt) {
-                fprintf(stderr, "ERROR: Failed to tokenize prompt\n");
-                return 1;
+            // Tokenize prompt (or use raw token IDs if prompt starts with "[")
+            PromptTokens *pt = NULL;
+            if (prompt_text[0] == '[') {
+                // Parse raw token IDs: "[248045,846,198]"
+                pt = calloc(1, sizeof(PromptTokens));
+                pt->ids = calloc(256, sizeof(int));
+                const char *p = prompt_text + 1;
+                while (*p && *p != ']' && pt->count < 256) {
+                    pt->ids[pt->count++] = atoi(p);
+                    while (*p && *p != ',' && *p != ']') p++;
+                    if (*p == ',') p++;
+                }
+                fprintf(stderr, "[main] Raw token IDs: %d tokens\n", pt->count);
+            } else {
+                pt = tokenizer_encode(prompt_text);
+                if (!pt) {
+                    fprintf(stderr, "ERROR: Failed to tokenize prompt\n");
+                    return 1;
+                }
             }
 
             printf("[main] Prompt: \"%s\" (%d tokens)\n", prompt_text, pt->count);
