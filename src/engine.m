@@ -158,7 +158,8 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
                                  MetalCtx *ctx, const ModelConfig *cfg,
                                  const ExpertLayerRef *elr,
                                  const LayerTensorCache *lt,
-                                 int K) {
+                                 int K,
+                                 bool shared_gate_up_fused) {
     int H = cfg->hidden_dim;
     int M = cfg->moe_intermediate;
     int S = cfg->shared_intermediate;
@@ -249,13 +250,15 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
     }
 
     // --- 5. Shared expert SwiGLU ---
-    [enc setComputePipelineState:ctx->swiglu];
-    [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
-    [enc setBuffer:ctx->buf_shared_up offset:0 atIndex:1];
-    [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:2];
-    { uint dim_val = (uint)S; [enc setBytes:&dim_val length:sizeof(uint) atIndex:3]; }
-    [enc dispatchThreadgroups:MTLSizeMake(((uint)S + 255) / 256, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (!shared_gate_up_fused) {
+        [enc setComputePipelineState:ctx->swiglu];
+        [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
+        [enc setBuffer:ctx->buf_shared_up offset:0 atIndex:1];
+        [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:2];
+        { uint dim_val = (uint)S; [enc setBytes:&dim_val length:sizeof(uint) atIndex:3]; }
+        [enc dispatchThreadgroups:MTLSizeMake(((uint)S + 255) / 256, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
 
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
@@ -551,24 +554,43 @@ int engine_step(Engine *eng, int token_id) {
             // --- Phase K: MoE routing + shared expert projections ---
             { size_t sgg_off = n_experts * sizeof(float);
                 const LayerTensorCache *lt = &tcache[layer];
+                bool fuse_shared_gate_up =
+                    ctx->shared_gate_up_swiglu_q4k
+                    && lt->shared_gate.format == QFMT_GGUF_Q4_K
+                    && lt->shared_up.format == QFMT_GGUF_Q4_K;
                 format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->routing_gate,
                     ctx->buf_input, 0, ctx->buf_output, 0);
-                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_gate,
-                    ctx->buf_input, 0, ctx->buf_shared_gate, 0);
-                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_up,
-                    ctx->buf_input, 0, ctx->buf_shared_up, 0);
+                if (fuse_shared_gate_up) {
+                    NSUInteger shared_tg_size = ENGINE_ROWS_PER_TG * 32;
+                    [enc setComputePipelineState:ctx->shared_gate_up_swiglu_q4k];
+                    [enc setBuffer:lt->shared_gate.buffer offset:lt->shared_gate.offset atIndex:0];
+                    [enc setBuffer:lt->shared_up.buffer offset:lt->shared_up.offset atIndex:1];
+                    [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
+                    [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:3];
+                    { uint od = (uint)lt->shared_gate.out_dim, id_ = (uint)lt->shared_gate.in_dim;
+                      [enc setBytes:&od length:sizeof(uint) atIndex:4];
+                      [enc setBytes:&id_ length:sizeof(uint) atIndex:5]; }
+                    uint rows_per_tg = ENGINE_ROWS_PER_TG;
+                    NSUInteger num_tgs = (lt->shared_gate.out_dim + rows_per_tg - 1) / rows_per_tg;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(shared_tg_size, 1, 1)];
+                } else {
+                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_gate,
+                        ctx->buf_input, 0, ctx->buf_shared_gate, 0);
+                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_up,
+                        ctx->buf_input, 0, ctx->buf_shared_up, 0);
+                }
                 format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_expert_gate,
                     ctx->buf_input, 0, ctx->buf_output, sgg_off);
+                // GPU-resident expert forward
+                double moe_t0 = now_ms();
+                encode_experts_gguf(enc, ctx, cfg,
+                                    &eng->expert_layer_cache[layer],
+                                    &tcache[layer], effective_k, fuse_shared_gate_up);
+                t1 = now_ms();
+                t_moe_total += t1 - moe_t0;
+                t_attn_total += t1 - t0;
             }
-
-            // GPU-resident expert forward
-            double moe_t0 = now_ms();
-            encode_experts_gguf(enc, ctx, cfg,
-                                &eng->expert_layer_cache[layer],
-                                &tcache[layer], effective_k);
-            t1 = now_ms();
-            t_moe_total += t1 - moe_t0;
-            t_attn_total += t1 - t0;
 
             linear_idx++;
             continue;
@@ -822,24 +844,43 @@ int engine_step(Engine *eng, int token_id) {
             // --- Phase L: MoE routing + shared expert projections ---
             { size_t sgg_off = n_experts * sizeof(float);
                 const LayerTensorCache *lt = &tcache[layer];
+                bool fuse_shared_gate_up =
+                    ctx->shared_gate_up_swiglu_q4k
+                    && lt->shared_gate.format == QFMT_GGUF_Q4_K
+                    && lt->shared_up.format == QFMT_GGUF_Q4_K;
                 format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->routing_gate,
                     ctx->buf_input, 0, ctx->buf_output, 0);
-                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_gate,
-                    ctx->buf_input, 0, ctx->buf_shared_gate, 0);
-                format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_up,
-                    ctx->buf_input, 0, ctx->buf_shared_up, 0);
+                if (fuse_shared_gate_up) {
+                    NSUInteger shared_tg_size = ENGINE_ROWS_PER_TG * 32;
+                    [enc setComputePipelineState:ctx->shared_gate_up_swiglu_q4k];
+                    [enc setBuffer:lt->shared_gate.buffer offset:lt->shared_gate.offset atIndex:0];
+                    [enc setBuffer:lt->shared_up.buffer offset:lt->shared_up.offset atIndex:1];
+                    [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
+                    [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:3];
+                    { uint od = (uint)lt->shared_gate.out_dim, id_ = (uint)lt->shared_gate.in_dim;
+                      [enc setBytes:&od length:sizeof(uint) atIndex:4];
+                      [enc setBytes:&id_ length:sizeof(uint) atIndex:5]; }
+                    uint rows_per_tg = ENGINE_ROWS_PER_TG;
+                    NSUInteger num_tgs = (lt->shared_gate.out_dim + rows_per_tg - 1) / rows_per_tg;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(shared_tg_size, 1, 1)];
+                } else {
+                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_gate,
+                        ctx->buf_input, 0, ctx->buf_shared_gate, 0);
+                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_up,
+                        ctx->buf_input, 0, ctx->buf_shared_up, 0);
+                }
                 format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_expert_gate,
                     ctx->buf_input, 0, ctx->buf_output, sgg_off);
+                // GPU-resident expert forward
+                double moe_t0 = now_ms();
+                encode_experts_gguf(enc, ctx, cfg,
+                                    &eng->expert_layer_cache[layer],
+                                    &tcache[layer], effective_k, fuse_shared_gate_up);
+                t1 = now_ms();
+                t_moe_total += t1 - moe_t0;
+                t_attn_total += t1 - t0;
             }
-
-            // GPU-resident expert forward
-            double moe_t0 = now_ms();
-            encode_experts_gguf(enc, ctx, cfg,
-                                &eng->expert_layer_cache[layer],
-                                &tcache[layer], effective_k);
-            t1 = now_ms();
-            t_moe_total += t1 - moe_t0;
-            t_attn_total += t1 - t0;
 
             full_idx++;
             continue;
