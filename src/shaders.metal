@@ -838,61 +838,50 @@ kernel void softmax_topk_route(
     uint tg_size [[threads_per_threadgroup]]
 ) {
     threadgroup float vals[256];
-    if (lid < n_experts) vals[lid] = logits[lid];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    threadgroup float reduce[32];
-    float local_max = (lid < n_experts) ? vals[lid] : -1e30f;
-    float sm = simd_max(local_max);
-    uint simd_lane = lid % 32;
-    uint simd_group = lid / 32;
-    if (simd_lane == 0) reduce[simd_group] = sm;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float global_max = -1e30f;
-    if (simd_group == 0 && simd_lane < (tg_size + 31) / 32) {
-        global_max = simd_max(reduce[simd_lane]);
-    }
-    threadgroup float bcast;
-    if (lid == 0) bcast = global_max;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    global_max = bcast;
-
-    float exp_val = (lid < n_experts) ? exp(vals[lid] - global_max) : 0.0f;
-    if (lid < n_experts) vals[lid] = exp_val;
-    float ss = simd_sum(exp_val);
-    if (simd_lane == 0) reduce[simd_group] = ss;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float global_sum = 0.0f;
-    if (simd_group == 0 && simd_lane < (tg_size + 31) / 32) {
-        global_sum = simd_sum(reduce[simd_lane]);
-    }
-    if (lid == 0) bcast = global_sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    global_sum = bcast;
-
-    if (lid < n_experts) vals[lid] = exp_val / global_sum;
+    for (uint i = lid; i < n_experts; i += tg_size) vals[i] = logits[i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (lid == 0) {
-        for (uint k = 0; k < K && k < 8; k++) {
-            float best_val = -1.0f;
-            uint best_idx = 0;
-            for (uint i = 0; i < n_experts; i++) {
-                if (vals[i] > best_val) {
-                    best_val = vals[i];
-                    best_idx = i;
-                }
-            }
-            out_indices[k] = best_idx;
-            out_params[k] = best_val;
-            vals[best_idx] = -1.0f;
+        uint limit = (K < 8) ? K : 8;
+        float top_logits[8];
+        float top_weights[8];
+        uint top_indices[8];
+        for (uint k = 0; k < 8; k++) {
+            top_logits[k] = -INFINITY;
+            top_weights[k] = 0.0f;
+            top_indices[k] = 0;
         }
-        float wsum = 0.0f;
-        for (uint k = 0; k < K && k < 8; k++) wsum += out_params[k];
-        float inv_wsum = 1.0f / wsum;
-        for (uint k = 0; k < K && k < 8; k++) out_params[k] *= inv_wsum;
+
+        for (uint i = 0; i < n_experts; i++) {
+            float v = vals[i];
+            if (v <= top_logits[limit - 1]) continue;
+            uint insert = limit - 1;
+            while (insert > 0 && v > top_logits[insert - 1]) {
+                top_logits[insert] = top_logits[insert - 1];
+                top_indices[insert] = top_indices[insert - 1];
+                insert--;
+            }
+            top_logits[insert] = v;
+            top_indices[insert] = i;
+        }
+
+        float max_logit = top_logits[0];
+        float weight_sum = 0.0f;
+        for (uint k = 0; k < limit; k++) {
+            float w = exp(top_logits[k] - max_logit);
+            top_weights[k] = w;
+            weight_sum += w;
+        }
+        float inv_weight_sum = (weight_sum > 0.0f) ? (1.0f / weight_sum) : 0.0f;
+
+        for (uint k = 0; k < limit; k++) {
+            out_indices[k] = top_indices[k];
+            out_params[k] = top_weights[k] * inv_weight_sum;
+        }
+        for (uint k = limit; k < 8; k++) {
+            out_indices[k] = 0;
+            out_params[k] = 0.0f;
+        }
         out_params[8] = logits[sgg_off_f];
     }
 }
