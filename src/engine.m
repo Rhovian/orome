@@ -455,8 +455,11 @@ int engine_step(Engine *eng, int token_id) {
             }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // --- Phase C: Conv1d step ---
-            // buf_conv_input → buf_conv_output, updates buf_conv_state[linear_idx]
+            // --- Phase C: Conv1d step + decay/beta (concurrent) ---
+            // Conv1d depends on buf_conv_input (from QKV proj).
+            // Decay/beta depends on buf_linear_decay/beta (from A/B projs).
+            // Both are ready after the projection barrier. Schedule together
+            // so decay_beta overlaps with conv1d in the concurrent encoder.
             [enc setComputePipelineState:ctx->conv1d_f32];
             [enc setBuffer:ctx->buf_conv_state[linear_idx] offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_conv_input offset:0 atIndex:1];
@@ -466,10 +469,23 @@ int engine_step(Engine *eng, int token_id) {
             { uint cd = (uint)conv_dim; [enc setBytes:&cd length:sizeof(uint) atIndex:4]; }
             [enc dispatchThreadgroups:MTLSizeMake(((uint)conv_dim + 255) / 256, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+            // Decay/beta: reads A/B projection outputs, writes decay/beta gates
+            [enc setComputePipelineState:ctx->decay_beta_f32];
+            [enc setBuffer:ctx->buf_linear_decay offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_linear_beta offset:0 atIndex:1];
+            [enc setBuffer:tcache[layer].lin.A_log.buffer
+                   offset:tcache[layer].lin.A_log.offset atIndex:2];
+            [enc setBuffer:tcache[layer].lin.dt_bias.buffer
+                   offset:tcache[layer].lin.dt_bias.offset atIndex:3];
+            [enc setBuffer:ctx->buf_linear_decay offset:0 atIndex:4];
+            [enc setBuffer:ctx->buf_linear_beta offset:0 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(((uint)n_v_heads + 63) / 64, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // --- Phase D: QK RMS norm (in-place on buf_conv_output) ---
-            // Q at offset 0, K at offset total_key * sizeof(float)
+            // --- Phase D: QK RMS norm (needs conv1d output) ---
             [enc setComputePipelineState:ctx->rms_norm_qk];
             [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_conv_output offset:total_key * sizeof(float) atIndex:1];
@@ -479,21 +495,6 @@ int engine_step(Engine *eng, int token_id) {
               [enc setBytes:&inv_s length:sizeof(float) atIndex:3]; }
             [enc dispatchThreadgroups:MTLSizeMake(n_k_heads, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(key_dim, 1, 1)];
-
-            // --- Phase E: Compute decay + beta gate ---
-            // alpha from buf_linear_decay (reused), beta from buf_linear_beta
-            // A_log and dt_bias from weights
-            [enc setComputePipelineState:ctx->decay_beta_f32];
-            [enc setBuffer:ctx->buf_linear_decay offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_linear_beta offset:0 atIndex:1];
-            [enc setBuffer:tcache[layer].lin.A_log.buffer
-                   offset:tcache[layer].lin.A_log.offset atIndex:2];
-            [enc setBuffer:tcache[layer].lin.dt_bias.buffer
-                   offset:tcache[layer].lin.dt_bias.offset atIndex:3];
-            [enc setBuffer:ctx->buf_linear_decay offset:0 atIndex:4];  // output overwrites
-            [enc setBuffer:ctx->buf_linear_beta offset:0 atIndex:5];   // output overwrites
-            [enc dispatchThreadgroups:MTLSizeMake(((uint)n_v_heads + 63) / 64, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase F: GatedDeltaNet recurrence ---
