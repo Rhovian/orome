@@ -39,10 +39,10 @@
 - Benchmark `proj_avg_ms` remains ~1.101, so the latest gain is coming from non-projection GGUF Q4_K work rather than the main projection micro-metric
 
 ## Latest Experiment
-- Baseline at `932ce2a`: **47.28 tok/s**, TTFT 2146 ms, proj avg 1.101 ms
-- Kept: per-group Q4_K scale/min decode in hot GGUF Q4_K/Q5_K kernels
-- Result: **48.22 tok/s**, TTFT 2099 ms, proj avg 1.101 ms
-- Interpretation: decoding only the two scale/min pairs each SIMD group uses trims enough Q4_K overhead to matter, and the unchanged `proj_avg_ms` suggests the win is landing mostly in the MoE-side Q4_K path rather than the benchmarked projection path
+- Current kept baseline at `a386dbf`: **48.22 tok/s**, TTFT 2099 ms, proj avg 1.101 ms
+- Discarded: threadgroup-cache `x` in `matvec_f32` for `in_dim <= 2048`
+- Result: **47.81 tok/s**, TTFT 2101 ms, proj avg 1.101 ms
+- Interpretation: the extra threadgroup load + barrier cost is not amortized by the small F32 projection workload; routing/shared-gate F32 matvecs are not the next bottleneck
 
 ## Key Bottleneck Analysis
 The Q4_K format has inherent overhead vs the old legacy 4-bit format:

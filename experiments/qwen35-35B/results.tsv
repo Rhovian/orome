@@ -8,6 +8,7 @@ n/a	46.85	2194.1	1.1011	discard	2-row-per-simdgroup fused routed+shared expert g
 aab62c5	47.49	2074.9	1.1011	keep	re-benchmark restored HEAD after discarding 2-row fused gate/up experiment
 932ce2a	47.28	2145.5	1.1011	keep	baseline: re-benchmark current GGUF HEAD before per-group Q4_K scale decode experiment
 n/a	48.22	2099.4	1.1011	keep	specialize Q4_K scale unpack to per-group pairs in hot GGUF Q4_K/Q5_K kernels
+n/a	47.81	2100.8	1.1011	discard	threadgroup-cache x in matvec_f32 for <=2048-dim F32 projections
 4cb4516	1.04	3016.0	0.0	keep	baseline: naive single-dispatch GPU, CPU experts
 499b87b	1.05	76440.0	0.0	keep	batch linear attn projections (qkv/z/a/b) into single GPU commit
 e259b59	1.06	75388.0	0.0	keep	batch MoE routing+shared expert gate/up/shared_gate into single GPU commit
