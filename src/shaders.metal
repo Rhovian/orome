@@ -978,6 +978,32 @@ kernel void matvec_f32(
     }
 }
 
+kernel void matvec_f32_pair(
+    device const float*    W0         [[buffer(0)]],
+    device const float*    W1         [[buffer(1)]],
+    device const float*    x          [[buffer(2)]],
+    device float*          out        [[buffer(3)]],
+    constant uint&         out0_dim   [[buffer(4)]],
+    constant uint&         in_dim     [[buffer(5)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint total_out_dim = out0_dim + 1;
+    if (row >= total_out_dim) return;
+
+    device const float* w_row = (row < out0_dim) ? (W0 + row * in_dim) : W1;
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < in_dim; col += 32) {
+        acc += w_row[col] * x[col];
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
 // ============================================================================
 // GGUF Q4_K dequant matvec
 //

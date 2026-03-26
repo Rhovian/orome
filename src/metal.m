@@ -127,6 +127,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->conv1d_f32 = make_pipeline(ctx, @"conv1d_step_f32");
     ctx->decay_beta_f32 = make_pipeline(ctx, @"compute_decay_beta_f32");
     ctx->matvec_f32 = make_pipeline(ctx, @"matvec_f32");
+    ctx->matvec_f32_pair = make_pipeline(ctx, @"matvec_f32_pair");
     ctx->matvec_q5k = make_pipeline(ctx, @"dequant_matvec_q5k");
     ctx->matvec_q6k = make_pipeline(ctx, @"dequant_matvec_q6k");
 

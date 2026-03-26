@@ -130,6 +130,7 @@ typedef struct {
     id<MTLComputePipelineState> conv1d_f32;
     id<MTLComputePipelineState> decay_beta_f32;
     id<MTLComputePipelineState> matvec_f32;
+    id<MTLComputePipelineState> matvec_f32_pair;
     id<MTLComputePipelineState> matvec_q4k;
     id<MTLComputePipelineState> matvec_q5k;
     id<MTLComputePipelineState> matvec_q8_0;
