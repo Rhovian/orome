@@ -371,8 +371,7 @@ LayerTensorCache *build_tensor_cache_legacy(WeightFile *wf, MetalCtx *ctx,
         c->shared_expert_gate = L_RAW(i, "mlp.shared_expert_gate.weight");
 
         if (cfg->layer_types[i] == ATTN_LINEAR) {
-            int conv_dim = cfg->linear_num_v_heads * (cfg->linear_key_dim + cfg->linear_value_dim)
-                         + cfg->linear_num_k_heads * cfg->linear_key_dim;
+            int conv_dim = cfg->linear_conv_dim;
             int total_value = cfg->linear_num_v_heads * cfg->linear_value_dim;
             int n_v = cfg->linear_num_v_heads;
 
@@ -430,26 +429,30 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
 
         snprintf(name, sizeof(name), "blk.%d.attn_norm.weight", i);
         c->input_norm = G_RAW(name);
-        snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", i);
+        snprintf(name, sizeof(name), "blk.%d.ffn_norm.weight", i);
         c->post_norm = G_RAW(name);
+        if (!c->post_norm.buffer) { // fallback name
+            snprintf(name, sizeof(name), "blk.%d.post_attention_norm.weight", i);
+            c->post_norm = G_RAW(name);
+        }
 
         // MoE routing gate (F32)
         snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp.weight", i);
         c->routing_gate = G_REF(name, cfg->num_experts, H);
 
-        // Shared expert
+        // Shared expert (may have different intermediate dim than routed experts)
+        int S = cfg->shared_intermediate > 0 ? cfg->shared_intermediate : M;
         snprintf(name, sizeof(name), "blk.%d.ffn_gate_shexp.weight", i);
-        c->shared_gate = G_REF(name, M, H);
+        c->shared_gate = G_REF(name, S, H);
         snprintf(name, sizeof(name), "blk.%d.ffn_up_shexp.weight", i);
-        c->shared_up = G_REF(name, M, H);
+        c->shared_up = G_REF(name, S, H);
         snprintf(name, sizeof(name), "blk.%d.ffn_down_shexp.weight", i);
-        c->shared_down = G_REF(name, H, M);
+        c->shared_down = G_REF(name, H, S);
         snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp_shexp.weight", i);
-        c->shared_expert_gate = G_RAW_F32(name); // scalar gate, dispatched as F32 matvec
+        c->shared_expert_gate = G_REF(name, 1, H); // scalar gate [1, H] matvec
 
         if (cfg->layer_types[i] == ATTN_LINEAR) {
-            int conv_dim = cfg->linear_num_v_heads * (cfg->linear_key_dim + cfg->linear_value_dim)
-                         + cfg->linear_num_k_heads * cfg->linear_key_dim;
+            int conv_dim = cfg->linear_conv_dim;
             int total_value = cfg->linear_num_v_heads * cfg->linear_value_dim;
             int n_v = cfg->linear_num_v_heads;
 
@@ -482,7 +485,10 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
             int hd = cfg->head_dim;
 
             snprintf(name, sizeof(name), "blk.%d.attn_q.weight", i);
-            c->full.q = G_REF(name, n_heads * hd, H);
+            { GGUFTensorInfo *qi = gguf_find_tensor(gf, name);
+              // Gated attention: Q tensor has n_heads*head_dim*2 rows (Q + gate interleaved)
+              int q_out = (qi && qi->n_dims >= 2) ? (int)qi->dims[1] : n_heads * hd;
+              c->full.q = G_REF(name, q_out, H); }
             snprintf(name, sizeof(name), "blk.%d.attn_k.weight", i);
             c->full.k = G_REF(name, n_kv * hd, H);
             snprintf(name, sizeof(name), "blk.%d.attn_v.weight", i);

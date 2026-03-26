@@ -2209,24 +2209,33 @@ kernel void dequant_matvec_q6k(
     for (uint sb_idx = simd_lane; sb_idx < num_superblocks; sb_idx += 32) {
         device const uint8_t* sb = row_data + sb_idx * 210;
 
-        // Low nibbles: 128 bytes at offset 0
-        device const uint8_t* ql = sb;
-        // High 2-bits: 64 bytes at offset 128
-        device const uint8_t* qh = sb + 128;
-        // Scales: 16 int8 at offset 192
-        device const int8_t* scales = (device const int8_t*)(sb + 192);
-        // Super-block scale: fp16 at offset 208
+        // Q6_K layout: ql(128) + qh(64) + scales(16) + d(2) = 210 bytes
+        device const uint8_t* ql_base = sb;
+        device const uint8_t* qh_base = sb + 128;
+        device const int8_t* sc_base = (device const int8_t*)(sb + 192);
         float d = float(as_type<half>(ushort(ushort(sb[208]) | (ushort(sb[209]) << 8))));
 
         uint x_base = sb_idx * 256;
 
-        for (uint j = 0; j < 256; j++) {
-            // Reconstruct 6-bit value from low 4 bits + high 2 bits
-            uint8_t q_lo = (ql[j / 2] >> (4 * (j % 2))) & 0xF;
-            uint8_t q_hi = (qh[j / 4] >> (2 * (j % 4))) & 0x3;
-            int q6 = (int)(q_lo | (q_hi << 4)) - 32;
-            float sc = (float)scales[j / 16];
-            acc += d * sc * (float)q6 * x[x_base + j];
+        // Process 256 weights in 2 blocks of 128, matching GGML Q6_K layout
+        for (uint blk = 0; blk < 2; blk++) {
+            device const uint8_t* ql = ql_base + blk * 64;
+            device const uint8_t* qh = qh_base + blk * 32;
+            device const int8_t* sc = sc_base + blk * 8;
+            uint y_off = x_base + blk * 128;
+
+            for (uint l = 0; l < 32; l++) {
+                uint is = l / 16;
+                int q1 = (int)((ql[l]      & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int q2 = (int)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int q3 = (int)((ql[l]      >> 4)  | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int q4 = (int)((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4)) - 32;
+
+                acc += d * (float)sc[is + 0] * (float)q1 * x[y_off + l];
+                acc += d * (float)sc[is + 2] * (float)q2 * x[y_off + l + 32];
+                acc += d * (float)sc[is + 4] * (float)q3 * x[y_off + l + 64];
+                acc += d * (float)sc[is + 6] * (float)q4 * x[y_off + l + 96];
+            }
         }
     }
 

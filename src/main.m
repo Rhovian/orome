@@ -136,10 +136,19 @@ int main(int argc, char **argv) {
             cfg.num_kv_heads = gf->num_kv_heads;
             cfg.rope_theta = gf->rope_theta > 0 ? gf->rope_theta : 1000000.0f;
 
-            // Qwen3.5 head dimensions
-            if (cfg.num_attn_heads > 0) {
-                cfg.head_dim = cfg.hidden_dim * 2 / cfg.num_attn_heads; // GQA: Q heads use 2x hidden
+            // Derive head_dim from K tensor shape (more reliable than Q since Q may be gated)
+            cfg.head_dim = 0;
+            for (int i = 0; i < cfg.num_layers && cfg.head_dim == 0; i++) {
+                char kname[128];
+                snprintf(kname, sizeof(kname), "blk.%d.attn_k.weight", i);
+                GGUFTensorInfo *ki = gguf_find_tensor(gf, kname);
+                if (ki && ki->n_dims >= 2 && cfg.num_kv_heads > 0) {
+                    cfg.head_dim = (int)ki->dims[1] / cfg.num_kv_heads;
+                    fprintf(stderr, "[main] K tensor shape: out=%d / kv_heads=%d → head_dim=%d\n",
+                            (int)ki->dims[1], cfg.num_kv_heads, cfg.head_dim);
+                }
             }
+            if (cfg.head_dim == 0) cfg.head_dim = cfg.hidden_dim / cfg.num_attn_heads;
             if (cfg.head_dim == 0) cfg.head_dim = 256; // fallback
 
             // Detect layer types from GGUF tensors
@@ -165,29 +174,44 @@ int main(int argc, char **argv) {
             cfg.linear_key_dim = 128;
             cfg.linear_value_dim = 128;
             cfg.partial_rotary = 0.25;
+            cfg.conv_kernel_size = 4;
+            cfg.rms_norm_eps = 1e-6f;
             // attn_qkv output dim = v_heads*(key+value) + k_heads*key
             // For Qwen3.5: qkv_dim = v_heads*256 + k_heads*128
             // We know k_heads from metadata (num_kv_heads for linear layers can differ)
             // Infer from attn_qkv tensor shape
             {
                 char tname[128];
-                // Find first linear attention layer
+                // Find first linear attention layer — derive v_heads and k_heads from tensor shapes
                 for (int i = 0; i < cfg.num_layers; i++) {
                     if (cfg.layer_types[i] == ATTN_LINEAR) {
+                        // alpha tensor has dims[1] = v_heads
+                        snprintf(tname, sizeof(tname), "blk.%d.ssm_alpha.weight", i);
+                        GGUFTensorInfo *alpha_ti = gguf_find_tensor(gf, tname);
                         snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.weight", i);
                         GGUFTensorInfo *qkv_ti = gguf_find_tensor(gf, tname);
-                        if (qkv_ti && qkv_ti->n_dims >= 2) {
-                            int qkv_dim = (int)qkv_ti->dims[1]; // ne1 = output dim
+                        if (alpha_ti && alpha_ti->n_dims >= 2 && qkv_ti && qkv_ti->n_dims >= 2) {
+                            int qkv_dim = (int)qkv_ti->dims[1];
+                            cfg.linear_num_v_heads = (int)alpha_ti->dims[1];
                             // conv_dim = 2 * k_heads * key_dim + v_heads * value_dim
-                            // For Qwen3.5: qkv_dim = 2*16*128 + v_heads*128
-                            cfg.linear_num_k_heads = 16; // fixed for Qwen3.5
-                            cfg.linear_num_v_heads = (qkv_dim - 2 * cfg.linear_num_k_heads * cfg.linear_key_dim)
-                                                   / cfg.linear_value_dim;
+                            cfg.linear_num_k_heads = (qkv_dim - cfg.linear_num_v_heads * cfg.linear_value_dim)
+                                                   / (2 * cfg.linear_key_dim);
                             fprintf(stderr, "[main] GGUF linear attn: qkv_dim=%d v_heads=%d k_heads=%d\n",
                                     qkv_dim, cfg.linear_num_v_heads, cfg.linear_num_k_heads);
                         }
                         break;
                     }
+                }
+            }
+
+            // Derive shared_intermediate from shared expert gate tensor shape
+            {
+                GGUFTensorInfo *sg = gguf_find_tensor(gf, "blk.0.ffn_gate_shexp.weight");
+                if (sg && sg->n_dims >= 2) {
+                    cfg.shared_intermediate = (int)sg->dims[1];
+                    fprintf(stderr, "[main] GGUF shared_intermediate=%d\n", cfg.shared_intermediate);
+                } else {
+                    cfg.shared_intermediate = cfg.moe_intermediate; // fallback
                 }
             }
 

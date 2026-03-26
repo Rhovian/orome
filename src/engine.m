@@ -722,7 +722,7 @@ int engine_step(Engine *eng, int token_id) {
     // Upload hidden to GPU once before the layer loop.
     // Hidden state stays on GPU (in buf_moe_hidden) throughout all layers.
     bool gpu_resident = (ctx && ctx->buf_weights && ctx->moe_combine
-                         && eng->ef->gpu_resident_safe);
+                         && eng->ef && eng->ef->gpu_resident_safe);
     if (gpu_resident) {
         memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
     }
@@ -1061,17 +1061,6 @@ int engine_step(Engine *eng, int token_id) {
                 && !moe_get_profile_experts();
             bool gguf_experts = (tcache != NULL) && !layer_fused;
 
-            // Debug: dump hidden states at each stage for layer 0
-            if (tcache && eng->pos == 0 && layer == 0) {
-                [enc endEncoding]; [cmd commit]; [cmd waitUntilCompleted];
-                float *mh = (float *)[ctx->buf_moe_hidden contents];
-                float *bi = (float *)[ctx->buf_input contents];
-                float *bo = (float *)[ctx->buf_output contents];
-                fprintf(stderr, "[stage] L0 pre-expert: moe_hidden=[%.4f %.4f] input=[%.4f %.4f] output(routing)=[%.4f %.4f %.4f]\n",
-                        mh[0], mh[1], bi[0], bi[1], bo[0], bo[1], bo[2]);
-                cmd = [ctx->queue commandBuffer];
-                enc = [cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-            }
 
             if (gguf_experts) {
                 // GGUF expert path: CPU routing readback + GPU expert forward
@@ -1205,11 +1194,6 @@ int engine_step(Engine *eng, int token_id) {
                 }
 
 
-                // Debug: check post-expert hidden
-                if (eng->pos == 0 && layer == 0) {
-                    fprintf(stderr, "[stage] L0 post-expert: hidden=[%.4f %.4f] (residual was [%.4f %.4f])\n",
-                            eng->hidden[0], eng->hidden[1], eng->residual[0], eng->residual[1]);
-                }
                 // Upload combined result back to GPU for next layer's attention
                 memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
 
@@ -1663,10 +1647,102 @@ int engine_step(Engine *eng, int token_id) {
                 }
 
                 double t0_moe = now_ms();
-                moe_forward_routed(eng->wf, ctx, cfg, layer, eng->hidden, eng->h_post,
-                                   s_fused_gate_scores, shared_gate_score,
-                                   eng->ef, effective_k, eng->quant,
-                                   gpu_resident);
+                if (tcache) {
+                    // GGUF expert forward (same path as linear attention layers)
+                    cpu_softmax(s_fused_gate_scores, n_experts);
+                    int expert_indices[OROME_MAX_ACTIVE];
+                    float expert_weights[OROME_MAX_ACTIVE];
+                    cpu_topk(s_fused_gate_scores, n_experts, effective_k, expert_indices, expert_weights);
+                    cpu_normalize_weights(expert_weights, effective_k);
+
+                    int M = cfg->moe_intermediate;
+                    int S = cfg->shared_intermediate;
+                    ExpertLayerRef elr = format_resolve_expert_layer(eng->fp, layer, H, M, n_experts);
+
+                    id<MTLCommandBuffer> ecmd = [ctx->queue commandBuffer];
+                    id<MTLComputeCommandEncoder> eenc = [ecmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+
+                    for (int ek = 0; ek < effective_k; ek++) {
+                        int eidx = expert_indices[ek];
+                        size_t gate_off = elr.gate.offset + (size_t)eidx * elr.gate.expert_stride;
+                        size_t up_off = elr.up.offset + (size_t)eidx * elr.up.expert_stride;
+
+                        TensorRef gate_ref = {
+                            .buffer = elr.buffer, .offset = gate_off,
+                            .format = elr.gate.format, .out_dim = (uint32_t)M, .in_dim = (uint32_t)H,
+                        };
+                        gate_ref.pipeline = format_pipeline_for(ctx, gate_ref.format);
+                        format_dispatch_matvec(eenc, ctx, &gate_ref,
+                            ctx->buf_input, 0, ctx->buf_multi_expert_gate[ek], 0);
+
+                        TensorRef up_ref = {
+                            .buffer = elr.buffer, .offset = up_off,
+                            .format = elr.up.format, .out_dim = (uint32_t)M, .in_dim = (uint32_t)H,
+                        };
+                        up_ref.pipeline = format_pipeline_for(ctx, up_ref.format);
+                        format_dispatch_matvec(eenc, ctx, &up_ref,
+                            ctx->buf_input, 0, ctx->buf_multi_expert_up[ek], 0);
+                    }
+                    [eenc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                    for (int ek = 0; ek < effective_k; ek++) {
+                        [eenc setComputePipelineState:ctx->swiglu];
+                        [eenc setBuffer:ctx->buf_multi_expert_gate[ek] offset:0 atIndex:0];
+                        [eenc setBuffer:ctx->buf_multi_expert_up[ek] offset:0 atIndex:1];
+                        [eenc setBuffer:ctx->buf_multi_expert_gate[ek] offset:0 atIndex:2];
+                        { uint dim = (uint)M; [eenc setBytes:&dim length:sizeof(uint) atIndex:3]; }
+                        [eenc dispatchThreadgroups:MTLSizeMake(((uint)M + 255) / 256, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    }
+                    [eenc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                    for (int ek = 0; ek < effective_k; ek++) {
+                        int eidx = expert_indices[ek];
+                        size_t down_off = elr.down.offset + (size_t)eidx * elr.down.expert_stride;
+                        TensorRef down_ref = {
+                            .buffer = elr.buffer, .offset = down_off,
+                            .format = elr.down.format, .out_dim = (uint32_t)H, .in_dim = (uint32_t)M,
+                        };
+                        down_ref.pipeline = format_pipeline_for(ctx, down_ref.format);
+                        format_dispatch_matvec(eenc, ctx, &down_ref,
+                            ctx->buf_multi_expert_gate[ek], 0, ctx->buf_multi_expert_out[ek], 0);
+                    }
+
+                    {
+                        [eenc setComputePipelineState:ctx->swiglu];
+                        [eenc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
+                        [eenc setBuffer:ctx->buf_shared_up offset:0 atIndex:1];
+                        [eenc setBuffer:ctx->buf_shared_act offset:0 atIndex:2];
+                        { uint dim = (uint)S; [eenc setBytes:&dim length:sizeof(uint) atIndex:3]; }
+                        [eenc dispatchThreadgroups:MTLSizeMake(((uint)S + 255) / 256, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    }
+                    [eenc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                    format_dispatch_matvec(eenc, ctx, (TensorRef *)&tcache[layer].shared_down,
+                        ctx->buf_shared_act, 0, ctx->buf_shared_out, 0);
+
+                    [eenc endEncoding];
+                    [ecmd commit];
+                    [ecmd waitUntilCompleted];
+
+                    float sigmoid_sg = 1.0f / (1.0f + expf(-shared_gate_score));
+                    float *shared_out = (float *)[ctx->buf_shared_out contents];
+                    for (int j = 0; j < H; j++) {
+                        float expert_sum = 0.0f;
+                        for (int ek = 0; ek < effective_k; ek++) {
+                            expert_sum += expert_weights[ek] * ((float *)[ctx->buf_multi_expert_out[ek] contents])[j];
+                        }
+                        eng->hidden[j] = eng->residual[j] + expert_sum + sigmoid_sg * shared_out[j];
+                    }
+                    memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
+
+                } else {
+                    moe_forward_routed(eng->wf, ctx, cfg, layer, eng->hidden, eng->h_post,
+                                       s_fused_gate_scores, shared_gate_score,
+                                       eng->ef, effective_k, eng->quant,
+                                       gpu_resident);
+                }
                 double moe_ms = now_ms() - t0_moe;
                 t_moe_total += moe_ms;
             }
@@ -1729,7 +1805,11 @@ int engine_step(Engine *eng, int token_id) {
 
     // Sync GPU + final norm + LM head
     t0 = now_ms();
-    if (gpu_resident) {
+    if (gpu_resident || tcache) {
+        // For GGUF (tcache): upload final hidden state if not gpu_resident
+        if (!gpu_resident && tcache) {
+            memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
+        }
         uint8_t *base = (uint8_t *)[ctx->buf_weights contents];
         uint16_t *final_norm_w = tcache ? NULL : weights_tensor_ptr(eng->wf, "model.norm.weight");
         uint32_t *lm_w = tcache ? NULL : weights_tensor_ptr(eng->wf, "lm_head.weight");
@@ -1747,8 +1827,8 @@ int engine_step(Engine *eng, int token_id) {
         }
 
         // RMS norm: buf_moe_hidden → buf_input
-        // Use partial sums from last layer's moe_combine_copy_sq if available
-        if (ctx->moe_combine_copy_sq) {
+        // Use partial sums ONLY if the last layer was gpu_resident (buf_sum_sq is valid)
+        if (ctx->moe_combine_copy_sq && gpu_resident) {
             uint num_tgs = ((uint)H + 255) / 256;
             [enc setComputePipelineState:ctx->norm_apply_partial];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
@@ -1833,7 +1913,7 @@ int engine_step(Engine *eng, int token_id) {
 
     // 5. Sample (greedy argmax)
     int next_token;
-    if (gpu_resident && ctx->argmax && ctx->buf_argmax_result) {
+    if ((gpu_resident || tcache) && ctx->argmax && ctx->buf_argmax_result) {
         // GPU argmax already computed — just read the 4-byte result
         next_token = (int)(*(uint32_t *)[ctx->buf_argmax_result contents]);
 
@@ -1841,7 +1921,6 @@ int engine_step(Engine *eng, int token_id) {
         next_token = cpu_argmax(eng->logits, cfg->vocab_size);
     }
 
-    // Debug: print top logits and hidden state summary
     if (moe_get_profile_experts()) {
         float maxl = -1e30f, minl = 1e30f;
         int maxi = 0;
