@@ -1269,41 +1269,59 @@ kernel void dequant_matvec_q8_0(
     uint simd_lane  [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
-    uint row = tgid * ROWS_PER_TG + simd_group;
-    if (row >= out_dim) return;
+    uint row0 = tgid * (ROWS_PER_TG * 2) + simd_group * 2;
+    uint row1 = row0 + 1;
+    bool valid0 = row0 < out_dim;
+    bool valid1 = row1 < out_dim;
 
     threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
     for (uint i = lid; i < in_dim; i += tg_size) {
         x_shared[i] = half(x[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (!valid0) return;
 
     // Q8_0: 32 weights per block, 34 bytes per block
     uint num_blocks = in_dim / 32;
     uint bytes_per_row = num_blocks * 34;
 
-    device const uint8_t* row_data = data + row * bytes_per_row;
+    device const uint8_t* row0_data = data + row0 * bytes_per_row;
+    device const uint8_t* row1_data = valid1 ? data + row1 * bytes_per_row : row0_data;
 
-    float acc = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
 
     for (uint blk = simd_lane; blk < num_blocks; blk += 32) {
-        device const uint8_t* block = row_data + blk * 34;
-
-        float d = float(as_type<half>(ushort(ushort(block[0]) | (ushort(block[1]) << 8))));
-        device const int8_t* qs = (device const int8_t*)(block + 2);
-
         uint x_base = blk * 32;
 
-        float local_acc = 0.0f;
+        device const uint8_t* block0 = row0_data + blk * 34;
+        float d0 = float(as_type<half>(ushort(ushort(block0[0]) | (ushort(block0[1]) << 8))));
+        device const int8_t* qs0 = (device const int8_t*)(block0 + 2);
+
+        float local0 = 0.0f;
         for (uint j = 0; j < 32; j++) {
-            local_acc += d * float(qs[j]) * float(x_shared[x_base + j]);
+            local0 += float(qs0[j]) * float(x_shared[x_base + j]);
         }
-        acc += local_acc;
+        acc0 += d0 * local0;
+
+        if (valid1) {
+            device const uint8_t* block1 = row1_data + blk * 34;
+            float d1 = float(as_type<half>(ushort(ushort(block1[0]) | (ushort(block1[1]) << 8))));
+            device const int8_t* qs1 = (device const int8_t*)(block1 + 2);
+
+            float local1 = 0.0f;
+            for (uint j = 0; j < 32; j++) {
+                local1 += float(qs1[j]) * float(x_shared[x_base + j]);
+            }
+            acc1 += d1 * local1;
+        }
     }
 
-    float sum = simd_sum(acc);
+    float sum0 = simd_sum(acc0);
+    float sum1 = simd_sum(acc1);
     if (simd_lane == 0) {
-        out[row] = sum;
+        out[row0] = sum0;
+        if (valid1) out[row1] = sum1;
     }
 }
 

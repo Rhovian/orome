@@ -24,6 +24,7 @@ static inline uint format_effective_rows_per_tg(QuantFormat fmt) {
         case QFMT_GGUF_Q4_K:
         case QFMT_GGUF_Q5_K:
         case QFMT_GGUF_Q6_K:
+        case QFMT_GGUF_Q8_0:
             return FORMAT_ROWS_PER_TG * FORMAT_TWO_ROW_MULTIPLIER;
         default:
             return FORMAT_ROWS_PER_TG;

@@ -58,3 +58,5 @@ n/a	65.92	2189.0	1.1011	keep	de-interleave Q+gate weights at load time to elimin
 n/a	65.96	2174.0	1.1011	keep	fuse sigmoid gate into attn_values to eliminate 1 dispatch+1 barrier per full-attn layer
 n/a	66.50	2180.0	1.1011	keep	schedule decay_beta alongside conv1d for concurrent overlap in linear attention
 n/a	66.12	2181.0	1.1011	keep	fuse QK RMS norm into delta_net kernel to eliminate 1 dispatch+1 barrier per linear layer
+n/a	66.57	2181.0	1.1011	keep	baseline: re-benchmark current HEAD before 2-row Q8_0 experiment
+n/a	66.74	2182.0	1.1011	keep	2-row GGUF Q8_0 matvec: halve threadgroups for all Q8_0 dispatches
