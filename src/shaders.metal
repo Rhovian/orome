@@ -351,8 +351,11 @@ kernel void gated_delta_net_step(
     device const float *beta_gate,   // [64] per v-head
     device float *output,            // [8192] (64 v-heads * 128)
     constant uint &k_heads_per_v,    // = 4
+    constant float &qk_inv_scale,    // = 1/sqrt(key_dim)
     uint head_id [[threadgroup_position_in_grid]],
-    uint vi [[thread_position_in_threadgroup]]
+    uint vi [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
     uint kh = head_id / k_heads_per_v;
     float g = g_decay[head_id];
@@ -362,13 +365,46 @@ kernel void gated_delta_net_step(
     uint k_base = kh * 128;
     uint v_base = head_id * 128;
 
-    // Load k and q into threadgroup memory (shared by all 128 threads)
+    // Load raw k and q into threadgroup memory, then apply RMS norm inline.
+    // This fuses the rms_norm_qk dispatch into the delta_net kernel.
     threadgroup float k_shared[128];
     threadgroup float q_shared[128];
-    if (vi < 128) {
-        k_shared[vi] = k[k_base + vi];
-        q_shared[vi] = q[k_base + vi];
+    float raw_k = k[k_base + vi];
+    float raw_q = q[k_base + vi];
+    k_shared[vi] = raw_k;
+    q_shared[vi] = raw_q;
+
+    // RMS norm reduction for Q and K (128 threads = 4 simdgroups)
+    threadgroup float q_sums[4];
+    threadgroup float k_sums[4];
+    float q_sq = raw_q * raw_q;
+    float k_sq = raw_k * raw_k;
+    float q_simd = simd_sum(q_sq);
+    float k_simd = simd_sum(k_sq);
+    if (simd_lane == 0) {
+        q_sums[simd_group] = q_simd;
+        k_sums[simd_group] = k_simd;
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float q_broadcast;
+    threadgroup float k_broadcast;
+    if (simd_group == 0) {
+        float qv = (simd_lane < 4) ? q_sums[simd_lane] : 0;
+        float q_total = simd_sum(qv);
+        float kv = (simd_lane < 4) ? k_sums[simd_lane] : 0;
+        float k_total = simd_sum(kv);
+        if (simd_lane == 0) {
+            q_broadcast = q_total;
+            k_broadcast = k_total;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Apply QK RMS norm: Q scaled by inv_scale^2, K by inv_scale
+    float q_inv_rms = rsqrt(q_broadcast / 128.0f + 1e-6f);
+    float k_inv_rms = rsqrt(k_broadcast / 128.0f + 1e-6f);
+    q_shared[vi] = raw_q * q_inv_rms * qk_inv_scale * qk_inv_scale;
+    k_shared[vi] = raw_k * k_inv_rms * qk_inv_scale;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Step 1+2: Compute kv_mem from pre-decay state (read-only pass).

@@ -485,31 +485,21 @@ int engine_step(Engine *eng, int token_id) {
 
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // --- Phase D: QK RMS norm (needs conv1d output) ---
-            [enc setComputePipelineState:ctx->rms_norm_qk];
-            [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_conv_output offset:total_key * sizeof(float) atIndex:1];
-            { uint kd = (uint)key_dim;
-              float inv_s = 1.0f / sqrtf((float)key_dim);
-              [enc setBytes:&kd length:sizeof(uint) atIndex:2];
-              [enc setBytes:&inv_s length:sizeof(float) atIndex:3]; }
-            [enc dispatchThreadgroups:MTLSizeMake(n_k_heads, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(key_dim, 1, 1)];
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-            // --- Phase F: GatedDeltaNet recurrence ---
-            // Q/K from buf_conv_output, V at offset 2*total_key
-            // state: buf_linear_state[linear_idx], output → buf_linear_v (reuse)
+            // --- Phase D+F: GatedDeltaNet with fused QK RMS norm ---
+            // QK norm is now computed inline within delta_net's shared memory loading.
+            // Q/K from buf_conv_output (raw, pre-norm), V at offset 2*total_key
             { uint k_per_v = (uint)(n_v_heads / n_k_heads);
+              float inv_s = 1.0f / sqrtf((float)key_dim);
             [enc setComputePipelineState:ctx->delta_net];
             [enc setBuffer:ctx->buf_linear_state[linear_idx] offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:1];  // q
-            [enc setBuffer:ctx->buf_conv_output offset:total_key * sizeof(float) atIndex:2]; // k
+            [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:1];  // q (raw)
+            [enc setBuffer:ctx->buf_conv_output offset:total_key * sizeof(float) atIndex:2]; // k (raw)
             [enc setBuffer:ctx->buf_conv_output offset:2 * total_key * sizeof(float) atIndex:3]; // v
             [enc setBuffer:ctx->buf_linear_decay offset:0 atIndex:4];
             [enc setBuffer:ctx->buf_linear_beta offset:0 atIndex:5];
             [enc setBuffer:ctx->buf_linear_v offset:0 atIndex:6];  // output
             [enc setBytes:&k_per_v length:sizeof(uint) atIndex:7];
+            [enc setBytes:&inv_s length:sizeof(float) atIndex:8];
             [enc dispatchThreadgroups:MTLSizeMake(n_v_heads, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(value_dim, 1, 1)]; }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
