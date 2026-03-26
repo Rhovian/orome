@@ -2149,13 +2149,19 @@ kernel void dequant_matvec_q5k(
             float sub_sc = d * sc[sub];
             float sub_mn = dmin * mn[sub];
             uint sub_base = sub * 32;
+            device const uint8_t* qsub = ql + sub * 16;
 
-            for (uint j = 0; j < 32; j++) {
-                uint idx = sub_base + j;
-                uint8_t q_lo = (ql[idx / 2] >> (4 * (idx % 2))) & 0xF;
-                uint8_t q_hi = (qh[idx / 8] >> (idx % 8)) & 1;
-                float q5 = float(q_lo | (q_hi << 4));
-                acc += (sub_sc * q5 - sub_mn) * x[x_base + idx];
+            // Split-half: byte l → low nibble at position l, high nibble at position l+16
+            for (uint l = 0; l < 16; l++) {
+                uint8_t byte_val = qsub[l];
+                uint idx_lo = sub_base + l;
+                uint idx_hi = sub_base + l + 16;
+                uint8_t qh_lo = (qh[idx_lo / 8] >> (idx_lo % 8)) & 1;
+                uint8_t qh_hi = (qh[idx_hi / 8] >> (idx_hi % 8)) & 1;
+                float q5_lo = float((byte_val & 0xF) | (qh_lo << 4));
+                float q5_hi = float((byte_val >> 4) | (qh_hi << 4));
+                acc += (sub_sc * q5_lo - sub_mn) * x[x_base + idx_lo];
+                acc += (sub_sc * q5_hi - sub_mn) * x[x_base + idx_hi];
             }
         }
     }
