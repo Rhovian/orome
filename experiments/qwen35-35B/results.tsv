@@ -96,3 +96,8 @@ n/a	48.48	2136.9	1.1011	discard	precompute shared gate sigmoid in softmax_topk_r
 bd54ca8	48.63	2119.0	1.1011	keep	baseline: re-benchmark current GGUF HEAD before combine-param and shared_down follow-up experiments
 n/a	48.39	2103.0	1.1011	discard	read combine params from constant address space and scalarize the fixed K=8 weights
 n/a	48.81	2115.0	1.1011	discard	specialize live Q8_0 shared_down for fixed S=512 with smaller threadgroup scratch and full simd participation
+4954529	47.79	1969.7	1.1011	keep	baseline: re-benchmark current GGUF HEAD before fused live Q8_0 shared_down+combine experiment
+n/a	46.91	1999.8	1.1011	discard	fuse live Q8_0 shared_down into the K=8 combine path to eliminate shared_out writeback
+4954529	47.68	1986.2	1.1011	keep	baseline: re-benchmark current GGUF HEAD before simplifying live routing top-k
+88553c3	57.50	1944.5	1.1011	keep	select top-K directly from routing logits and normalize only the chosen experts
+n/a	57.44	1950.8	1.1011	discard	shrink softmax_topk_route launch from 256 threads to a single 32-thread simdgroup
