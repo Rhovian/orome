@@ -54,3 +54,4 @@ n/a	65.59	2164.0	1.1011	discard	resource-specific memoryBarrierWithResources in 
 n/a	60.84	2173.2	1.1011	discard	transpose GDN state from row-major to column-major for cross-thread coalescing
 n/a	65.44	2188.0	1.1011	keep	baseline: re-benchmark current HEAD before new experiments
 n/a	65.85	2203.0	1.1011	keep	defer GDN state decay to second pass: halve state write traffic by computing kv_mem from pre-decay state
+n/a	65.92	2189.0	1.1011	keep	de-interleave Q+gate weights at load time to eliminate 2 dispatch+2 barrier per full-attn layer

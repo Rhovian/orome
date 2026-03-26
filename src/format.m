@@ -525,8 +525,35 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
             snprintf(name, sizeof(name), "blk.%d.attn_q.weight", i);
             { GGUFTensorInfo *qi = gguf_find_tensor(gf, name);
               // Gated attention: Q tensor has n_heads*head_dim*2 rows (Q + gate interleaved)
+              // De-interleave at load time: [Q_h0,gate_h0,Q_h1,gate_h1,...] → [Q_h0..h15,gate_h0..h15]
               int q_out = (qi && qi->n_dims >= 2) ? (int)qi->dims[1] : n_heads * hd;
-              c->full.q = G_REF(name, q_out, H); }
+              if (qi && qi->n_dims >= 2 && q_out == n_heads * hd * 2) {
+                  int _bpr = ((int)qi->dims[0] / 32) * 34;  // bytes per row for Q8_0
+                  size_t _total = (size_t)q_out * _bpr;
+                  id<MTLBuffer> db = [ctx->device newBufferWithLength:_total options:MTLResourceStorageModeShared];
+                  uint8_t *s = (uint8_t *)[buf contents] + gf->data_offset + qi->offset;
+                  uint8_t *d = (uint8_t *)[db contents];
+                  // Source: [Q_h0(hd rows), gate_h0(hd rows), Q_h1(hd rows), gate_h1(hd rows), ...]
+                  // Dest:   [Q_h0(hd rows), Q_h1(hd rows), ..., gate_h0(hd rows), gate_h1(hd rows), ...]
+                  for (int h = 0; h < n_heads; h++) {
+                      // Q rows for head h: src offset = h * 2 * hd, dst offset = h * hd
+                      memcpy(d + (size_t)(h * hd) * _bpr,
+                             s + (size_t)(h * 2 * hd) * _bpr,
+                             (size_t)hd * _bpr);
+                      // Gate rows for head h: src offset = h * 2 * hd + hd, dst offset = n_heads*hd + h*hd
+                      memcpy(d + (size_t)(n_heads * hd + h * hd) * _bpr,
+                             s + (size_t)(h * 2 * hd + hd) * _bpr,
+                             (size_t)hd * _bpr);
+                  }
+                  QuantFormat fmt = format_from_ggml_type(qi->type);
+                  c->full.q = (TensorRef){ .buffer = db, .offset = 0,
+                      .pipeline = format_pipeline_for(ctx, fmt),
+                      .format = fmt, .out_dim = (uint32_t)q_out, .in_dim = (uint32_t)H };
+                  if (i == cfg->num_layers - 1 || cfg->layer_types[i+1] != ATTN_FULL)
+                      fprintf(stderr, "[format] De-interleaved attn_q Q+gate (%d heads × %d hd)\n", n_heads, hd);
+              } else {
+                  c->full.q = G_REF(name, q_out, H);
+              } }
             snprintf(name, sizeof(name), "blk.%d.attn_k.weight", i);
             c->full.k = G_REF(name, n_kv * hd, H);
             snprintf(name, sizeof(name), "blk.%d.attn_v.weight", i);

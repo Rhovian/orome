@@ -705,29 +705,8 @@ int engine_step(Engine *eng, int token_id) {
             }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // --- Phase B2: De-interleave Q+gate ---
-            // Q projection output layout: [Q_h0(hd), gate_h0(hd), Q_h1(hd), gate_h1(hd), ...]
-            // Rearrange to: [Q_h0, Q_h1, ..., Q_h15, gate_h0, gate_h1, ..., gate_h15]
-            // Use buf_output as scratch (large enough: vocab_size floats)
-            [enc setComputePipelineState:ctx->deinterleave_qgate];
-            [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_output offset:0 atIndex:1];
-            { uint hd_val = (uint)hd, nh = (uint)n_heads;
-              [enc setBytes:&hd_val length:sizeof(uint) atIndex:2];
-              [enc setBytes:&nh length:sizeof(uint) atIndex:3]; }
-            [enc dispatchThreadgroups:MTLSizeMake(((uint)(n_heads * hd) + 255) / 256, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-            // Copy de-interleaved data back from scratch to buf_attn_output
-            [enc setComputePipelineState:ctx->copy_tmp_to_buf];
-            [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_output offset:0 atIndex:1];
-            { uint cnt = (uint)(n_heads * hd * 2);
-              [enc setBytes:&cnt length:sizeof(uint) atIndex:2]; }
-            [enc dispatchThreadgroups:MTLSizeMake(((uint)(n_heads * hd * 2) + 255) / 256, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            // Q+gate weights are de-interleaved at load time, so the matvec
+            // output is already [Q_h0..h15, gate_h0..h15]. No runtime permutation needed.
 
             // --- Phase C: Weighted QK RMS norm ---
             // Q in buf_attn_output (16 heads × 256), K in buf_conv_output (2 heads × 256)
