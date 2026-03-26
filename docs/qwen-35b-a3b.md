@@ -91,5 +91,3 @@ Total GPU round-trips per token: ~40 (one per layer) + 1 (final readback). Down 
 ## Key Insight
 
 The 35B story is simple: **move everything to GPU, then reduce the number of times you talk to it.** Every win came from either (a) moving compute from CPU to GPU, or (b) batching GPU dispatches to reduce synchronization. The model fits in memory, so there's no I/O story. It's pure dispatch engineering.
-
-This is the foundation that the 397B campaign builds on — same GPU kernels, same dispatch patterns, but with a fundamentally different bottleneck: the experts don't fit in RAM.

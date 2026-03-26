@@ -1,7 +1,7 @@
 {
-  "model_dir": "/Users/j/models/Qwen3.5-35B-A3B-4bit",
-  "min_tok_sec": 55.0,
+  "model": "/Users/j/Code/lllm/models/Qwen3.5-35B-A3B-Q4_K_S.gguf",
+  "min_tok_sec": 40.0,
   "tokens": 5,
   "k": 8,
-  "description": "35B mlock path regression check"
+  "description": "35B GGUF smoke regression check"
 }

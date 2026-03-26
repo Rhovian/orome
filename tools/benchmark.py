@@ -48,7 +48,7 @@ def parse_metrics(output):
     }
 
 
-def run_infer(cwd, infer_path, prompt, tokens, k, use_2bit, timing, model=None, extra_args=None):
+def run_infer(cwd, infer_path, prompt, tokens, k, timing, model=None, extra_args=None):
     cmd = [str(infer_path)]
     if model:
         cmd.extend(["--model", model])
@@ -80,7 +80,6 @@ def main():
     parser.add_argument("--prompt", default="[248045,846,198,9419,248046,198,248045,74455,198]", help="Prompt (raw token IDs or text)")
     parser.add_argument("--tokens", type=int, default=100, help="Tokens to generate (default: 100 for sustained throughput)")
     parser.add_argument("--k", type=int, default=8, help="Active experts")
-    parser.add_argument("--2bit", dest="use_2bit", action="store_true", help="Use 2-bit experts (legacy)")
     parser.add_argument("--trials", type=int, default=3, help="Number of timed trials")
     parser.add_argument("--warmup-runs", type=int, default=1, help="Untimed warm-up runs before first trial")
     parser.add_argument("--cooldown-sec", type=float, default=5.0, help="Sleep between trials (short — Mac Studio has a fan)")
@@ -94,14 +93,13 @@ def main():
         print(f"ERROR: infer binary not found at {infer_path}", file=sys.stderr)
         sys.exit(1)
 
-    quant = "2-bit" if args.use_2bit else "4-bit"
     if not args.json:
         print("=== orome benchmark (M2 Max 96GB) ===")
         print(f"infer:        {infer_path}")
+        print(f"model:        {args.model}")
         print(f"prompt:       {args.prompt!r}")
         print(f"tokens:       {args.tokens}")
         print(f"experts:      {args.k}")
-        print(f"quant:        {quant}")
         print(f"trials:       {args.trials}")
         print(f"warm-up runs: {args.warmup_runs}")
         print(f"cool-down:    {args.cooldown_sec:.0f}s")
@@ -114,7 +112,7 @@ def main():
         print("[warmup] warming cache and Metal pipeline")
     for warmup_idx in range(1, args.warmup_runs + 1):
         run_infer(cwd, infer_path, args.prompt, min(args.tokens, 20), args.k,
-                  args.use_2bit, timing=False, model=args.model, extra_args=args.extra)
+                  timing=False, model=args.model, extra_args=args.extra)
         if not args.json:
             print(f"  warm-up {warmup_idx}/{args.warmup_runs} complete")
 
@@ -127,7 +125,7 @@ def main():
             print(f"[trial {trial_idx}/{args.trials}] running timed benchmark")
         output = run_infer(
             cwd, infer_path, args.prompt, args.tokens, args.k,
-            args.use_2bit, timing=True, model=args.model, extra_args=args.extra
+            timing=True, model=args.model, extra_args=args.extra
         )
         metrics = parse_metrics(output)
         trials.append(metrics)

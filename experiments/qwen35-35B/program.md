@@ -25,7 +25,6 @@ Secondary goals:
 
 - Keep TTFT low
 - Preserve output correctness
-- Avoid regressions on the current 397B path
 
 ## Current Baseline
 

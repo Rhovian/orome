@@ -6,8 +6,7 @@
 using namespace metal;
 
 // Max input dimension for matvec shared buffer.
-// Must fit the largest in_dim across all models:
-//   397B O projection: max(32*256, 64*128) = 8192
+// Must fit the largest current in_dim: 8192.
 // Using half precision to stay within 32KB threadgroup memory limit.
 #define MATVEC_X_SHARED_SIZE 8192
 

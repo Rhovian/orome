@@ -1,9 +1,9 @@
 /*
- * orome.h — Core types and interfaces for multi-model MoE inference on Apple Silicon.
+ * orome.h — Core types and interfaces for GGUF MoE inference on Apple Silicon.
  *
  * Design principles:
  *   - No hardcoded model dimensions. Everything comes from ModelConfig.
- *   - Engine is parameterized: same code serves Qwen3.5-35B, 397B, or future models.
+ *   - Engine is parameterized: the same code can serve current and future models.
  *   - Clear ownership: each module has a well-defined interface.
  *   - Explicit state: no hidden globals in headers.
  */
@@ -47,8 +47,8 @@ typedef struct {
     char name[64];              // e.g. "qwen3.5-35b-a3b"
 
     // --- Core dimensions ---
-    int hidden_dim;             // e.g. 2048 (35B) or 4096 (397B)
-    int num_layers;             // e.g. 40 (35B) or 60 (397B)
+    int hidden_dim;             // e.g. 2048
+    int num_layers;             // e.g. 40
     int vocab_size;             // e.g. 248320
     float rms_norm_eps;         // e.g. 1e-6
 
@@ -94,10 +94,6 @@ typedef struct {
 
 // Compute derived fields and expert layouts from the core fields.
 void model_config_init_derived(ModelConfig *cfg);
-
-// Load config from a model directory (reads config.json from HF format).
-// Returns 0 on success, -1 on failure.
-
 
 // ============================================================================
 // Metal GPU context

@@ -20,7 +20,6 @@ model_weights.bin
 model_weights.json
 expert_index.json
 packed_experts/
-packed_experts_2bit/
 hot_experts_*.json
 vocab.bin
 

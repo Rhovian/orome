@@ -19,9 +19,9 @@
 #   ./run_experiments.sh <model> --sessions 5                 # run 5 Claude sessions then stop
 #   ./run_experiments.sh <model> --agent codex --sessions 5   # run 5 Codex sessions then stop
 #
-# Models:
-#   qwen35-35B   — Qwen3.5-35B-A3B (fits in RAM, mlock path)
-#   qwen35-397B  — Qwen3.5-397B-A17B (pread path, adaptive memory)
+# Experiment targets are discovered from experiments/*/program.md.
+# Current repo target:
+#   qwen35-35B   — Qwen3.5-35B-A3B GGUF optimization
 #
 # To stop: Ctrl+C or kill this script. Current experiment will finish.
 
@@ -162,21 +162,26 @@ run_cross_checks() {
     # Run each cross-model check. Returns 0 if all pass, 1 if any regress.
     local any_fail=0
     for cc in "${CROSS_CHECKS[@]}"; do
-        local cc_model_dir cc_min_tok cc_tokens cc_k cc_desc
-        cc_model_dir=$(python3 -c "import json; print(json.load(open('$cc'))['model_dir'])")
+        local cc_model cc_min_tok cc_tokens cc_k cc_desc
+        cc_model=$(python3 -c "import json; d=json.load(open('$cc')); print(d.get('model') or d.get('model_dir') or '')")
         cc_min_tok=$(python3 -c "import json; print(json.load(open('$cc'))['min_tok_sec'])")
         cc_tokens=$(python3 -c "import json; print(json.load(open('$cc')).get('tokens', 5))")
         cc_k=$(python3 -c "import json; print(json.load(open('$cc')).get('k', 8))")
         cc_desc=$(python3 -c "import json; print(json.load(open('$cc'))['description'])")
 
-        if [[ ! -d "$cc_model_dir" ]]; then
-            echo "[cross-check] SKIP: $cc_desc (model dir not found: $cc_model_dir)"
+        if [[ -z "$cc_model" ]]; then
+            echo "[cross-check] SKIP: $cc_desc (no model configured: $cc)"
+            continue
+        fi
+
+        if [[ ! -e "$cc_model" ]]; then
+            echo "[cross-check] SKIP: $cc_desc (model not found: $cc_model)"
             continue
         fi
 
         echo "[cross-check] Running: $cc_desc"
         local output
-        output=$(./orome --model "$cc_model_dir" --prompt "Hello" --tokens "$cc_tokens" --k "$cc_k" 2>&1)
+        output=$(./orome --model "$cc_model" --prompt "Hello" --tokens "$cc_tokens" --k "$cc_k" 2>&1)
         local tok_sec
         tok_sec=$(echo "$output" | grep -o '[0-9.]* tok/s' | head -1 | awk '{print $1}')
 

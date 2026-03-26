@@ -2,8 +2,8 @@
  * main.m — CLI entry point for orome inference engine.
  *
  * Usage:
- *   ./orome --model DIR --prompt "Hello" --tokens 20
- *   ./orome --model DIR --serve 8080
+ *   ./orome --model FILE.gguf --prompt "Hello" --tokens 20
+ *   ./orome --model FILE.gguf --serve 8080
  */
 
 #import <Foundation/Foundation.h>
@@ -12,13 +12,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <getopt.h>
+#include <unistd.h>
 
 #include "orome.h"
 
 static void print_usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [options]\n"
-        "  --model DIR      Model directory (weights + config)\n"
+        "  --model FILE     GGUF model file\n"
         "  --prompt TEXT     Prompt text\n"
         "  --tokens N        Max tokens to generate (default: 20)\n"
         "  --k N             Active experts per layer (default: from config)\n"
@@ -255,16 +256,39 @@ int main(int argc, char **argv) {
                 return 1;
             }
 
-            // Load tokenizer (try model directory, then fallback paths)
-            // GGUF embeds vocab but we use our external tokenizer for now
-            // Strip .gguf filename to get directory
+            // Load tokenizer from the first vocab.bin we can actually read.
+            // GGUF embeds vocab metadata, but text tokenization still uses the
+            // external BPE vocab.bin from the legacy 35B assets.
             char tok_dir[512];
             strncpy(tok_dir, model_dir, sizeof(tok_dir));
+            tok_dir[sizeof(tok_dir) - 1] = '\0';
             char *last_slash = strrchr(tok_dir, '/');
             if (last_slash) *last_slash = '\0';
-            if (tokenizer_init(tok_dir) != 0) {
-                // Try the legacy 35B model dir for tokenizer
-                tokenizer_init("/Users/j/models/Qwen3.5-35B-A3B-4bit");
+            const char *tok_candidates[] = {
+                NULL,  // current working directory
+                tok_dir,
+                "/Users/j/models/Qwen3.5-35B-A3B-4bit",
+                NULL
+            };
+            int tok_loaded = -1;
+            for (int i = 0; tok_candidates[i] != NULL || i == 0; i++) {
+                if (tok_candidates[i] == NULL) {
+                    if (access("vocab.bin", R_OK) == 0) {
+                        tok_loaded = tokenizer_init(NULL);
+                        if (tok_loaded == 0) break;
+                    }
+                    continue;
+                }
+
+                char tok_vocab[1024];
+                snprintf(tok_vocab, sizeof(tok_vocab), "%s/vocab.bin", tok_candidates[i]);
+                if (access(tok_vocab, R_OK) != 0) continue;
+                tok_loaded = tokenizer_init(tok_candidates[i]);
+                if (tok_loaded == 0) break;
+            }
+            if (tok_loaded != 0) {
+                fprintf(stderr, "ERROR: Could not load tokenizer\n");
+                return 1;
             }
 
             fprintf(stderr, "[main] GGUF: creating engine...\n");
