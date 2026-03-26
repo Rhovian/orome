@@ -44,3 +44,7 @@ n/a	59.17	2144.5	1.1011	discard	hoist 8 combine weights via simd_broadcast_first
 n/a	59.36	2153.8	1.1011	discard	vectorize GDN state loops with half2 loads/stores
 n/a	59.05	2163.1	1.1011	discard	fuse residual_add_sq + norm_apply_partial into single-TG dispatch
 def8689	65.20	2144.4	1.1011	keep	parallel top-K routing: simd_max reduction replaces serial insertion sort
+8558d2f	65.58	2138.0	1.1011	keep	transpose expert output [K][dim] → [dim][K] for contiguous combine reads
+n/a	64.75	2153.0	1.1011	discard	fuse residual_add_sq + norm_apply_partial into single-TG dispatch
+n/a	65.45	2165.0	1.1011	discard	vectorize combine expert_out reads with float4 loads
+n/a	65.67	2133.0	1.1011	discard	unroll Q8_0 inner loop 4x with d hoisted outside accumulation
