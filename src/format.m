@@ -351,10 +351,79 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, MetalCtx *ctx,
             int total_value = cfg->linear_num_v_heads * cfg->linear_value_dim;
             int n_v = cfg->linear_num_v_heads;
 
+            // QKV: 8192 rows = Q(2048) + K(2048) + V(4096)
+            // V portion (rows 4096-8191) is head-interleaved like Z gate
             snprintf(name, sizeof(name), "blk.%d.attn_qkv.weight", i);
-            c->lin.qkv = G_REF(name, conv_dim, H);
+            {
+                GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
+                if (ti && ti->n_dims >= 2) {
+                    int _rows = (int)ti->dims[1];
+                    int _bpr = ((int)ti->dims[0] / 32) * 34;
+                    size_t _total = (size_t)_rows * _bpr;
+                    int qk_rows = 2 * cfg->linear_num_k_heads * cfg->linear_key_dim; // 4096
+                    int v_rows = total_value; // 4096
+                    int hd = cfg->linear_value_dim;  // 128
+
+                    id<MTLBuffer> db = [ctx->device newBufferWithLength:_total options:MTLResourceStorageModeShared];
+                    uint8_t *s = (uint8_t *)[buf contents] + gf->data_offset + ti->offset;
+                    uint8_t *d = (uint8_t *)[db contents];
+
+                    // Copy Q+K rows unchanged (first qk_rows rows)
+                    memcpy(d, s, (size_t)qk_rows * _bpr);
+
+                    // De-interleave V rows (rows qk_rows..qk_rows+v_rows-1)
+                    int v_half = v_rows / 2;
+                    for (int gr = 0; gr < v_rows; gr++) {
+                        int half = gr / v_half;
+                        int within = gr % v_half;
+                        int head_idx = within / hd;
+                        int pos = within % hd;
+                        int ref_head = head_idx * 2 + half;
+                        int ref_row = ref_head * hd + pos;
+                        memcpy(d + (qk_rows + ref_row) * _bpr,
+                               s + (qk_rows + gr) * _bpr, _bpr);
+                    }
+
+                    QuantFormat fmt = format_from_ggml_type(ti->type);
+                    c->lin.qkv = (TensorRef){ .buffer = db, .offset = 0,
+                        .pipeline = format_pipeline_for(ctx, fmt),
+                        .format = fmt, .out_dim = (uint32_t)conv_dim, .in_dim = (uint32_t)H };
+                } else {
+                    c->lin.qkv = G_REF(name, conv_dim, H);
+                }
+            }
+            // Z gate (attn_gate): out_dim=4096=32 heads × 128, rows are head-interleaved
             snprintf(name, sizeof(name), "blk.%d.attn_gate.weight", i);
-            c->lin.z = G_REF(name, total_value, H);
+            {
+                GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
+                if (ti && ti->n_dims >= 2 && ti->dims[1] == (uint64_t)total_value) {
+                    int _rows = total_value, _half = _rows / 2;
+                    int _bpr = ((int)ti->dims[0] / 32) * 34;
+                    size_t _total = (size_t)_rows * _bpr;
+                    int hd = cfg->linear_value_dim;  // 128 rows per head
+                    id<MTLBuffer> db = [ctx->device newBufferWithLength:_total options:MTLResourceStorageModeShared];
+                    uint8_t *s = (uint8_t *)[buf contents] + gf->data_offset + ti->offset;
+                    uint8_t *d = (uint8_t *)[db contents];
+                    // Interleave pattern: GGUF row r → ref row (r%_half < _half ? r%(_half) mapped)
+                    // Groups of hd rows. First half: even groups, second half: odd groups.
+                    int heads_per_half = n_v / 2;  // 16
+                    for (int gr = 0; gr < _rows; gr++) {
+                        int half = gr / _half;
+                        int within_half = gr % _half;
+                        int head_idx = within_half / hd;
+                        int pos_in_head = within_half % hd;
+                        int ref_head = head_idx * 2 + half;
+                        int ref_row = ref_head * hd + pos_in_head;
+                        memcpy(d + ref_row * _bpr, s + gr * _bpr, _bpr);
+                    }
+                    QuantFormat fmt = format_from_ggml_type(ti->type);
+                    c->lin.z = (TensorRef){ .buffer = db, .offset = 0,
+                        .pipeline = format_pipeline_for(ctx, fmt),
+                        .format = fmt, .out_dim = (uint32_t)total_value, .in_dim = (uint32_t)H };
+                } else {
+                    c->lin.z = G_REF(name, total_value, H);
+                }
+            }
             // Alpha, beta, A_log, dt_bias: GGUF stores with head-interleaved rows.
             // GGUF order: [head0, head2, head4, ..., head30, head1, head3, ..., head31]
             // De-interleave by building new buffers/tensors with sequential head order.
