@@ -104,6 +104,7 @@ SESSION_NUM=0
 CONSECUTIVE_FAILURES=0
 LOG_DIR="$EXPERIMENT_DIR/logs"
 ERROR_LOG="$EXPERIMENT_DIR/errors.log"
+RESULTS_SCOPE_FILE="$EXPERIMENT_DIR/results_scope.json"
 mkdir -p "$LOG_DIR"
 
 # Trap Ctrl+C gracefully
@@ -157,6 +158,56 @@ if [[ ${#CROSS_CHECKS[@]} -gt 0 ]]; then
 else
     echo "[runner] No cross-model regression checks configured"
 fi
+
+CURRENT_BEST_LABEL=""
+CURRENT_BEST_END_BEFORE_COMMIT=""
+if [[ -f "$RESULTS_SCOPE_FILE" ]]; then
+    CURRENT_BEST_LABEL=$(python3 -c "import json; print(json.load(open('$RESULTS_SCOPE_FILE')).get('current_best_label', ''))")
+    CURRENT_BEST_END_BEFORE_COMMIT=$(python3 -c "import json; print(json.load(open('$RESULTS_SCOPE_FILE')).get('current_best_end_before_commit', ''))")
+fi
+
+best_results_row() {
+    local results_file="$1"
+    local scope_mode="${2:-all}"
+    python3 - "$results_file" "$scope_mode" "$CURRENT_BEST_END_BEFORE_COMMIT" <<'PY'
+import csv
+import sys
+
+path, scope_mode, end_before = sys.argv[1:]
+
+with open(path, newline="") as f:
+    rows = list(csv.DictReader(f, delimiter="\t"))
+
+if scope_mode == "scoped" and end_before:
+    scoped = []
+    found = False
+    for row in rows:
+        if row.get("commit") == end_before:
+            found = True
+            break
+        scoped.append(row)
+    if not found:
+        sys.exit(2)
+    rows = scoped
+
+best = None
+for row in rows:
+    if row.get("status") != "keep":
+        continue
+    try:
+        tok = float(row.get("tok_sec", ""))
+    except ValueError:
+        continue
+    if best is None or tok > best[0]:
+        best = (tok, row)
+
+if best is not None:
+    row = best[1]
+    print("\t".join(row.get(k, "") for k in (
+        "commit", "tok_sec", "ttft_ms", "proj_avg_ms", "status", "description"
+    )))
+PY
+}
 
 run_cross_checks() {
     # Run each cross-model check. Returns 0 if all pass, 1 if any regress.
@@ -349,8 +400,30 @@ $(cat "$EXPERIMENT_DIR/results.tsv")
 
     # Show current best if results exist
     if [[ -f "$EXPERIMENT_DIR/results.tsv" ]]; then
-        BEST=$(grep "keep" "$EXPERIMENT_DIR/results.tsv" 2>/dev/null | sort -t$'\t' -k2 -rn | head -1 || echo "no results yet")
-        echo "[runner] Current best: $BEST"
+        BEST=""
+        if [[ -n "$CURRENT_BEST_END_BEFORE_COMMIT" ]]; then
+            if BEST=$(best_results_row "$EXPERIMENT_DIR/results.tsv" scoped); then
+                if [[ -n "$CURRENT_BEST_LABEL" ]]; then
+                    echo "[runner] Current best (${CURRENT_BEST_LABEL}): $BEST"
+                else
+                    echo "[runner] Current best: $BEST"
+                fi
+            else
+                echo "[runner] WARNING: Could not find scoped results boundary $CURRENT_BEST_END_BEFORE_COMMIT; falling back to all-time history"
+            fi
+        fi
+
+        if [[ -z "$BEST" ]]; then
+            BEST=$(best_results_row "$EXPERIMENT_DIR/results.tsv" all || echo "no results yet")
+            echo "[runner] Current best: $BEST"
+        fi
+
+        if [[ -n "$CURRENT_BEST_END_BEFORE_COMMIT" ]]; then
+            HISTORICAL_BEST=$(best_results_row "$EXPERIMENT_DIR/results.tsv" all || true)
+            if [[ -n "$HISTORICAL_BEST" && "$HISTORICAL_BEST" != "$BEST" ]]; then
+                echo "[runner] Historical context: $HISTORICAL_BEST"
+            fi
+        fi
     fi
 
     # Brief pause between sessions
