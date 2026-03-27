@@ -26,7 +26,7 @@ Secondary goals:
 - Preserve output correctness
 - Do not regress 9B dense or 35B MoE
 
-The benchmark harness includes a chat quality canary. A run is not valid if the visible answer is empty, garbled, or fails the canary keyword check, even if tok/s improves.
+The benchmark harness includes a chat quality canary. A run is not valid if the visible answer is empty, garbled, or otherwise fails the quality gate, even if tok/s improves.
 
 ## Current Baseline
 
@@ -133,6 +133,8 @@ python3 tools/benchmark.py \
    - what worked / failed
    - the next 2-4 best ideas
 10. Continue until interrupted.
+
+The runner owns the final `## Runner Validation` section in `status.md` and normalizes the retained `keep` row in `results.tsv` to the final commit hash after post-session checks. Do not hand-edit that runner-managed section.
 
 ## Results Format
 
