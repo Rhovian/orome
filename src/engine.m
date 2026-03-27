@@ -687,31 +687,8 @@ int engine_step(Engine *eng, int token_id) {
             }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // Gated full-attention Q projections arrive as
-            // [Q_h0, gate_h0, Q_h1, gate_h1, ...] in float space.
-            // De-interleave them at runtime so the later kernels see
-            // [Q_h0.., Q_h1.., gate_h0.., gate_h1..] regardless of weight format.
-            if (tcache[layer].full.q.out_dim == (uint32_t)(n_heads * hd * 2)) {
-                uint hd_u = (uint)hd;
-                uint nh_u = (uint)n_heads;
-                uint count = (uint)tcache[layer].full.q.out_dim;
-                [enc setComputePipelineState:ctx->deinterleave_qgate];
-                [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];
-                [enc setBuffer:ctx->buf_output offset:0 atIndex:1];
-                [enc setBytes:&hd_u length:sizeof(uint) atIndex:2];
-                [enc setBytes:&nh_u length:sizeof(uint) atIndex:3];
-                [enc dispatchThreadgroups:MTLSizeMake(((uint)(n_heads * hd) + 255) / 256, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-                [enc setComputePipelineState:ctx->copy_tmp_to_buf];
-                [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];
-                [enc setBuffer:ctx->buf_output offset:0 atIndex:1];
-                [enc setBytes:&count length:sizeof(uint) atIndex:2];
-                [enc dispatchThreadgroups:MTLSizeMake((count + 255) / 256, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            }
+            // Q+gate weights are de-interleaved at load time, so the matvec
+            // output is already [Q_h0..hN, gate_h0..hN].
 
             // Keep QK RMS norm and RoPE as separate dispatches for now.
             // The fused path introduced in 041860b regressed first-token correctness.

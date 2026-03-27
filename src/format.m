@@ -539,8 +539,33 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
 
             snprintf(name, sizeof(name), "blk.%d.attn_q.weight", i);
             { GGUFTensorInfo *qi = gguf_find_tensor(gf, name);
+              // Gated attention stores Q and gate rows interleaved per head.
+              // Reorder rows at load time using generic per-row tensor bytes so
+              // all quant formats stay on the same fast runtime path.
               int q_out = (qi && qi->n_dims >= 2) ? (int)qi->dims[1] : n_heads * hd;
-              c->full.q = G_REF(name, q_out, H); }
+              if (qi && qi->n_dims >= 2 && q_out == n_heads * hd * 2) {
+                  int rows = q_out;
+                  size_t row_bytes = gguf_tensor_size(qi) / (size_t)rows;
+                  size_t total_bytes = (size_t)rows * row_bytes;
+                  id<MTLBuffer> db = [ctx->device newBufferWithLength:total_bytes
+                                                              options:MTLResourceStorageModeShared];
+                  uint8_t *s = (uint8_t *)[buf contents] + gf->data_offset + qi->offset;
+                  uint8_t *d = (uint8_t *)[db contents];
+                  for (int h = 0; h < n_heads; h++) {
+                      memcpy(d + (size_t)(h * hd) * row_bytes,
+                             s + (size_t)(h * 2 * hd) * row_bytes,
+                             (size_t)hd * row_bytes);
+                      memcpy(d + (size_t)(n_heads * hd + h * hd) * row_bytes,
+                             s + (size_t)(h * 2 * hd + hd) * row_bytes,
+                             (size_t)hd * row_bytes);
+                  }
+                  QuantFormat fmt = format_from_ggml_type(qi->type);
+                  c->full.q = (TensorRef){ .buffer = db, .offset = 0,
+                      .pipeline = format_pipeline_for(ctx, fmt),
+                      .format = fmt, .out_dim = (uint32_t)q_out, .in_dim = (uint32_t)H };
+              } else {
+                  c->full.q = G_REF(name, q_out, H);
+              } }
             snprintf(name, sizeof(name), "blk.%d.attn_k.weight", i);
             c->full.k = G_REF(name, n_kv * hd, H);
             snprintf(name, sizeof(name), "blk.%d.attn_v.weight", i);
