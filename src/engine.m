@@ -48,7 +48,9 @@ Engine *engine_create(ModelConfig *cfg, MetalCtx *ctx, int active_experts) {
     Engine *eng = calloc(1, sizeof(Engine));
     eng->cfg = cfg;
     eng->ctx = ctx;
-    eng->active_experts = active_experts > 0 ? active_experts : cfg->num_experts_per_tok;
+    eng->active_experts = (cfg->ffn_type == FFN_MOE)
+        ? (active_experts > 0 ? active_experts : cfg->num_experts_per_tok)
+        : 0;
     eng->thermal.enabled = false;
     eng->thermal.hot_k = 0;
     eng->thermal.min_gen = 16;
@@ -62,19 +64,20 @@ Engine *engine_create(ModelConfig *cfg, MetalCtx *ctx, int active_experts) {
 
 void engine_free(Engine *eng) {
     if (!eng) return;
+    free(eng->expert_layer_cache);
     free(eng->hidden);
     free(eng);
 }
 
 // Profiling accumulators (reset in engine_reset)
-static double t_attn_total = 0, t_moe_total = 0, t_lmhead_total = 0;
+static double t_attn_total = 0, t_ffn_total = 0, t_lmhead_total = 0;
 static int profile_count = 0;
 
 void engine_reset(Engine *eng) {
     eng->pos = 0;
     thermal_k_reset(&eng->thermal);
     // Reset profile accumulators
-    t_attn_total = 0; t_moe_total = 0; t_lmhead_total = 0;
+    t_attn_total = 0; t_ffn_total = 0; t_lmhead_total = 0;
     profile_count = 0;
 }
 
@@ -82,59 +85,24 @@ void engine_reset(Engine *eng) {
 // Embedding lookup (GGUF format)
 // ============================================================================
 
-// Embedding lookup for GGUF Q8_0 format
-// Q8_0 block: 32 int8 weights + fp16 scale, so one row = H/32 blocks
-static void embed_lookup_gguf(GGUFFile *gf, const ModelConfig *cfg,
-                               int token_id, float *out) {
-    GGUFTensorInfo *ti = gguf_find_tensor(gf, "token_embd.weight");
-    if (!ti) { fprintf(stderr, "ERROR: token_embd.weight not found in GGUF\n"); return; }
-
-    int H = cfg->hidden_dim;
-    uint8_t *data = (uint8_t *)gf->mmap_base + gf->data_offset + ti->offset;
-
-    if (ti->type == 8) { // Q8_0
-        int blocks_per_row = H / 32;
-        int bytes_per_row = blocks_per_row * 34; // 34 bytes per Q8_0 block
-        uint8_t *row = data + (size_t)token_id * bytes_per_row;
-
-        for (int blk = 0; blk < blocks_per_row; blk++) {
-            uint8_t *block = row + blk * 34;
-            uint16_t d_raw = block[0] | ((uint16_t)block[1] << 8);
-            // fp16 to float
-            uint32_t sign = (d_raw >> 15) & 1;
-            uint32_t exp = (d_raw >> 10) & 0x1F;
-            uint32_t mant = d_raw & 0x3FF;
-            float d;
-            if (exp == 0) d = 0.0f;
-            else {
-                uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-                memcpy(&d, &f32, 4);
-            }
-
-            int8_t *qs = (int8_t *)(block + 2);
-            int base = blk * 32;
-            for (int j = 0; j < 32; j++) {
-                out[base + j] = d * (float)qs[j];
-            }
-        }
-    } else if (ti->type == 0) { // F32
-        float *row = (float *)(data + (size_t)token_id * H * sizeof(float));
-        memcpy(out, row, H * sizeof(float));
-    } else if (ti->type == 1) { // F16
-        uint16_t *row = (uint16_t *)(data + (size_t)token_id * H * sizeof(uint16_t));
-        for (int j = 0; j < H; j++) {
-            uint16_t h = row[j];
-            uint32_t sign = (h >> 15) & 1;
-            uint32_t exp = (h >> 10) & 0x1F;
-            uint32_t mant = h & 0x3FF;
-            if (exp == 0) out[j] = 0.0f;
-            else {
-                uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-                memcpy(&out[j], &f32, 4);
-            }
-        }
-    } else {
-        fprintf(stderr, "ERROR: unsupported embedding type %d\n", ti->type);
+static void embed_lookup_tensor(const GlobalTensorCache *globals,
+                                const ModelConfig *cfg,
+                                int token_id, float *out) {
+    TensorRef ref = globals->token_embd.buffer ? globals->token_embd : globals->lm_head;
+    if (!ref.buffer) {
+        fprintf(stderr, "ERROR: token_embd.weight not resolved\n");
+        memset(out, 0, (size_t)cfg->hidden_dim * sizeof(float));
+        return;
+    }
+    if (token_id < 0 || (uint32_t)token_id >= ref.out_dim) {
+        fprintf(stderr, "ERROR: token id %d out of range for embedding rows %u\n",
+                token_id, ref.out_dim);
+        memset(out, 0, (size_t)cfg->hidden_dim * sizeof(float));
+        return;
+    }
+    if (!format_decode_row_f32(&ref, (uint32_t)token_id, out)) {
+        fprintf(stderr, "ERROR: unsupported embedding format %d\n", ref.format);
+        memset(out, 0, (size_t)cfg->hidden_dim * sizeof(float));
     }
 }
 
@@ -337,6 +305,42 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
+static void encode_dense_ffn(id<MTLComputeCommandEncoder> enc,
+                             MetalCtx *ctx, const ModelConfig *cfg,
+                             const LayerTensorCache *lt) {
+    int H = cfg->hidden_dim;
+    int M = cfg->moe_intermediate;
+
+    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_gate,
+        ctx->buf_input, 0, ctx->buf_shared_gate, 0);
+    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_up,
+        ctx->buf_input, 0, ctx->buf_shared_up, 0);
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    [enc setComputePipelineState:ctx->swiglu];
+    [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
+    [enc setBuffer:ctx->buf_shared_up offset:0 atIndex:1];
+    [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:2];
+    { uint dim_val = (uint)M; [enc setBytes:&dim_val length:sizeof(uint) atIndex:3]; }
+    [enc dispatchThreadgroups:MTLSizeMake(((uint)M + 255) / 256, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_down,
+        ctx->buf_shared_act, 0, ctx->buf_h_mid, 0);
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    [enc setComputePipelineState:ctx->residual_add_sq];
+    [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
+    [enc setBuffer:ctx->buf_h_mid offset:0 atIndex:1];
+    [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:2];
+    [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:3];
+    { uint d = (uint)H; [enc setBytes:&d length:sizeof(uint) atIndex:4]; }
+    [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
 // ============================================================================
 // Forward pass: one token
 // ============================================================================
@@ -348,21 +352,22 @@ int engine_step(Engine *eng, int token_id) {
     int H = cfg->hidden_dim;
     int pos = eng->pos;
     double step_start = now_ms();
+    MetalCtx *ctx = eng->ctx;
+    LayerTensorCache *tcache = eng->tensor_cache;
+
+    if (cfg->num_full_attn_layers > 0 &&
+        !metal_ensure_kv_capacity(ctx, cfg, pos + 1)) {
+        fprintf(stderr, "ERROR: KV cache unavailable for token position %d\n", pos);
+        return cfg->eos_tokens[0] >= 0 ? cfg->eos_tokens[0] : 0;
+    }
 
     // 1. Embedding
     memset(eng->hidden, 0, H * sizeof(float));
-    embed_lookup_gguf(eng->gf, cfg, token_id, eng->hidden);
-    if (eng->pos < 2) {
-        fprintf(stderr, "[gguf] embed[%d] first 4: %.6f %.6f %.6f %.6f\n",
-                token_id, eng->hidden[0], eng->hidden[1], eng->hidden[2], eng->hidden[3]);
-    }
+    embed_lookup_tensor(&eng->globals, cfg, token_id, eng->hidden);
 
     // 2. Layer loop — fused O-proj + post-norm + MoE routing in one GPU commit
     int full_idx = 0, linear_idx = 0;
     double t0, t1;
-    MetalCtx *ctx = eng->ctx;
-    LayerTensorCache *tcache = eng->tensor_cache;
-
     // Upload hidden to GPU once before the layer loop.
     // Hidden state stays on GPU (in buf_moe_hidden) throughout all layers.
     memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
@@ -384,11 +389,11 @@ int engine_step(Engine *eng, int token_id) {
             int total_key = cfg->linear_total_key;
             int conv_dim = cfg->linear_conv_dim;
             int n_v_heads = cfg->linear_num_v_heads;
-            int n_k_heads = cfg->linear_num_k_heads;
             int key_dim = cfg->linear_key_dim;
             int value_dim = cfg->linear_value_dim;
 
-            bool skip_copy_norm = (layer > 0 && ctx->moe_combine_copy_sq);
+            bool skip_copy_norm =
+                (cfg->ffn_type == FFN_MOE && layer > 0 && ctx->moe_combine_copy_sq);
             id<MTLComputeCommandEncoder> enc = fwd_enc;
             if (!skip_copy_norm) {
                 [enc setComputePipelineState:ctx->copy_buffer];
@@ -488,7 +493,7 @@ int engine_step(Engine *eng, int token_id) {
             // --- Phase D+F: GatedDeltaNet with fused QK RMS norm ---
             // QK norm is now computed inline within delta_net's shared memory loading.
             // Q/K from buf_conv_output (raw, pre-norm), V at offset 2*total_key
-            { uint k_per_v = (uint)(n_v_heads / n_k_heads);
+            { uint num_k_heads = (uint)cfg->linear_num_k_heads;
               float inv_s = 1.0f / sqrtf((float)key_dim);
             [enc setComputePipelineState:ctx->delta_net];
             [enc setBuffer:ctx->buf_linear_state[linear_idx] offset:0 atIndex:0];
@@ -498,7 +503,7 @@ int engine_step(Engine *eng, int token_id) {
             [enc setBuffer:ctx->buf_linear_decay offset:0 atIndex:4];
             [enc setBuffer:ctx->buf_linear_beta offset:0 atIndex:5];
             [enc setBuffer:ctx->buf_linear_v offset:0 atIndex:6];  // output
-            [enc setBytes:&k_per_v length:sizeof(uint) atIndex:7];
+            [enc setBytes:&num_k_heads length:sizeof(uint) atIndex:7];
             [enc setBytes:&inv_s length:sizeof(float) atIndex:8];
             [enc dispatchThreadgroups:MTLSizeMake(n_v_heads, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(value_dim, 1, 1)]; }
@@ -524,29 +529,6 @@ int engine_step(Engine *eng, int token_id) {
             format_dispatch_matvec(enc, ctx, (TensorRef *)&tcache[layer].lin.o,
                 ctx->buf_linear_q, 0, ctx->buf_h_mid, 0);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-            // DIAG: all phase outputs for layer 0
-            if (eng->pos == 0 && layer == 0) {
-                [enc endEncoding]; [fwd_cmd commit]; [fwd_cmd waitUntilCompleted];
-                float *co = (float *)[ctx->buf_conv_output contents];
-                float *dout = (float *)[ctx->buf_linear_v contents];
-                float *gn = (float *)[ctx->buf_linear_q contents];
-                float *op = (float *)[ctx->buf_h_mid contents];
-                float cmx=0, dmx=0, gmx=0, omx=0;
-                int tv = n_v_heads * value_dim;
-                for (int i=0;i<conv_dim;i++) { float a=fabsf(co[i]); if(a>cmx) cmx=a; }
-                for (int i=0;i<tv;i++) { float a=fabsf(dout[i]); if(a>dmx) dmx=a; }
-                for (int i=0;i<tv;i++) { float a=fabsf(gn[i]); if(a>gmx) gmx=a; }
-                for (int i=0;i<H;i++) { float a=fabsf(op[i]); if(a>omx) omx=a; }
-                float gsum=0, osum=0;
-                for (int i=0;i<tv;i++) gsum+=fabsf(gn[i]);
-                for (int i=0;i<H;i++) osum+=fabsf(op[i]);
-                fprintf(stderr, "[L0] conv=%.4f delta=%.6f gated=%.4f(mean=%.6f) oproj=%.4f(mean=%.6f)\n",
-                        cmx, dmx, gmx, gsum/tv, omx, osum/H);
-                fwd_cmd = [ctx->queue commandBuffer];
-                fwd_enc = [fwd_cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-                enc = fwd_enc;
-            }
             // --- Phase I+J: Fused residual add + sum_sq → buf_moe_hidden ---
             { uint num_tgs = ((uint)H + 255) / 256;
             [enc setComputePipelineState:ctx->residual_add_sq];
@@ -576,42 +558,50 @@ int engine_step(Engine *eng, int token_id) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
 
 
-            // --- Phase K: MoE routing + shared expert projections ---
-            { size_t sgg_off = n_experts * sizeof(float);
-                const LayerTensorCache *lt = &tcache[layer];
-                bool fuse_routing_shared_gate =
-                    ctx->matvec_f32_pair
-                    && lt->routing_gate.format == QFMT_F32
-                    && lt->shared_expert_gate.format == QFMT_F32
-                    && lt->routing_gate.out_dim == (uint32_t)n_experts
-                    && lt->shared_expert_gate.out_dim == 1
-                    && lt->routing_gate.in_dim == lt->shared_expert_gate.in_dim;
-                if (fuse_routing_shared_gate) {
-                    uint od = (uint)lt->routing_gate.out_dim;
-                    uint id_ = (uint)lt->routing_gate.in_dim;
-                    NSUInteger num_tgs = (od + 1 + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
-                    [enc setComputePipelineState:ctx->matvec_f32_pair];
-                    [enc setBuffer:lt->routing_gate.buffer offset:lt->routing_gate.offset atIndex:0];
-                    [enc setBuffer:lt->shared_expert_gate.buffer offset:lt->shared_expert_gate.offset atIndex:1];
-                    [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
-                    [enc setBuffer:ctx->buf_output offset:0 atIndex:3];
-                    [enc setBytes:&od length:sizeof(uint) atIndex:4];
-                    [enc setBytes:&id_ length:sizeof(uint) atIndex:5];
-                    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(ENGINE_ROWS_PER_TG * 32, 1, 1)];
-                } else {
-                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->routing_gate,
-                        ctx->buf_input, 0, ctx->buf_output, 0);
-                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_expert_gate,
-                        ctx->buf_input, 0, ctx->buf_output, sgg_off);
+            if (cfg->ffn_type == FFN_MOE) {
+                // --- Phase K: MoE routing + shared expert projections ---
+                { size_t sgg_off = n_experts * sizeof(float);
+                    const LayerTensorCache *lt = &tcache[layer];
+                    bool fuse_routing_shared_gate =
+                        ctx->matvec_f32_pair
+                        && lt->routing_gate.format == QFMT_F32
+                        && lt->shared_expert_gate.format == QFMT_F32
+                        && lt->routing_gate.out_dim == (uint32_t)n_experts
+                        && lt->shared_expert_gate.out_dim == 1
+                        && lt->routing_gate.in_dim == lt->shared_expert_gate.in_dim;
+                    if (fuse_routing_shared_gate) {
+                        uint od = (uint)lt->routing_gate.out_dim;
+                        uint id_ = (uint)lt->routing_gate.in_dim;
+                        NSUInteger num_tgs = (od + 1 + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
+                        [enc setComputePipelineState:ctx->matvec_f32_pair];
+                        [enc setBuffer:lt->routing_gate.buffer offset:lt->routing_gate.offset atIndex:0];
+                        [enc setBuffer:lt->shared_expert_gate.buffer offset:lt->shared_expert_gate.offset atIndex:1];
+                        [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
+                        [enc setBuffer:ctx->buf_output offset:0 atIndex:3];
+                        [enc setBytes:&od length:sizeof(uint) atIndex:4];
+                        [enc setBytes:&id_ length:sizeof(uint) atIndex:5];
+                        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(ENGINE_ROWS_PER_TG * 32, 1, 1)];
+                    } else {
+                        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->routing_gate,
+                            ctx->buf_input, 0, ctx->buf_output, 0);
+                        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_expert_gate,
+                            ctx->buf_input, 0, ctx->buf_output, sgg_off);
+                    }
+                    // GPU-resident expert forward
+                    double ffn_t0 = now_ms();
+                    encode_experts_gguf(enc, ctx, cfg,
+                                        &eng->expert_layer_cache[layer],
+                                        &tcache[layer], effective_k);
+                    t1 = now_ms();
+                    t_ffn_total += t1 - ffn_t0;
+                    t_attn_total += t1 - t0;
                 }
-                // GPU-resident expert forward
-                double moe_t0 = now_ms();
-                encode_experts_gguf(enc, ctx, cfg,
-                                    &eng->expert_layer_cache[layer],
-                                    &tcache[layer], effective_k);
+            } else {
+                double ffn_t0 = now_ms();
+                encode_dense_ffn(enc, ctx, cfg, &tcache[layer]);
                 t1 = now_ms();
-                t_moe_total += t1 - moe_t0;
+                t_ffn_total += t1 - ffn_t0;
                 t_attn_total += t1 - t0;
             }
 
@@ -632,7 +622,8 @@ int engine_step(Engine *eng, int token_id) {
             int kv_dim = cfg->kv_dim;
             int seq_len = pos + 1;
 
-            bool skip_copy_norm = (layer > 0 && ctx->moe_combine_copy_sq);
+            bool skip_copy_norm =
+                (cfg->ffn_type == FFN_MOE && layer > 0 && ctx->moe_combine_copy_sq);
             id<MTLComputeCommandEncoder> enc = fwd_enc;
             if (!skip_copy_norm) {
                 [enc setComputePipelineState:ctx->copy_buffer];
@@ -697,7 +688,7 @@ int engine_step(Engine *eng, int token_id) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // Q+gate weights are de-interleaved at load time, so the matvec
-            // output is already [Q_h0..h15, gate_h0..h15]. No runtime permutation needed.
+            // output is already [Q_h0..hN, gate_h0..hN].
 
             // Keep QK RMS norm and RoPE as separate dispatches for now.
             // The fused path introduced in 041860b regressed first-token correctness.
@@ -758,9 +749,9 @@ int engine_step(Engine *eng, int token_id) {
             [enc setBuffer:ctx->buf_kv_k[full_idx] offset:0 atIndex:1];
             [enc setBuffer:ctx->buf_attn_scores offset:0 atIndex:2];
             { uint hd_val = (uint)hd, kvd = (uint)kv_dim;
-              uint sl = (uint)seq_len, ss = (uint)OROME_GPU_KV_SEQ;
+              uint sl = (uint)seq_len, ss = (uint)ctx->kv_cache_seq;
               float scale = 1.0f;  // already scaled in QK norm
-              uint hpk = (uint)(n_heads / n_kv);
+              uint hpk = (uint)cfg->q_heads_per_kv;
               uint nst = (uint)seq_len;
               [enc setBytes:&hd_val length:sizeof(uint) atIndex:3];
               [enc setBytes:&kvd length:sizeof(uint) atIndex:4];
@@ -776,7 +767,7 @@ int engine_step(Engine *eng, int token_id) {
             // --- Phase G: Softmax ---
             [enc setComputePipelineState:ctx->attn_softmax];
             [enc setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];
-            { uint sl = (uint)seq_len, ss = (uint)OROME_GPU_KV_SEQ;
+            { uint sl = (uint)seq_len, ss = (uint)ctx->kv_cache_seq;
               [enc setBytes:&sl length:sizeof(uint) atIndex:1];
               [enc setBytes:&ss length:sizeof(uint) atIndex:2]; }
             [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
@@ -790,8 +781,8 @@ int engine_step(Engine *eng, int token_id) {
             [enc setBuffer:ctx->buf_kv_v[full_idx] offset:0 atIndex:1];
             [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:2];
             { uint hd_val = (uint)hd, kvd = (uint)kv_dim;
-              uint sl = (uint)seq_len, ss = (uint)OROME_GPU_KV_SEQ;
-              uint hpk = (uint)(n_heads / n_kv);
+              uint sl = (uint)seq_len, ss = (uint)ctx->kv_cache_seq;
+              uint hpk = (uint)cfg->q_heads_per_kv;
               [enc setBytes:&hd_val length:sizeof(uint) atIndex:3];
               [enc setBytes:&kvd length:sizeof(uint) atIndex:4];
               [enc setBytes:&sl length:sizeof(uint) atIndex:5];
@@ -836,42 +827,50 @@ int engine_step(Engine *eng, int token_id) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
 
 
-            // --- Phase L: MoE routing + shared expert projections ---
-            { size_t sgg_off = n_experts * sizeof(float);
-                const LayerTensorCache *lt = &tcache[layer];
-                bool fuse_routing_shared_gate =
-                    ctx->matvec_f32_pair
-                    && lt->routing_gate.format == QFMT_F32
-                    && lt->shared_expert_gate.format == QFMT_F32
-                    && lt->routing_gate.out_dim == (uint32_t)n_experts
-                    && lt->shared_expert_gate.out_dim == 1
-                    && lt->routing_gate.in_dim == lt->shared_expert_gate.in_dim;
-                if (fuse_routing_shared_gate) {
-                    uint od = (uint)lt->routing_gate.out_dim;
-                    uint id_ = (uint)lt->routing_gate.in_dim;
-                    NSUInteger num_tgs = (od + 1 + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
-                    [enc setComputePipelineState:ctx->matvec_f32_pair];
-                    [enc setBuffer:lt->routing_gate.buffer offset:lt->routing_gate.offset atIndex:0];
-                    [enc setBuffer:lt->shared_expert_gate.buffer offset:lt->shared_expert_gate.offset atIndex:1];
-                    [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
-                    [enc setBuffer:ctx->buf_output offset:0 atIndex:3];
-                    [enc setBytes:&od length:sizeof(uint) atIndex:4];
-                    [enc setBytes:&id_ length:sizeof(uint) atIndex:5];
-                    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(ENGINE_ROWS_PER_TG * 32, 1, 1)];
-                } else {
-                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->routing_gate,
-                        ctx->buf_input, 0, ctx->buf_output, 0);
-                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_expert_gate,
-                        ctx->buf_input, 0, ctx->buf_output, sgg_off);
+            if (cfg->ffn_type == FFN_MOE) {
+                // --- Phase L: MoE routing + shared expert projections ---
+                { size_t sgg_off = n_experts * sizeof(float);
+                    const LayerTensorCache *lt = &tcache[layer];
+                    bool fuse_routing_shared_gate =
+                        ctx->matvec_f32_pair
+                        && lt->routing_gate.format == QFMT_F32
+                        && lt->shared_expert_gate.format == QFMT_F32
+                        && lt->routing_gate.out_dim == (uint32_t)n_experts
+                        && lt->shared_expert_gate.out_dim == 1
+                        && lt->routing_gate.in_dim == lt->shared_expert_gate.in_dim;
+                    if (fuse_routing_shared_gate) {
+                        uint od = (uint)lt->routing_gate.out_dim;
+                        uint id_ = (uint)lt->routing_gate.in_dim;
+                        NSUInteger num_tgs = (od + 1 + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
+                        [enc setComputePipelineState:ctx->matvec_f32_pair];
+                        [enc setBuffer:lt->routing_gate.buffer offset:lt->routing_gate.offset atIndex:0];
+                        [enc setBuffer:lt->shared_expert_gate.buffer offset:lt->shared_expert_gate.offset atIndex:1];
+                        [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
+                        [enc setBuffer:ctx->buf_output offset:0 atIndex:3];
+                        [enc setBytes:&od length:sizeof(uint) atIndex:4];
+                        [enc setBytes:&id_ length:sizeof(uint) atIndex:5];
+                        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(ENGINE_ROWS_PER_TG * 32, 1, 1)];
+                    } else {
+                        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->routing_gate,
+                            ctx->buf_input, 0, ctx->buf_output, 0);
+                        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_expert_gate,
+                            ctx->buf_input, 0, ctx->buf_output, sgg_off);
+                    }
+                    // GPU-resident expert forward
+                    double ffn_t0 = now_ms();
+                    encode_experts_gguf(enc, ctx, cfg,
+                                        &eng->expert_layer_cache[layer],
+                                        &tcache[layer], effective_k);
+                    t1 = now_ms();
+                    t_ffn_total += t1 - ffn_t0;
+                    t_attn_total += t1 - t0;
                 }
-                // GPU-resident expert forward
-                double moe_t0 = now_ms();
-                encode_experts_gguf(enc, ctx, cfg,
-                                    &eng->expert_layer_cache[layer],
-                                    &tcache[layer], effective_k);
+            } else {
+                double ffn_t0 = now_ms();
+                encode_dense_ffn(enc, ctx, cfg, &tcache[layer]);
                 t1 = now_ms();
-                t_moe_total += t1 - moe_t0;
+                t_ffn_total += t1 - ffn_t0;
                 t_attn_total += t1 - t0;
             }
 
@@ -960,9 +959,9 @@ int engine_step(Engine *eng, int token_id) {
     // Print profile every 10 tokens
     if (profile_count % 10 == 0) {
         double inv = 1.0 / profile_count;
-        double attn_only = t_attn_total - t_moe_total;
-        fprintf(stderr, "[profile] avg/tok: attn=%.1fms moe=%.1fms lmhead=%.1fms\n",
-                attn_only * inv, t_moe_total * inv, t_lmhead_total * inv);
+        double attn_only = t_attn_total - t_ffn_total;
+        fprintf(stderr, "[profile] avg/tok: attn=%.1fms ffn=%.1fms lmhead=%.1fms\n",
+                attn_only * inv, t_ffn_total * inv, t_lmhead_total * inv);
     }
 
     double step_ms = now_ms() - step_start;

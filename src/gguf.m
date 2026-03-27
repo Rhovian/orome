@@ -318,6 +318,8 @@ GGUFFile *gguf_open(const char *path) {
     gf->mmap_base = mapped;
     gf->file_size = file_size;
     gf->num_tensors = tensor_count;
+    gf->eos_token_id = -1;
+    gf->padding_token_id = -1;
     gf->alignment = 32; // default
     gf->tensors = calloc(tensor_count, sizeof(GGUFTensorInfo));
 
@@ -351,6 +353,8 @@ GGUFFile *gguf_open(const char *path) {
                 const char *field = key + plen;
                 if (strcmp(field, "block_count") == 0) {
                     gf->num_layers = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "context_length") == 0) {
+                    gf->context_length = (int)read_value_uint(&r, vtype);
                 } else if (strcmp(field, "embedding_length") == 0) {
                     gf->hidden_dim = (int)read_value_uint(&r, vtype);
                 } else if (strcmp(field, "expert_count") == 0) {
@@ -363,16 +367,44 @@ GGUFFile *gguf_open(const char *path) {
                     gf->num_attn_heads = (int)read_value_uint(&r, vtype);
                 } else if (strcmp(field, "attention.head_count_kv") == 0) {
                     gf->num_kv_heads = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "attention.key_length") == 0) {
+                    gf->attn_key_length = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "attention.value_length") == 0) {
+                    gf->attn_value_length = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "attention.layer_norm_rms_epsilon") == 0) {
+                    gf->rms_norm_eps = read_value_float(&r, vtype);
                 } else if (strcmp(field, "rope.freq_base") == 0) {
                     gf->rope_theta = read_value_float(&r, vtype);
+                } else if (strcmp(field, "rope.dimension_count") == 0) {
+                    gf->rope_dimension_count = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "ssm.conv_kernel") == 0) {
+                    gf->ssm_conv_kernel = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "ssm.state_size") == 0) {
+                    gf->ssm_state_size = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "ssm.group_count") == 0) {
+                    gf->ssm_group_count = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "ssm.time_step_rank") == 0) {
+                    gf->ssm_time_step_rank = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "ssm.inner_size") == 0) {
+                    gf->ssm_inner_size = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "full_attention_interval") == 0) {
+                    gf->full_attention_interval = (int)read_value_uint(&r, vtype);
                 } else if (strcmp(field, "vocab_size") == 0) {
                     gf->vocab_size = (int)read_value_uint(&r, vtype);
                 } else {
                     skip_value(&r, vtype);
                 }
             } else if (strncmp(key, "tokenizer.", 10) == 0) {
-                // Tokenizer metadata — skip for now
-                skip_value(&r, vtype);
+                if (strcmp(key, "tokenizer.ggml.eos_token_id") == 0) {
+                    gf->eos_token_id = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(key, "tokenizer.ggml.padding_token_id") == 0) {
+                    gf->padding_token_id = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(key, "tokenizer.chat_template") == 0) {
+                    gf->chat_template = read_string(&r);
+                } else {
+                    // Tokenizer metadata — skip for now
+                    skip_value(&r, vtype);
+                }
             } else if (strncmp(key, "general.", 8) == 0) {
                 skip_value(&r, vtype);
             } else {
@@ -405,6 +437,24 @@ GGUFFile *gguf_open(const char *path) {
         }
     }
 
+    bool has_moe_tensors = false;
+    bool has_dense_ffn_tensors = false;
+    for (uint64_t i = 0; i < tensor_count; i++) {
+        const char *name = gf->tensors[i].name;
+        if (!name) continue;
+        if (strstr(name, "ffn_gate_exps") || strstr(name, "ffn_up_exps") ||
+            strstr(name, "ffn_down_exps")) {
+            has_moe_tensors = true;
+        } else if (strstr(name, ".ffn_gate.weight") ||
+                   strstr(name, ".ffn_up.weight") ||
+                   strstr(name, ".ffn_down.weight")) {
+            has_dense_ffn_tensors = true;
+        }
+    }
+    if (has_moe_tensors) gf->ffn_type = FFN_MOE;
+    else if (has_dense_ffn_tensors) gf->ffn_type = FFN_DENSE;
+    else gf->ffn_type = gf->num_experts > 0 ? FFN_MOE : FFN_DENSE;
+
     // Infer vocab_size from embedding tensor shape if not in metadata
     if (gf->vocab_size == 0) {
         for (uint64_t i = 0; i < tensor_count; i++) {
@@ -423,22 +473,38 @@ GGUFFile *gguf_open(const char *path) {
 
     // Infer moe_intermediate from tensor shapes if not in metadata
     if (gf->moe_intermediate == 0) {
-        for (uint64_t i = 0; i < tensor_count; i++) {
-            if (gf->tensors[i].name && strstr(gf->tensors[i].name, "ffn_gate_exps")) {
-                for (uint32_t d = 0; d < gf->tensors[i].n_dims; d++) {
-                    uint64_t dim = gf->tensors[i].dims[d];
+        for (uint64_t i = 0; i < tensor_count && gf->moe_intermediate == 0; i++) {
+            const GGUFTensorInfo *ti = &gf->tensors[i];
+            if (!ti->name) continue;
+
+            if (gf->ffn_type == FFN_MOE) {
+                if (!strstr(ti->name, "ffn_gate_exps")) continue;
+                for (uint32_t d = 0; d < ti->n_dims; d++) {
+                    uint64_t dim = ti->dims[d];
                     if (dim != (uint64_t)gf->hidden_dim && dim != (uint64_t)gf->num_experts) {
                         gf->moe_intermediate = (int)dim;
                         break;
                     }
                 }
-                break;
+            } else {
+                if (!strstr(ti->name, ".ffn_gate.weight") &&
+                    !strstr(ti->name, ".ffn_up.weight")) {
+                    continue;
+                }
+                for (uint32_t d = 0; d < ti->n_dims; d++) {
+                    uint64_t dim = ti->dims[d];
+                    if (dim != (uint64_t)gf->hidden_dim) {
+                        gf->moe_intermediate = (int)dim;
+                        break;
+                    }
+                }
             }
         }
     }
 
-    fprintf(stderr, "[gguf] arch=%s layers=%d hidden=%d experts=%d K=%d intermediate=%d vocab=%d\n",
+    fprintf(stderr, "[gguf] arch=%s layers=%d hidden=%d ffn=%s experts=%d K=%d intermediate=%d vocab=%d\n",
             gf->arch, gf->num_layers, gf->hidden_dim,
+            gf->ffn_type == FFN_MOE ? "moe" : "dense",
             gf->num_experts, gf->num_experts_per_tok, gf->moe_intermediate, gf->vocab_size);
 
     // Compute data_offset: current position, aligned up to alignment
@@ -455,6 +521,7 @@ void gguf_close(GGUFFile *gf) {
     if (!gf) return;
     if (gf->mmap_base) munmap(gf->mmap_base, gf->file_size);
     if (gf->fd >= 0) close(gf->fd);
+    free(gf->chat_template);
     for (uint64_t i = 0; i < gf->num_tensors; i++) {
         free(gf->tensors[i].name);
     }
@@ -567,10 +634,28 @@ void model_config_init_derived(ModelConfig *cfg) {
     cfg->linear_total_value = cfg->linear_num_v_heads * cfg->linear_value_dim;
     cfg->linear_conv_dim = cfg->linear_total_key * 2 + cfg->linear_total_value;
     cfg->kv_dim = cfg->num_kv_heads * cfg->head_dim;
+    cfg->q_heads_per_kv =
+        (cfg->num_kv_heads > 0 && cfg->num_attn_heads % cfg->num_kv_heads == 0)
+        ? (cfg->num_attn_heads / cfg->num_kv_heads)
+        : 0;
+    cfg->linear_v_heads_per_k =
+        (cfg->linear_num_k_heads > 0 && cfg->linear_num_v_heads % cfg->linear_num_k_heads == 0)
+        ? (cfg->linear_num_v_heads / cfg->linear_num_k_heads)
+        : 0;
+
+    if (cfg->layer_types) {
+        int full_count = 0, lin_count = 0;
+        for (int i = 0; i < cfg->num_layers; i++) {
+            if (cfg->layer_types[i] == ATTN_FULL) full_count++;
+            else lin_count++;
+        }
+        cfg->num_full_attn_layers = full_count;
+        cfg->num_linear_layers = lin_count;
+        return;
+    }
 
     // Layer type array from full_attn_interval and full_attn_offset
     if (cfg->full_attn_interval > 0) {
-        if (cfg->layer_types) free(cfg->layer_types);
         cfg->layer_types = calloc(cfg->num_layers, sizeof(AttnLayerType));
         int full_count = 0, lin_count = 0;
         for (int i = 0; i < cfg->num_layers; i++) {

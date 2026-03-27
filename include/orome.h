@@ -27,7 +27,6 @@ typedef struct GGUFTensorInfo GGUFTensorInfo;
 // ============================================================================
 
 #define OROME_MAX_ACTIVE        16      // max active experts per token
-#define OROME_GPU_KV_SEQ        4096    // GPU-side KV cache for attention offload
 
 // ============================================================================
 // Attention layer type
@@ -37,6 +36,11 @@ typedef enum {
     ATTN_FULL,          // Standard grouped-query attention (Q/K/V + RoPE + softmax)
     ATTN_LINEAR,        // GatedDeltaNet (linear attention with SSM-style state)
 } AttnLayerType;
+
+typedef enum {
+    FFN_MOE,            // Routed experts + shared expert
+    FFN_DENSE,          // Standard dense SwiGLU FFN
+} FFNType;
 
 // ============================================================================
 // Model configuration — everything that varies between models
@@ -50,6 +54,7 @@ typedef struct {
     int hidden_dim;             // e.g. 2048
     int num_layers;             // e.g. 40
     int vocab_size;             // e.g. 248320
+    int context_length;         // max context length advertised by the model
     float rms_norm_eps;         // e.g. 1e-6
 
     // --- Full attention ---
@@ -76,20 +81,27 @@ typedef struct {
     float partial_rotary;       // fraction of head_dim that gets rotary, e.g. 0.25
     int rotary_dim;             // derived: head_dim * partial_rotary
 
-    // --- MoE ---
-    int num_experts;            // e.g. 256
-    int num_experts_per_tok;    // default active experts, e.g. 8
-    int moe_intermediate;       // expert FFN hidden dim, e.g. 512
+    // --- Feed-forward block ---
+    FFNType ffn_type;           // MoE for 35B-A3B, dense for 9B
+    int num_experts;            // e.g. 256 for MoE, 0 for dense
+    int num_experts_per_tok;    // default active experts, e.g. 8, 0 for dense
+    int moe_intermediate;       // FFN hidden dim (expert dim for MoE, intermediate dim for dense)
     int shared_intermediate;    // shared expert FFN hidden dim, e.g. 512
     // --- Special tokens ---
     int eos_tokens[4];          // EOS token IDs (up to 4, -1 terminated)
+    int chat_start_token;
+    int chat_end_token;
+    int think_start_token;
     int think_end_token;
+    bool chat_prefill_think;
 
     // --- Derived (computed during init) ---
     int linear_total_key;       // linear_num_k_heads * linear_key_dim
     int linear_total_value;     // linear_num_v_heads * linear_value_dim
     int linear_conv_dim;        // total_key*2 + total_value
     int kv_dim;                 // num_kv_heads * head_dim
+    int q_heads_per_kv;         // derived grouped-query ratio
+    int linear_v_heads_per_k;   // derived linear-attention sharing ratio
 } ModelConfig;
 
 // Compute derived fields and expert layouts from the core fields.
@@ -103,6 +115,7 @@ typedef struct {
     id<MTLDevice>               device;
     id<MTLCommandQueue>         queue;
     id<MTLLibrary>              library;
+    int                         kv_cache_seq;
 
     // Pipelines
     id<MTLComputePipelineState> norm_sum_sq;
@@ -188,6 +201,7 @@ typedef struct {
 } MetalCtx;
 
 MetalCtx *metal_setup(const ModelConfig *cfg);
+bool      metal_ensure_kv_capacity(MetalCtx *ctx, const ModelConfig *cfg, int seq_len);
 void metal_free(MetalCtx *ctx);
 
 // ============================================================================
@@ -244,6 +258,9 @@ typedef struct {
     TensorRef shared_up;        // shared expert up projection
     TensorRef shared_down;      // shared expert down projection
     TensorRef shared_expert_gate; // scalar gate for shared expert
+    TensorRef dense_gate;       // dense SwiGLU gate projection
+    TensorRef dense_up;         // dense SwiGLU up projection
+    TensorRef dense_down;       // dense SwiGLU down projection
     union {
         struct {
             TensorRef qkv;      // fused Q+K+V projection
@@ -267,6 +284,7 @@ typedef struct {
 
 // Global (non-per-layer) tensor refs
 typedef struct {
+    TensorRef token_embd;       // input embedding lookup
     TensorRef lm_head;          // final projection
     TensorRef final_norm;       // final RMS norm
 } GlobalTensorCache;
@@ -288,6 +306,7 @@ void              format_dispatch_matvec(id<MTLComputeCommandEncoder> enc,
                                          id<MTLBuffer> out_buf, size_t out_off);
 id<MTLComputePipelineState> format_pipeline_for(MetalCtx *ctx, QuantFormat fmt);
 QuantFormat       format_from_ggml_type(uint32_t ggml_type);
+bool              format_decode_row_f32(TensorRef *ref, uint32_t row_idx, float *out);
 
 // Timing
 double now_ms(void);
@@ -347,6 +366,8 @@ typedef struct {
 int           tokenizer_init(const char *model_dir);
 PromptTokens *tokenizer_encode(const char *text);
 const char   *tokenizer_decode(int token_id);
+int           tokenizer_find_token(const char *text);
+int           tokenizer_find_added_tokens_in_text(const char *text, int *ids, int max_ids);
 void          prompt_tokens_free(PromptTokens *pt);
 
 bool          is_eos_token(const ModelConfig *cfg, int token_id);
@@ -379,9 +400,19 @@ struct GGUFFile {
     uint32_t alignment;
     // Extracted model config from metadata
     char arch[32];
+    FFNType ffn_type;
     int num_layers, hidden_dim, num_experts, num_experts_per_tok;
     int num_attn_heads, num_kv_heads, moe_intermediate;
+    int context_length;
+    int attn_key_length, attn_value_length;
+    int rope_dimension_count;
+    int ssm_conv_kernel, ssm_state_size, ssm_group_count;
+    int ssm_time_step_rank, ssm_inner_size;
+    int full_attention_interval;
+    int eos_token_id, padding_token_id;
+    char *chat_template;
     float rope_theta;
+    float rms_norm_eps;
     int vocab_size;
 };
 
