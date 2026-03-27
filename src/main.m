@@ -126,9 +126,10 @@ int main(int argc, char **argv) {
             cfg.num_attn_heads = gf->num_attn_heads;
             cfg.num_kv_heads = gf->num_kv_heads;
             cfg.rope_theta = gf->rope_theta > 0 ? gf->rope_theta : 1000000.0f;
+            cfg.rms_norm_eps = gf->rms_norm_eps > 0 ? gf->rms_norm_eps : 1e-6f;
 
-            // Derive head_dim from K tensor shape (more reliable than Q since Q may be gated)
-            cfg.head_dim = 0;
+            // Prefer GGUF metadata for attention geometry, fall back to tensor shapes.
+            cfg.head_dim = gf->attn_key_length;
             for (int i = 0; i < cfg.num_layers && cfg.head_dim == 0; i++) {
                 char kname[128];
                 snprintf(kname, sizeof(kname), "blk.%d.attn_k.weight", i);
@@ -162,36 +163,40 @@ int main(int argc, char **argv) {
                     cfg.num_full_attn_layers, cfg.num_linear_layers);
 
             // Linear attention params — infer from GGUF tensor shapes
-            cfg.linear_key_dim = 128;
-            cfg.linear_value_dim = 128;
-            cfg.partial_rotary = 0.25;
-            cfg.conv_kernel_size = 4;
-            cfg.rms_norm_eps = 1e-6f;
-            // attn_qkv output dim = v_heads*(key+value) + k_heads*key
-            // For Qwen3.5: qkv_dim = v_heads*256 + k_heads*128
-            // We know k_heads from metadata (num_kv_heads for linear layers can differ)
-            // Infer from attn_qkv tensor shape
-            {
-                char tname[128];
-                // Find first linear attention layer — derive v_heads and k_heads from tensor shapes
+            cfg.linear_key_dim = gf->ssm_state_size > 0 ? gf->ssm_state_size : 128;
+            cfg.linear_num_k_heads = gf->ssm_group_count;
+            cfg.linear_num_v_heads = gf->ssm_time_step_rank;
+            cfg.linear_value_dim =
+                (gf->ssm_inner_size > 0 && gf->ssm_time_step_rank > 0)
+                ? (gf->ssm_inner_size / gf->ssm_time_step_rank)
+                : 128;
+            cfg.partial_rotary =
+                (gf->rope_dimension_count > 0 && cfg.head_dim > 0)
+                ? ((float)gf->rope_dimension_count / (float)cfg.head_dim)
+                : 0.25f;
+            cfg.conv_kernel_size = gf->ssm_conv_kernel > 0 ? gf->ssm_conv_kernel : 4;
+
+            if (cfg.linear_num_v_heads <= 0 || cfg.linear_num_k_heads <= 0 || cfg.linear_value_dim <= 0) {
+                // Fall back to tensor shapes when the GGUF lacks explicit SSM metadata.
                 for (int i = 0; i < cfg.num_layers; i++) {
-                    if (cfg.layer_types[i] == ATTN_LINEAR) {
-                        // alpha tensor has dims[1] = v_heads
-                        snprintf(tname, sizeof(tname), "blk.%d.ssm_alpha.weight", i);
-                        GGUFTensorInfo *alpha_ti = gguf_find_tensor(gf, tname);
-                        snprintf(tname, sizeof(tname), "blk.%d.attn_qkv.weight", i);
-                        GGUFTensorInfo *qkv_ti = gguf_find_tensor(gf, tname);
-                        if (alpha_ti && alpha_ti->n_dims >= 2 && qkv_ti && qkv_ti->n_dims >= 2) {
-                            int qkv_dim = (int)qkv_ti->dims[1];
-                            cfg.linear_num_v_heads = (int)alpha_ti->dims[1];
-                            // conv_dim = 2 * k_heads * key_dim + v_heads * value_dim
-                            cfg.linear_num_k_heads = (qkv_dim - cfg.linear_num_v_heads * cfg.linear_value_dim)
-                                                   / (2 * cfg.linear_key_dim);
-                            fprintf(stderr, "[main] GGUF linear attn: qkv_dim=%d v_heads=%d k_heads=%d\n",
-                                    qkv_dim, cfg.linear_num_v_heads, cfg.linear_num_k_heads);
-                        }
-                        break;
+                    if (cfg.layer_types[i] != ATTN_LINEAR) continue;
+
+                    char alpha_name[128];
+                    char qkv_name[128];
+                    snprintf(alpha_name, sizeof(alpha_name), "blk.%d.ssm_alpha.weight", i);
+                    snprintf(qkv_name, sizeof(qkv_name), "blk.%d.attn_qkv.weight", i);
+
+                    GGUFTensorInfo *alpha_ti = gguf_find_tensor(gf, alpha_name);
+                    GGUFTensorInfo *qkv_ti = gguf_find_tensor(gf, qkv_name);
+                    if (alpha_ti && alpha_ti->n_dims >= 2 && qkv_ti && qkv_ti->n_dims >= 2) {
+                        int qkv_dim = (int)qkv_ti->dims[1];
+                        cfg.linear_num_v_heads = (int)alpha_ti->dims[1];
+                        cfg.linear_num_k_heads = (qkv_dim - cfg.linear_num_v_heads * cfg.linear_value_dim)
+                                               / (2 * cfg.linear_key_dim);
+                        fprintf(stderr, "[main] GGUF linear attn: qkv_dim=%d v_heads=%d k_heads=%d\n",
+                                qkv_dim, cfg.linear_num_v_heads, cfg.linear_num_k_heads);
                     }
+                    break;
                 }
             }
 
@@ -211,7 +216,7 @@ int main(int argc, char **argv) {
             }
 
             // EOS tokens (Qwen3.5)
-            cfg.eos_tokens[0] = 248046;
+            cfg.eos_tokens[0] = gf->eos_token_id > 0 ? gf->eos_token_id : 248046;
             cfg.eos_tokens[1] = 248044;
             cfg.eos_tokens[2] = -1;
             cfg.think_end_token = 248069;
@@ -222,17 +227,6 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "[main] Ignoring --k for dense FFN model\n");
             }
 
-            // Set full_attn_interval and offset so init_derived generates correct layer types
-            if (cfg.num_full_attn_layers > 0) {
-                cfg.full_attn_interval = cfg.num_layers / cfg.num_full_attn_layers;
-                // Find the first full attention layer to determine offset
-                for (int i = 0; i < cfg.num_layers; i++) {
-                    if (cfg.layer_types[i] == ATTN_FULL) {
-                        cfg.full_attn_offset = i % cfg.full_attn_interval;
-                        break;
-                    }
-                }
-            }
             model_config_init_derived(&cfg);
 
             if (max_layers > 0 && max_layers < cfg.num_layers) {

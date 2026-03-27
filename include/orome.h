@@ -391,7 +391,15 @@ struct GGUFFile {
     FFNType ffn_type;
     int num_layers, hidden_dim, num_experts, num_experts_per_tok;
     int num_attn_heads, num_kv_heads, moe_intermediate;
+    int context_length;
+    int attn_key_length, attn_value_length;
+    int rope_dimension_count;
+    int ssm_conv_kernel, ssm_state_size, ssm_group_count;
+    int ssm_time_step_rank, ssm_inner_size;
+    int full_attention_interval;
+    int eos_token_id, padding_token_id;
     float rope_theta;
+    float rms_norm_eps;
     int vocab_size;
 };
 

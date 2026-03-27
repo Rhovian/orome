@@ -351,6 +351,8 @@ GGUFFile *gguf_open(const char *path) {
                 const char *field = key + plen;
                 if (strcmp(field, "block_count") == 0) {
                     gf->num_layers = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "context_length") == 0) {
+                    gf->context_length = (int)read_value_uint(&r, vtype);
                 } else if (strcmp(field, "embedding_length") == 0) {
                     gf->hidden_dim = (int)read_value_uint(&r, vtype);
                 } else if (strcmp(field, "expert_count") == 0) {
@@ -363,16 +365,42 @@ GGUFFile *gguf_open(const char *path) {
                     gf->num_attn_heads = (int)read_value_uint(&r, vtype);
                 } else if (strcmp(field, "attention.head_count_kv") == 0) {
                     gf->num_kv_heads = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "attention.key_length") == 0) {
+                    gf->attn_key_length = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "attention.value_length") == 0) {
+                    gf->attn_value_length = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "attention.layer_norm_rms_epsilon") == 0) {
+                    gf->rms_norm_eps = read_value_float(&r, vtype);
                 } else if (strcmp(field, "rope.freq_base") == 0) {
                     gf->rope_theta = read_value_float(&r, vtype);
+                } else if (strcmp(field, "rope.dimension_count") == 0) {
+                    gf->rope_dimension_count = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "ssm.conv_kernel") == 0) {
+                    gf->ssm_conv_kernel = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "ssm.state_size") == 0) {
+                    gf->ssm_state_size = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "ssm.group_count") == 0) {
+                    gf->ssm_group_count = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "ssm.time_step_rank") == 0) {
+                    gf->ssm_time_step_rank = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "ssm.inner_size") == 0) {
+                    gf->ssm_inner_size = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(field, "full_attention_interval") == 0) {
+                    gf->full_attention_interval = (int)read_value_uint(&r, vtype);
                 } else if (strcmp(field, "vocab_size") == 0) {
                     gf->vocab_size = (int)read_value_uint(&r, vtype);
                 } else {
                     skip_value(&r, vtype);
                 }
             } else if (strncmp(key, "tokenizer.", 10) == 0) {
-                // Tokenizer metadata — skip for now
-                skip_value(&r, vtype);
+                if (strcmp(key, "tokenizer.ggml.eos_token_id") == 0) {
+                    gf->eos_token_id = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(key, "tokenizer.ggml.padding_token_id") == 0) {
+                    gf->padding_token_id = (int)read_value_uint(&r, vtype);
+                } else {
+                    // Tokenizer metadata — skip for now
+                    skip_value(&r, vtype);
+                }
             } else if (strncmp(key, "general.", 8) == 0) {
                 skip_value(&r, vtype);
             } else {
@@ -602,9 +630,19 @@ void model_config_init_derived(ModelConfig *cfg) {
     cfg->linear_conv_dim = cfg->linear_total_key * 2 + cfg->linear_total_value;
     cfg->kv_dim = cfg->num_kv_heads * cfg->head_dim;
 
+    if (cfg->layer_types) {
+        int full_count = 0, lin_count = 0;
+        for (int i = 0; i < cfg->num_layers; i++) {
+            if (cfg->layer_types[i] == ATTN_FULL) full_count++;
+            else lin_count++;
+        }
+        cfg->num_full_attn_layers = full_count;
+        cfg->num_linear_layers = lin_count;
+        return;
+    }
+
     // Layer type array from full_attn_interval and full_attn_offset
     if (cfg->full_attn_interval > 0) {
-        if (cfg->layer_types) free(cfg->layer_types);
         cfg->layer_types = calloc(cfg->num_layers, sizeof(AttnLayerType));
         int full_count = 0, lin_count = 0;
         for (int i = 0; i < cfg->num_layers; i++) {
