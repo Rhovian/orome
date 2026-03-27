@@ -336,11 +336,12 @@ kernel void sigmoid_gate(
 //   4. State update: S[vi][ki] += k[ki] * delta[vi]
 //   5. Output:       out[vi] = sum_ki(S[vi][ki] * q[ki])
 //
-// Dispatch: 64 threadgroups (one per v-head), 128 threads each (one per vi).
+// Dispatch: one threadgroup per v-head, value_dim threads each (one per vi).
 // Each thread owns one row S[head_id][vi][:] of the 128x128 state matrix.
 //
-// State layout: [64 * 128 * 128] float = 4MB total, persisted across tokens.
-// k-head sharing: 4 v-heads share 1 k-head (64 v-heads / 16 k-heads).
+// State layout: [n_v_heads * 128 * 128] float, persisted across tokens.
+// GGUF keeps V-head tensors grouped by modulo of the shared K-head rather than
+// sequentially. In that layout, head_id % num_k_heads selects the owning K-head.
 
 kernel void gated_delta_net_step(
     device half *state,              // [n_v_heads * 128 * 128] persistent state (half)
@@ -350,14 +351,14 @@ kernel void gated_delta_net_step(
     device const float *g_decay,     // [64] per v-head
     device const float *beta_gate,   // [64] per v-head
     device float *output,            // [8192] (64 v-heads * 128)
-    constant uint &k_heads_per_v,    // = 4
+    constant uint &num_k_heads,      // shared K-head set size
     constant float &qk_inv_scale,    // = 1/sqrt(key_dim)
     uint head_id [[threadgroup_position_in_grid]],
     uint vi [[thread_position_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
-    uint kh = head_id / k_heads_per_v;
+    uint kh = head_id % num_k_heads;
     float g = g_decay[head_id];
     float beta = beta_gate[head_id];
 

@@ -284,6 +284,7 @@ typedef struct {
 
 // Global (non-per-layer) tensor refs
 typedef struct {
+    TensorRef token_embd;       // input embedding lookup
     TensorRef lm_head;          // final projection
     TensorRef final_norm;       // final RMS norm
 } GlobalTensorCache;
@@ -305,6 +306,7 @@ void              format_dispatch_matvec(id<MTLComputeCommandEncoder> enc,
                                          id<MTLBuffer> out_buf, size_t out_off);
 id<MTLComputePipelineState> format_pipeline_for(MetalCtx *ctx, QuantFormat fmt);
 QuantFormat       format_from_ggml_type(uint32_t ggml_type);
+bool              format_decode_row_f32(TensorRef *ref, uint32_t row_idx, float *out);
 
 // Timing
 double now_ms(void);

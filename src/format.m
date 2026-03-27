@@ -10,7 +10,212 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <math.h>
+#include <string.h>
 #include "orome.h"
+
+static inline float format_fp16_to_f32(uint16_t h) {
+    uint32_t sign = (h >> 15) & 1u;
+    uint32_t exp = (h >> 10) & 0x1Fu;
+    uint32_t mant = h & 0x3FFu;
+    if (exp == 0) {
+        if (mant == 0) return sign ? -0.0f : 0.0f;
+        return ldexpf((float)mant, -24) * (sign ? -1.0f : 1.0f);
+    }
+    if (exp == 31) {
+        return mant ? NAN : (sign ? -INFINITY : INFINITY);
+    }
+    uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
+    float out;
+    memcpy(&out, &f32, sizeof(out));
+    return out;
+}
+
+static inline float format_bf16_to_f32(uint16_t h) {
+    uint32_t bits = (uint32_t)h << 16;
+    float out;
+    memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+static inline void format_unpack_q4k_scale_min_pair(const uint8_t *sc_data,
+                                                    uint32_t g,
+                                                    float *sc_lo,
+                                                    float *sc_hi,
+                                                    float *mn_lo,
+                                                    float *mn_hi) {
+    if (g < 2) {
+        uint32_t base = g * 2;
+        *sc_lo = (float)(sc_data[base] & 63);
+        *sc_hi = (float)(sc_data[base + 1] & 63);
+        *mn_lo = (float)(sc_data[base + 4] & 63);
+        *mn_hi = (float)(sc_data[base + 5] & 63);
+        return;
+    }
+
+    uint32_t base = (g - 2) * 2;
+    uint32_t upper = g - 2;
+    uint8_t sc_pack = sc_data[8 + upper];
+    uint8_t mn_pack = sc_data[10 + upper];
+    *sc_lo = (float)((sc_pack & 0xF) | ((sc_data[base] >> 6) << 4));
+    *sc_hi = (float)((sc_pack >> 4) | ((sc_data[base + 1] >> 6) << 4));
+    *mn_lo = (float)((mn_pack & 0xF) | ((sc_data[base + 4] >> 6) << 4));
+    *mn_hi = (float)((mn_pack >> 4) | ((sc_data[base + 5] >> 6) << 4));
+}
+
+static bool format_decode_q8_0_row(const uint8_t *row, uint32_t in_dim, float *out) {
+    if (in_dim % 32 != 0) return false;
+    uint32_t blocks_per_row = in_dim / 32;
+    for (uint32_t blk = 0; blk < blocks_per_row; blk++) {
+        const uint8_t *block = row + blk * 34;
+        float d = format_fp16_to_f32((uint16_t)(block[0] | ((uint16_t)block[1] << 8)));
+        const int8_t *qs = (const int8_t *)(block + 2);
+        uint32_t base = blk * 32;
+        for (uint32_t j = 0; j < 32; j++) {
+            out[base + j] = d * (float)qs[j];
+        }
+    }
+    return true;
+}
+
+static bool format_decode_q4_k_row(const uint8_t *row, uint32_t in_dim, float *out) {
+    if (in_dim % 256 != 0) return false;
+    uint32_t num_superblocks = in_dim / 256;
+    for (uint32_t sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
+        const uint8_t *sb = row + sb_idx * 144;
+        float d = format_fp16_to_f32((uint16_t)(sb[0] | ((uint16_t)sb[1] << 8)));
+        float dmin = format_fp16_to_f32((uint16_t)(sb[2] | ((uint16_t)sb[3] << 8)));
+        const uint8_t *scales = sb + 4;
+        const uint8_t *qs = sb + 16;
+        uint32_t base = sb_idx * 256;
+
+        for (uint32_t g = 0; g < 4; g++) {
+            float sc_lo, sc_hi, mn_lo, mn_hi;
+            format_unpack_q4k_scale_min_pair(scales, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
+            const uint8_t *group_qs = qs + g * 32;
+            float q_sc_lo = d * sc_lo;
+            float q_sc_hi = d * sc_hi;
+            float q_mn_lo = dmin * mn_lo;
+            float q_mn_hi = dmin * mn_hi;
+            for (uint32_t l = 0; l < 32; l++) {
+                uint8_t byte = group_qs[l];
+                out[base + g * 64 + l] = q_sc_lo * (float)(byte & 0xF) - q_mn_lo;
+                out[base + g * 64 + 32 + l] = q_sc_hi * (float)(byte >> 4) - q_mn_hi;
+            }
+        }
+    }
+    return true;
+}
+
+static bool format_decode_q5_k_row(const uint8_t *row, uint32_t in_dim, float *out) {
+    if (in_dim % 256 != 0) return false;
+    uint32_t num_superblocks = in_dim / 256;
+    for (uint32_t sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
+        const uint8_t *sb = row + sb_idx * 176;
+        float d = format_fp16_to_f32((uint16_t)(sb[0] | ((uint16_t)sb[1] << 8)));
+        float dmin = format_fp16_to_f32((uint16_t)(sb[2] | ((uint16_t)sb[3] << 8)));
+        const uint8_t *scales = sb + 4;
+        const uint8_t *qh = sb + 16;
+        const uint8_t *ql = sb + 48;
+        uint32_t base = sb_idx * 256;
+
+        for (uint32_t g = 0; g < 4; g++) {
+            float sc_lo, sc_hi, mn_lo, mn_hi;
+            format_unpack_q4k_scale_min_pair(scales, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
+            const uint8_t *group_ql = ql + g * 32;
+            uint8_t hm_lo = (uint8_t)(1u << (g * 2));
+            uint8_t hm_hi = (uint8_t)(1u << (g * 2 + 1));
+            float q_sc_lo = d * sc_lo;
+            float q_sc_hi = d * sc_hi;
+            float q_mn_lo = dmin * mn_lo;
+            float q_mn_hi = dmin * mn_hi;
+            for (uint32_t l = 0; l < 32; l++) {
+                uint8_t byte = group_ql[l];
+                uint8_t q5_lo = (uint8_t)((byte & 0xF) | ((qh[l] & hm_lo) ? 16 : 0));
+                uint8_t q5_hi = (uint8_t)((byte >> 4) | ((qh[l] & hm_hi) ? 16 : 0));
+                out[base + g * 64 + l] = q_sc_lo * (float)q5_lo - q_mn_lo;
+                out[base + g * 64 + 32 + l] = q_sc_hi * (float)q5_hi - q_mn_hi;
+            }
+        }
+    }
+    return true;
+}
+
+static bool format_decode_q6_k_row(const uint8_t *row, uint32_t in_dim, float *out) {
+    if (in_dim % 256 != 0) return false;
+    uint32_t num_superblocks = in_dim / 256;
+    for (uint32_t sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
+        const uint8_t *sb = row + sb_idx * 210;
+        const uint8_t *ql = sb;
+        const uint8_t *qh = sb + 128;
+        const int8_t *sc = (const int8_t *)(sb + 192);
+        float d = format_fp16_to_f32((uint16_t)(sb[208] | ((uint16_t)sb[209] << 8)));
+        uint32_t base = sb_idx * 256;
+
+        for (uint32_t blk = 0; blk < 2; blk++) {
+            const uint8_t *ql_blk = ql + blk * 64;
+            const uint8_t *qh_blk = qh + blk * 32;
+            const int8_t *sc_blk = sc + blk * 8;
+            uint32_t blk_base = base + blk * 128;
+            for (uint32_t l = 0; l < 32; l++) {
+                uint32_t is = l / 16;
+                int q1 = (int)((ql_blk[l] & 0xF) | (((qh_blk[l] >> 0) & 3) << 4)) - 32;
+                int q2 = (int)((ql_blk[l + 32] & 0xF) | (((qh_blk[l] >> 2) & 3) << 4)) - 32;
+                int q3 = (int)((ql_blk[l] >> 4) | (((qh_blk[l] >> 4) & 3) << 4)) - 32;
+                int q4 = (int)((ql_blk[l + 32] >> 4) | (((qh_blk[l] >> 6) & 3) << 4)) - 32;
+                out[blk_base + l] = d * (float)sc_blk[is + 0] * (float)q1;
+                out[blk_base + l + 32] = d * (float)sc_blk[is + 2] * (float)q2;
+                out[blk_base + l + 64] = d * (float)sc_blk[is + 4] * (float)q3;
+                out[blk_base + l + 96] = d * (float)sc_blk[is + 6] * (float)q4;
+            }
+        }
+    }
+    return true;
+}
+
+bool format_decode_row_f32(TensorRef *ref, uint32_t row_idx, float *out) {
+    if (!ref || !ref->buffer || !out || row_idx >= ref->out_dim) return false;
+    const uint8_t *base = (const uint8_t *)[ref->buffer contents] + ref->offset;
+
+    switch (ref->format) {
+        case QFMT_F32: {
+            const float *row = (const float *)(base + (size_t)row_idx * ref->in_dim * sizeof(float));
+            memcpy(out, row, (size_t)ref->in_dim * sizeof(float));
+            return true;
+        }
+        case QFMT_F16: {
+            const uint16_t *row = (const uint16_t *)(base + (size_t)row_idx * ref->in_dim * sizeof(uint16_t));
+            for (uint32_t j = 0; j < ref->in_dim; j++) out[j] = format_fp16_to_f32(row[j]);
+            return true;
+        }
+        case QFMT_BF16: {
+            const uint16_t *row = (const uint16_t *)(base + (size_t)row_idx * ref->in_dim * sizeof(uint16_t));
+            for (uint32_t j = 0; j < ref->in_dim; j++) out[j] = format_bf16_to_f32(row[j]);
+            return true;
+        }
+        case QFMT_GGUF_Q8_0: {
+            if (ref->in_dim % 32 != 0) return false;
+            size_t row_bytes = (size_t)(ref->in_dim / 32) * 34;
+            return format_decode_q8_0_row(base + (size_t)row_idx * row_bytes, ref->in_dim, out);
+        }
+        case QFMT_GGUF_Q4_K: {
+            if (ref->in_dim % 256 != 0) return false;
+            size_t row_bytes = (size_t)(ref->in_dim / 256) * 144;
+            return format_decode_q4_k_row(base + (size_t)row_idx * row_bytes, ref->in_dim, out);
+        }
+        case QFMT_GGUF_Q5_K: {
+            if (ref->in_dim % 256 != 0) return false;
+            size_t row_bytes = (size_t)(ref->in_dim / 256) * 176;
+            return format_decode_q5_k_row(base + (size_t)row_idx * row_bytes, ref->in_dim, out);
+        }
+        case QFMT_GGUF_Q6_K: {
+            if (ref->in_dim % 256 != 0) return false;
+            size_t row_bytes = (size_t)(ref->in_dim / 256) * 210;
+            return format_decode_q6_k_row(base + (size_t)row_idx * row_bytes, ref->in_dim, out);
+        }
+    }
+    return false;
+}
 
 // ============================================================================
 // Dispatch: encode a matvec into a command encoder using a TensorRef
@@ -260,10 +465,11 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
 
     // Global tensors
     if (globals) {
+        globals->token_embd = G_REF("token_embd.weight", cfg->vocab_size, H);
         globals->lm_head = G_REF("output.weight", cfg->vocab_size, H);
         if (!globals->lm_head.buffer) {
             // Qwen3.5 ties the LM head to token embeddings in GGUF exports.
-            globals->lm_head = G_REF("token_embd.weight", cfg->vocab_size, H);
+            globals->lm_head = globals->token_embd;
         }
         globals->final_norm = G_RAW("output_norm.weight");
     }
@@ -308,244 +514,24 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
             int conv_dim = cfg->linear_conv_dim;
             int total_value = cfg->linear_num_v_heads * cfg->linear_value_dim;
             int n_v = cfg->linear_num_v_heads;
-            bool need_v_head_reorder =
-                cfg->linear_num_v_heads > 0 &&
-                cfg->linear_num_k_heads > 0 &&
-                cfg->linear_num_v_heads != cfg->linear_num_k_heads;
-
-            // QKV: 8192 rows = Q(2048) + K(2048) + V(4096)
-            // V portion (rows 4096-8191) is head-interleaved like Z gate
             snprintf(name, sizeof(name), "blk.%d.attn_qkv.weight", i);
-            {
-                GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
-                if (need_v_head_reorder && ti && ti->n_dims >= 2) {
-                    int _rows = (int)ti->dims[1];
-                    int _bpr = ((int)ti->dims[0] / 32) * 34;
-                    size_t _total = (size_t)_rows * _bpr;
-                    int qk_rows = 2 * cfg->linear_num_k_heads * cfg->linear_key_dim; // 4096
-                    int v_rows = total_value; // 4096
-                    int hd = cfg->linear_value_dim;  // 128
-
-                    id<MTLBuffer> db = [ctx->device newBufferWithLength:_total options:MTLResourceStorageModeShared];
-                    uint8_t *s = (uint8_t *)[buf contents] + gf->data_offset + ti->offset;
-                    uint8_t *d = (uint8_t *)[db contents];
-
-                    // Copy Q+K rows unchanged (first qk_rows rows)
-                    memcpy(d, s, (size_t)qk_rows * _bpr);
-
-                    // De-interleave V rows (rows qk_rows..qk_rows+v_rows-1)
-                    int v_half = v_rows / 2;
-                    for (int gr = 0; gr < v_rows; gr++) {
-                        int half = gr / v_half;
-                        int within = gr % v_half;
-                        int head_idx = within / hd;
-                        int pos = within % hd;
-                        int ref_head = head_idx * 2 + half;
-                        int ref_row = ref_head * hd + pos;
-                        memcpy(d + (qk_rows + ref_row) * _bpr,
-                               s + (qk_rows + gr) * _bpr, _bpr);
-                    }
-
-                    QuantFormat fmt = format_from_ggml_type(ti->type);
-                    c->lin.qkv = (TensorRef){ .buffer = db, .offset = 0,
-                        .pipeline = format_pipeline_for(ctx, fmt),
-                        .format = fmt, .out_dim = (uint32_t)conv_dim, .in_dim = (uint32_t)H };
-                } else {
-                    c->lin.qkv = G_REF(name, conv_dim, H);
-                }
-            }
-            // Z gate (attn_gate): out_dim=4096=32 heads × 128, rows are head-interleaved
+            c->lin.qkv = G_REF(name, conv_dim, H);
             snprintf(name, sizeof(name), "blk.%d.attn_gate.weight", i);
-            {
-                GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
-                if (need_v_head_reorder && ti && ti->n_dims >= 2 && ti->dims[1] == (uint64_t)total_value) {
-                    int _rows = total_value, _half = _rows / 2;
-                    int _bpr = ((int)ti->dims[0] / 32) * 34;
-                    size_t _total = (size_t)_rows * _bpr;
-                    int hd = cfg->linear_value_dim;  // 128 rows per head
-                    id<MTLBuffer> db = [ctx->device newBufferWithLength:_total options:MTLResourceStorageModeShared];
-                    uint8_t *s = (uint8_t *)[buf contents] + gf->data_offset + ti->offset;
-                    uint8_t *d = (uint8_t *)[db contents];
-                    // Interleave pattern: GGUF row r → ref row (r%_half < _half ? r%(_half) mapped)
-                    // Groups of hd rows. First half: even groups, second half: odd groups.
-                    for (int gr = 0; gr < _rows; gr++) {
-                        int half = gr / _half;
-                        int within_half = gr % _half;
-                        int head_idx = within_half / hd;
-                        int pos_in_head = within_half % hd;
-                        int ref_head = head_idx * 2 + half;
-                        int ref_row = ref_head * hd + pos_in_head;
-                        memcpy(d + ref_row * _bpr, s + gr * _bpr, _bpr);
-                    }
-                    QuantFormat fmt = format_from_ggml_type(ti->type);
-                    c->lin.z = (TensorRef){ .buffer = db, .offset = 0,
-                        .pipeline = format_pipeline_for(ctx, fmt),
-                        .format = fmt, .out_dim = (uint32_t)total_value, .in_dim = (uint32_t)H };
-                } else {
-                    c->lin.z = G_REF(name, total_value, H);
-                }
-            }
-            // Alpha, beta, A_log, dt_bias: GGUF stores with head-interleaved rows.
-            // GGUF order: [head0, head2, head4, ..., head30, head1, head3, ..., head31]
-            // De-interleave by building new buffers/tensors with sequential head order.
-
-            // Helper: de-interleave a Q8_0 weight tensor with n_v rows
-            #define DEINTERLEAVE_Q8_ROWS(tname, out_ref) do { \
-                snprintf(name, sizeof(name), "blk.%d." tname, i); \
-                GGUFTensorInfo *_ti = gguf_find_tensor(gf, name); \
-                if (_ti && _ti->n_dims >= 2 && _ti->dims[1] == (uint64_t)n_v) { \
-                    int _rows = n_v, _half = _rows / 2; \
-                    int _bpr = ((int)_ti->dims[0] / 32) * 34; \
-                    size_t _total = (size_t)_rows * _bpr; \
-                    id<MTLBuffer> _db = [ctx->device newBufferWithLength:_total options:MTLResourceStorageModeShared]; \
-                    uint8_t *_s = (uint8_t *)[buf contents] + gf->data_offset + _ti->offset; \
-                    uint8_t *_d = (uint8_t *)[_db contents]; \
-                    for (int _r = 0; _r < _half; _r++) { \
-                        memcpy(_d + (_r*2) * _bpr, _s + _r * _bpr, _bpr); \
-                        memcpy(_d + (_r*2+1) * _bpr, _s + (_half+_r) * _bpr, _bpr); \
-                    } \
-                    QuantFormat _fmt = format_from_ggml_type(_ti->type); \
-                    out_ref = (TensorRef){ .buffer = _db, .offset = 0, \
-                        .pipeline = format_pipeline_for(ctx, _fmt), \
-                        .format = _fmt, .out_dim = (uint32_t)n_v, .in_dim = (uint32_t)H }; \
-                } else { out_ref = G_REF(name, n_v, H); } \
-            } while(0)
-
-            if (need_v_head_reorder) {
-                DEINTERLEAVE_Q8_ROWS("ssm_alpha.weight", c->lin.a);
-                DEINTERLEAVE_Q8_ROWS("ssm_beta.weight", c->lin.b);
-            } else {
-                snprintf(name, sizeof(name), "blk.%d.ssm_alpha.weight", i);
-                c->lin.a = G_REF(name, n_v, H);
-                snprintf(name, sizeof(name), "blk.%d.ssm_beta.weight", i);
-                c->lin.b = G_REF(name, n_v, H);
-            }
-            #undef DEINTERLEAVE_Q8_ROWS
-            // Output projection (ssm_out in GGUF)
-            // The GGUF stores ssm_out with head-interleaved Q8_0 blocks along in_dim.
-            // 32 v-heads × 4 blocks each (128 values), interleaved in 2 groups of 16 heads.
-            // De-interleave at load time by creating a new buffer with correct block order.
+            c->lin.z = G_REF(name, total_value, H);
+            snprintf(name, sizeof(name), "blk.%d.ssm_alpha.weight", i);
+            c->lin.a = G_REF(name, n_v, H);
+            snprintf(name, sizeof(name), "blk.%d.ssm_beta.weight", i);
+            c->lin.b = G_REF(name, n_v, H);
             snprintf(name, sizeof(name), "blk.%d.ssm_out.weight", i);
-            {
-                GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
-                if (need_v_head_reorder && ti && ti->n_dims >= 2) {
-                    int in_dim = (int)ti->dims[0];  // 4096 (total_value)
-                    int out_dim = (int)ti->dims[1];  // 2048 (H)
-                    int head_dim_vals = cfg->linear_value_dim;  // 128
-                    int blocks_per_head = head_dim_vals / 32;  // 4 Q8_0 blocks per head
-                    int total_blocks = in_dim / 32;  // 128 blocks per row
-                    int bytes_per_block = 34;  // Q8_0: 32 int8 + fp16 scale
-                    int bytes_per_row = total_blocks * bytes_per_block;
-                    size_t total_bytes = (size_t)out_dim * bytes_per_row;
-
-                    // Allocate de-interleaved buffer
-                    id<MTLBuffer> deint_buf = [ctx->device newBufferWithLength:total_bytes
-                                                                      options:MTLResourceStorageModeShared];
-                    uint8_t *src = (uint8_t *)[buf contents] + gf->data_offset + ti->offset;
-                    uint8_t *dst = (uint8_t *)[deint_buf contents];
-
-                    // For each row, rearrange blocks from interleaved to sequential order
-                    // GGUF block i maps to: ref_block = (i/blocks_per_head % (n_heads/2)) * (2*blocks_per_head)
-                    //                                 + (i / (total_blocks/2)) * blocks_per_head
-                    //                                 + (i % blocks_per_head)
-                    // Simplified: half = i / (total_blocks/2), group = (i % (total_blocks/2)) / blocks_per_head
-                    //             pos = i % blocks_per_head
-                    //             ref = group * (2*blocks_per_head) + half * blocks_per_head + pos
-                    int half_blocks = total_blocks / 2;
-                    for (int row = 0; row < out_dim; row++) {
-                        uint8_t *src_row = src + (size_t)row * bytes_per_row;
-                        uint8_t *dst_row = dst + (size_t)row * bytes_per_row;
-                        for (int gb = 0; gb < total_blocks; gb++) {
-                            int half = gb / half_blocks;
-                            int group = (gb % half_blocks) / blocks_per_head;
-                            int pos = gb % blocks_per_head;
-                            int ref_blk = group * (2 * blocks_per_head) + half * blocks_per_head + pos;
-                            memcpy(dst_row + ref_blk * bytes_per_block,
-                                   src_row + gb * bytes_per_block,
-                                   bytes_per_block);
-                        }
-                    }
-
-                    QuantFormat fmt = format_from_ggml_type(ti->type);
-                    c->lin.o = (TensorRef){
-                        .buffer = deint_buf, .offset = 0,
-                        .pipeline = format_pipeline_for(ctx, fmt),
-                        .format = fmt, .out_dim = (uint32_t)out_dim, .in_dim = (uint32_t)in_dim,
-                    };
-                } else {
-                    c->lin.o = G_REF(name, H, total_value);
-                }
-            }
-            // Conv1d weights: GGUF stores [ne0=kernel_size, ne1=conv_dim] F32
-            // Already in [conv_dim, kernel_size] memory order (ne0 contiguous per channel)
-            // Use F32 conv1d kernel directly — no conversion needed
-            // Conv1d: F32, [kernel_size=4, conv_dim=8192] = [4, Q(2048)+K(2048)+V(4096)]
-            // V-portion channels (4096-8191) are head-interleaved like other V-head tensors
+            c->lin.o = G_REF(name, H, total_value);
             snprintf(name, sizeof(name), "blk.%d.ssm_conv1d.weight", i);
-            {
-                GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
-                if (need_v_head_reorder && ti && ti->type == 0 && ti->dims[0] == 4) {
-                    int cd = (int)ti->dims[1];  // 8192
-                    int qk_ch = 2 * cfg->linear_num_k_heads * cfg->linear_key_dim;  // 4096
-                    int v_ch = total_value;  // 4096
-                    int hd = cfg->linear_value_dim;  // 128
-                    size_t bytes = cd * 4 * sizeof(float);  // 4 taps per channel
-
-                    id<MTLBuffer> db = [ctx->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
-                    float *s = (float *)((uint8_t *)[buf contents] + gf->data_offset + ti->offset);
-                    float *d = (float *)[db contents];
-
-                    // Copy Q+K channels unchanged
-                    memcpy(d, s, (size_t)qk_ch * 4 * sizeof(float));
-
-                    // De-interleave V channels
-                    int v_half = v_ch / 2;
-                    for (int ch = 0; ch < v_ch; ch++) {
-                        int half = ch / v_half;
-                        int within = ch % v_half;
-                        int head_idx = within / hd;
-                        int pos = within % hd;
-                        int ref_ch = (head_idx * 2 + half) * hd + pos;
-                        memcpy(d + (qk_ch + ref_ch) * 4, s + (qk_ch + ch) * 4, 4 * sizeof(float));
-                    }
-
-                    c->lin.conv = (TensorRef){ .buffer = db, .offset = 0, .format = QFMT_F32 };
-                } else {
-                    c->lin.conv = G_RAW_F32(name);
-                }
-            }
-            // A_log and dt_bias: F32, 32 elements, head-interleaved
-            // De-interleave: deint[r*2] = gguf[r], deint[r*2+1] = gguf[half+r] for r<half
-            #define DEINTERLEAVE_F32_RAW(tname, out_ref) do { \
-                snprintf(name, sizeof(name), "blk.%d." tname, i); \
-                GGUFTensorInfo *_ti = gguf_find_tensor(gf, name); \
-                if (_ti && _ti->dims[0] == (uint64_t)n_v) { \
-                    int _half = n_v / 2; \
-                    size_t _bytes = n_v * sizeof(float); \
-                    id<MTLBuffer> _db = [ctx->device newBufferWithLength:_bytes options:MTLResourceStorageModeShared]; \
-                    float *_s = (float *)((uint8_t *)[buf contents] + gf->data_offset + _ti->offset); \
-                    float *_d = (float *)[_db contents]; \
-                    for (int _r = 0; _r < _half; _r++) { \
-                        _d[_r*2] = _s[_r]; \
-                        _d[_r*2+1] = _s[_half+_r]; \
-                    } \
-                    out_ref = (TensorRef){ .buffer = _db, .offset = 0, .format = QFMT_F32 }; \
-                } else { out_ref = G_RAW_F32(name); } \
-            } while(0)
-
-            if (need_v_head_reorder) {
-                DEINTERLEAVE_F32_RAW("ssm_a", c->lin.A_log);
-                DEINTERLEAVE_F32_RAW("ssm_dt.bias", c->lin.dt_bias);
-            } else {
-                snprintf(name, sizeof(name), "blk.%d.ssm_a", i);
-                c->lin.A_log = G_RAW_F32(name);
-                snprintf(name, sizeof(name), "blk.%d.ssm_dt.bias", i);
-                c->lin.dt_bias = G_RAW_F32(name);
-            }
-            #undef DEINTERLEAVE_F32_RAW
-            // Output norm (ssm_norm in GGUF)
+            c->lin.conv = G_RAW_F32(name);
             snprintf(name, sizeof(name), "blk.%d.ssm_norm.weight", i);
             c->lin.o_norm = G_RAW(name);     // gated_rms_norm expects BF16
+            snprintf(name, sizeof(name), "blk.%d.ssm_a", i);
+            c->lin.A_log = G_RAW_F32(name);
+            snprintf(name, sizeof(name), "blk.%d.ssm_dt.bias", i);
+            c->lin.dt_bias = G_RAW_F32(name);
         } else {
             int n_heads = cfg->num_attn_heads;
             int n_kv = cfg->num_kv_heads;
@@ -553,34 +539,8 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
 
             snprintf(name, sizeof(name), "blk.%d.attn_q.weight", i);
             { GGUFTensorInfo *qi = gguf_find_tensor(gf, name);
-              // Gated attention: Q tensor has n_heads*head_dim*2 rows (Q + gate interleaved)
-              // De-interleave at load time: [Q_h0,gate_h0,Q_h1,gate_h1,...] → [Q_h0..h15,gate_h0..h15]
               int q_out = (qi && qi->n_dims >= 2) ? (int)qi->dims[1] : n_heads * hd;
-              if (qi && qi->n_dims >= 2 && q_out == n_heads * hd * 2) {
-                  int _bpr = ((int)qi->dims[0] / 32) * 34;  // bytes per row for Q8_0
-                  size_t _total = (size_t)q_out * _bpr;
-                  id<MTLBuffer> db = [ctx->device newBufferWithLength:_total options:MTLResourceStorageModeShared];
-                  uint8_t *s = (uint8_t *)[buf contents] + gf->data_offset + qi->offset;
-                  uint8_t *d = (uint8_t *)[db contents];
-                  // Source: [Q_h0(hd rows), gate_h0(hd rows), Q_h1(hd rows), gate_h1(hd rows), ...]
-                  // Dest:   [Q_h0(hd rows), Q_h1(hd rows), ..., gate_h0(hd rows), gate_h1(hd rows), ...]
-                  for (int h = 0; h < n_heads; h++) {
-                      // Q rows for head h: src offset = h * 2 * hd, dst offset = h * hd
-                      memcpy(d + (size_t)(h * hd) * _bpr,
-                             s + (size_t)(h * 2 * hd) * _bpr,
-                             (size_t)hd * _bpr);
-                      // Gate rows for head h: src offset = h * 2 * hd + hd, dst offset = n_heads*hd + h*hd
-                      memcpy(d + (size_t)(n_heads * hd + h * hd) * _bpr,
-                             s + (size_t)(h * 2 * hd + hd) * _bpr,
-                             (size_t)hd * _bpr);
-                  }
-                  QuantFormat fmt = format_from_ggml_type(qi->type);
-                  c->full.q = (TensorRef){ .buffer = db, .offset = 0,
-                      .pipeline = format_pipeline_for(ctx, fmt),
-                      .format = fmt, .out_dim = (uint32_t)q_out, .in_dim = (uint32_t)H };
-              } else {
-                  c->full.q = G_REF(name, q_out, H);
-              } }
+              c->full.q = G_REF(name, q_out, H); }
             snprintf(name, sizeof(name), "blk.%d.attn_k.weight", i);
             c->full.k = G_REF(name, n_kv * hd, H);
             snprintf(name, sizeof(name), "blk.%d.attn_v.weight", i);

@@ -85,59 +85,24 @@ void engine_reset(Engine *eng) {
 // Embedding lookup (GGUF format)
 // ============================================================================
 
-// Embedding lookup for GGUF Q8_0 format
-// Q8_0 block: 32 int8 weights + fp16 scale, so one row = H/32 blocks
-static void embed_lookup_gguf(GGUFFile *gf, const ModelConfig *cfg,
-                               int token_id, float *out) {
-    GGUFTensorInfo *ti = gguf_find_tensor(gf, "token_embd.weight");
-    if (!ti) { fprintf(stderr, "ERROR: token_embd.weight not found in GGUF\n"); return; }
-
-    int H = cfg->hidden_dim;
-    uint8_t *data = (uint8_t *)gf->mmap_base + gf->data_offset + ti->offset;
-
-    if (ti->type == 8) { // Q8_0
-        int blocks_per_row = H / 32;
-        int bytes_per_row = blocks_per_row * 34; // 34 bytes per Q8_0 block
-        uint8_t *row = data + (size_t)token_id * bytes_per_row;
-
-        for (int blk = 0; blk < blocks_per_row; blk++) {
-            uint8_t *block = row + blk * 34;
-            uint16_t d_raw = block[0] | ((uint16_t)block[1] << 8);
-            // fp16 to float
-            uint32_t sign = (d_raw >> 15) & 1;
-            uint32_t exp = (d_raw >> 10) & 0x1F;
-            uint32_t mant = d_raw & 0x3FF;
-            float d;
-            if (exp == 0) d = 0.0f;
-            else {
-                uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-                memcpy(&d, &f32, 4);
-            }
-
-            int8_t *qs = (int8_t *)(block + 2);
-            int base = blk * 32;
-            for (int j = 0; j < 32; j++) {
-                out[base + j] = d * (float)qs[j];
-            }
-        }
-    } else if (ti->type == 0) { // F32
-        float *row = (float *)(data + (size_t)token_id * H * sizeof(float));
-        memcpy(out, row, H * sizeof(float));
-    } else if (ti->type == 1) { // F16
-        uint16_t *row = (uint16_t *)(data + (size_t)token_id * H * sizeof(uint16_t));
-        for (int j = 0; j < H; j++) {
-            uint16_t h = row[j];
-            uint32_t sign = (h >> 15) & 1;
-            uint32_t exp = (h >> 10) & 0x1F;
-            uint32_t mant = h & 0x3FF;
-            if (exp == 0) out[j] = 0.0f;
-            else {
-                uint32_t f32 = (sign << 31) | ((exp + 112) << 23) | (mant << 13);
-                memcpy(&out[j], &f32, 4);
-            }
-        }
-    } else {
-        fprintf(stderr, "ERROR: unsupported embedding type %d\n", ti->type);
+static void embed_lookup_tensor(const GlobalTensorCache *globals,
+                                const ModelConfig *cfg,
+                                int token_id, float *out) {
+    TensorRef ref = globals->token_embd.buffer ? globals->token_embd : globals->lm_head;
+    if (!ref.buffer) {
+        fprintf(stderr, "ERROR: token_embd.weight not resolved\n");
+        memset(out, 0, (size_t)cfg->hidden_dim * sizeof(float));
+        return;
+    }
+    if (token_id < 0 || (uint32_t)token_id >= ref.out_dim) {
+        fprintf(stderr, "ERROR: token id %d out of range for embedding rows %u\n",
+                token_id, ref.out_dim);
+        memset(out, 0, (size_t)cfg->hidden_dim * sizeof(float));
+        return;
+    }
+    if (!format_decode_row_f32(&ref, (uint32_t)token_id, out)) {
+        fprintf(stderr, "ERROR: unsupported embedding format %d\n", ref.format);
+        memset(out, 0, (size_t)cfg->hidden_dim * sizeof(float));
     }
 }
 
@@ -398,7 +363,7 @@ int engine_step(Engine *eng, int token_id) {
 
     // 1. Embedding
     memset(eng->hidden, 0, H * sizeof(float));
-    embed_lookup_gguf(eng->gf, cfg, token_id, eng->hidden);
+    embed_lookup_tensor(&eng->globals, cfg, token_id, eng->hidden);
 
     // 2. Layer loop — fused O-proj + post-norm + MoE routing in one GPU commit
     int full_idx = 0, linear_idx = 0;
@@ -528,7 +493,7 @@ int engine_step(Engine *eng, int token_id) {
             // --- Phase D+F: GatedDeltaNet with fused QK RMS norm ---
             // QK norm is now computed inline within delta_net's shared memory loading.
             // Q/K from buf_conv_output (raw, pre-norm), V at offset 2*total_key
-            { uint k_per_v = (uint)cfg->linear_v_heads_per_k;
+            { uint num_k_heads = (uint)cfg->linear_num_k_heads;
               float inv_s = 1.0f / sqrtf((float)key_dim);
             [enc setComputePipelineState:ctx->delta_net];
             [enc setBuffer:ctx->buf_linear_state[linear_idx] offset:0 atIndex:0];
@@ -538,7 +503,7 @@ int engine_step(Engine *eng, int token_id) {
             [enc setBuffer:ctx->buf_linear_decay offset:0 atIndex:4];
             [enc setBuffer:ctx->buf_linear_beta offset:0 atIndex:5];
             [enc setBuffer:ctx->buf_linear_v offset:0 atIndex:6];  // output
-            [enc setBytes:&k_per_v length:sizeof(uint) atIndex:7];
+            [enc setBytes:&num_k_heads length:sizeof(uint) atIndex:7];
             [enc setBytes:&inv_s length:sizeof(float) atIndex:8];
             [enc dispatchThreadgroups:MTLSizeMake(n_v_heads, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(value_dim, 1, 1)]; }
@@ -722,8 +687,31 @@ int engine_step(Engine *eng, int token_id) {
             }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // Q+gate weights are de-interleaved at load time, so the matvec
-            // output is already [Q_h0..h15, gate_h0..h15]. No runtime permutation needed.
+            // Gated full-attention Q projections arrive as
+            // [Q_h0, gate_h0, Q_h1, gate_h1, ...] in float space.
+            // De-interleave them at runtime so the later kernels see
+            // [Q_h0.., Q_h1.., gate_h0.., gate_h1..] regardless of weight format.
+            if (tcache[layer].full.q.out_dim == (uint32_t)(n_heads * hd * 2)) {
+                uint hd_u = (uint)hd;
+                uint nh_u = (uint)n_heads;
+                uint count = (uint)tcache[layer].full.q.out_dim;
+                [enc setComputePipelineState:ctx->deinterleave_qgate];
+                [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];
+                [enc setBuffer:ctx->buf_output offset:0 atIndex:1];
+                [enc setBytes:&hd_u length:sizeof(uint) atIndex:2];
+                [enc setBytes:&nh_u length:sizeof(uint) atIndex:3];
+                [enc dispatchThreadgroups:MTLSizeMake(((uint)(n_heads * hd) + 255) / 256, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                [enc setComputePipelineState:ctx->copy_tmp_to_buf];
+                [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];
+                [enc setBuffer:ctx->buf_output offset:0 atIndex:1];
+                [enc setBytes:&count length:sizeof(uint) atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake((count + 255) / 256, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
 
             // Keep QK RMS norm and RoPE as separate dispatches for now.
             // The fused path introduced in 041860b regressed first-token correctness.

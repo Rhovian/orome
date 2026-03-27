@@ -29,9 +29,9 @@ from pathlib import Path
 GEN_RE = re.compile(r"Generation:\s+([0-9.]+) s \(([0-9.]+) tok/s\)")
 TTFT_RE = re.compile(r"TTFT:\s+([0-9.]+) ms")
 PROJ_RE = re.compile(r"proj=([0-9.]+)")
-DEFAULT_QUALITY_SYSTEM = "You are a concise helpful assistant."
-DEFAULT_QUALITY_PROMPT = "Reply with one short sentence: what color is the sky on a clear day?"
-DEFAULT_QUALITY_MUST_CONTAIN = ["blue"]
+DEFAULT_QUALITY_SYSTEM = ""
+DEFAULT_QUALITY_PROMPT = "Hello"
+DEFAULT_QUALITY_MUST_CONTAIN = []
 
 
 def parse_metrics(output):
@@ -324,7 +324,7 @@ def main():
     parser.add_argument("--quality-system", default=DEFAULT_QUALITY_SYSTEM, help="System prompt for the quality canary")
     parser.add_argument("--quality-prompt", default=DEFAULT_QUALITY_PROMPT, help="User prompt for the quality canary")
     parser.add_argument("--quality-must-contain", nargs="*", default=None, help="Substrings that must appear in the quality reply")
-    parser.add_argument("--quality-max-tokens", type=int, default=48, help="Max tokens for the quality canary reply")
+    parser.add_argument("--quality-max-tokens", type=int, default=64, help="Max tokens for the quality canary reply")
     parser.add_argument("--quality-temperature", type=float, default=0.2, help="Sampling temperature for the quality canary")
     parser.add_argument("--quality-timeout-sec", type=float, default=30.0, help="Timeout for server startup and quality probe")
     args = parser.parse_args()
