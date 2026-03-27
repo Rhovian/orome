@@ -240,14 +240,15 @@ void serve_loop(Engine *eng, int port) {
                                  role, content];
                             }
                         }
-                        // Add assistant turn prefix for generation
-                        [chat appendString:@"<|im_start|>assistant\n"];
+                        // Prefill an empty think block so visible generation starts
+                        // in the answer channel rather than hidden reasoning.
+                        [chat appendString:@"<|im_start|>assistant\n<think>\n</think>\n"];
                         prompt = strdup([chat UTF8String]);
                     }
                 }
             }
 
-            if (!prompt) prompt = strdup("<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n");
+            if (!prompt) prompt = strdup("<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n</think>\n");
 
             // SSE headers
             http_write_str(client_fd,
