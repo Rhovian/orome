@@ -725,9 +725,11 @@ int engine_step(Engine *eng, int token_id) {
             // Q+gate weights are de-interleaved at load time, so the matvec
             // output is already [Q_h0..h15, gate_h0..h15]. No runtime permutation needed.
 
-            // --- Phase C+D: Fused QK RMS norm + RoPE ---
+            // Keep QK RMS norm and RoPE as separate dispatches for now.
+            // The fused path introduced in 041860b regressed first-token correctness.
+            // --- Phase C: Weighted QK RMS norm ---
             // Q in buf_attn_output (16 heads × 256), K in buf_conv_output (2 heads × 256)
-            [enc setComputePipelineState:ctx->rms_norm_qk_rope];
+            [enc setComputePipelineState:ctx->rms_norm_qk_w];
             [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];  // Q
             [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:1];  // K
             [enc setBuffer:tcache[layer].full.q_norm.buffer
@@ -736,17 +738,31 @@ int engine_step(Engine *eng, int token_id) {
                    offset:tcache[layer].full.k_norm.offset atIndex:3];
             { uint hd_val = (uint)hd, nq = (uint)n_heads, nkv = (uint)n_kv;
               float inv_s = 1.0f / sqrtf((float)hd);
-              uint rd = (uint)cfg->rotary_dim;
-              uint p = (uint)pos; float th = cfg->rope_theta;
               [enc setBytes:&hd_val length:sizeof(uint) atIndex:4];
               [enc setBytes:&nq length:sizeof(uint) atIndex:5];
               [enc setBytes:&nkv length:sizeof(uint) atIndex:6];
-              [enc setBytes:&inv_s length:sizeof(float) atIndex:7];
-              [enc setBytes:&rd length:sizeof(uint) atIndex:8];
-              [enc setBytes:&p length:sizeof(uint) atIndex:9];
-              [enc setBytes:&th length:sizeof(float) atIndex:10]; }
+              [enc setBytes:&inv_s length:sizeof(float) atIndex:7]; }
             [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(hd, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            // --- Phase D: RoPE ---
+            [enc setComputePipelineState:ctx->rope_apply];
+            [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:0];  // Q
+            [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:1];  // K
+            { uint hd_val = (uint)hd, rd = (uint)cfg->rotary_dim;
+              uint nq = (uint)n_heads, nkv = (uint)n_kv;
+              uint p = (uint)pos; float th = cfg->rope_theta;
+              [enc setBytes:&hd_val length:sizeof(uint) atIndex:2];
+              [enc setBytes:&rd length:sizeof(uint) atIndex:3];
+              [enc setBytes:&nq length:sizeof(uint) atIndex:4];
+              [enc setBytes:&nkv length:sizeof(uint) atIndex:5];
+              [enc setBytes:&p length:sizeof(uint) atIndex:6];
+              [enc setBytes:&th length:sizeof(float) atIndex:7]; }
+            { uint half_rot = (uint)cfg->rotary_dim / 2;
+              uint max_heads = n_heads > n_kv ? n_heads : n_kv;
+              [enc dispatchThreadgroups:MTLSizeMake(max_heads, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(half_rot, 1, 1)]; }
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase E: KV cache write ---
