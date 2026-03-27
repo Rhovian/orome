@@ -21,7 +21,9 @@
 #   ./run_experiments.sh <model> --agent codex --sessions 5   # run 5 Codex sessions then stop
 #
 # Experiment targets are discovered from experiments/*/program.md.
-# Current repo target:
+# Current repo targets:
+#   qwen35-9B    — Qwen3.5-9B dense GGUF optimization
+#   qwen35-27B   — Qwen3.5-27B dense GGUF optimization
 #   qwen35-35B   — Qwen3.5-35B-A3B GGUF optimization
 #
 # To stop: Ctrl+C or kill this script. Current experiment will finish.
@@ -143,6 +145,65 @@ if ! make clean && make 2>/dev/null; then
     exit 1
 fi
 echo "[runner] Build OK."
+
+validate_cross_check_config() {
+    local cc="$1"
+    python3 - "$cc" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+with open(path) as f:
+    d = json.load(f)
+
+missing = [k for k in ("model", "min_tok_sec", "description") if not d.get(k)]
+if missing:
+    print(f"missing required keys: {', '.join(missing)}")
+    sys.exit(1)
+
+if d.get("quality_check", True) is False:
+    print("quality_check is disabled")
+    sys.exit(1)
+PY
+}
+
+validate_cross_check_suite() {
+    local suite_fail=0
+    local count=0
+    local d name cc reason
+
+    for d in experiments/*/; do
+        [[ -f "$d/program.md" ]] || continue
+        count=$((count + 1))
+        name="$(basename "$d")"
+        cc="$d/cross_check.json"
+
+        if [[ ! -f "$cc" ]]; then
+            echo "[runner] FATAL: $name is missing cross_check.json" | tee -a "$ERROR_LOG"
+            suite_fail=1
+            continue
+        fi
+
+        if ! reason="$(validate_cross_check_config "$cc" 2>&1)"; then
+            echo "[runner] FATAL: invalid cross_check.json for $name: $reason" | tee -a "$ERROR_LOG"
+            suite_fail=1
+        fi
+    done
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "[runner] FATAL: no experiment targets found under experiments/" | tee -a "$ERROR_LOG"
+        exit 1
+    fi
+
+    if [[ "$suite_fail" -ne 0 ]]; then
+        exit 1
+    fi
+
+    echo "[runner] Cross-check suite validated for $count experiment targets."
+}
+
+validate_cross_check_suite
 
 # ---- Collect regression checks ----
 # The current experiment can define a self-check in cross_check.json.
