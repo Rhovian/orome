@@ -61,3 +61,18 @@ n/a	66.12	2181.0	1.1011	keep	fuse QK RMS norm into delta_net kernel to eliminate
 n/a	66.57	2181.0	1.1011	keep	baseline: re-benchmark current HEAD before 2-row Q8_0 experiment
 n/a	66.74	2182.0	1.1011	keep	2-row GGUF Q8_0 matvec: halve threadgroups for all Q8_0 dispatches
 n/a	64.93	2183.0	1.1011	discard	column-major GDN state for cross-thread coalescing (still negative with deferred decay)
+n/a	66.80	2191.0	1.1011	keep	baseline: re-benchmark current HEAD before Q8_0 scale-hoist experiment
+n/a	66.41	2186.0	1.1011	discard	hoist Q8_0 scale factor out of inner loop in shared_gate_up_swiglu (compiler already does this)
+041860b	68.01	2209.0	1.1011	keep	fuse QK RMS norm + RoPE into single kernel: eliminate 1 dispatch+1 barrier per full-attn layer
+n/a	68.02	2175.0	1.1011	discard	fuse KV cache write into QK norm+RoPE kernel (noise-level, tiny kernel already negligible)
+041860b	67.23	2180.0	1.1011	keep	baseline: re-benchmark current HEAD before new experiments
+n/a	68.06	2201.0	1.1011	discard	fuse norm_apply_partial + routing_gate into single kernel (noise-level)
+n/a	67.74	2188.0	1.1011	discard	fuse gated_rms_norm into delta_net kernel (noise-level, extra TG barriers offset savings)
+041860b	67.70	2176.0	1.1011	keep	baseline: re-benchmark current HEAD before new session
+n/a	67.18	2181.0	1.1011	discard	fuse softmax_topk into expert gate_up_swiglu: redundant topk in 256 TGs offsets barrier savings
+n/a	67.88	2210.0	1.1011	discard	fuse norm_apply_partial into routing F32 matvec (noise-level, extra norm compute offsets barrier savings)
+041860b	68.91	2184.0	0.5887	keep	baseline: re-benchmark current HEAD before new session
+n/a	65.58	2188.0	0.5887	discard	2-row expert gate+up+SwiGLU Q4K: register pressure from 4 accumulators overwhelms TG reduction
+n/a	67.34	2214.0	1.1011	discard	4-row Q4K standalone matvec: register pressure from 4 accumulators still negative
+n/a	67.71	2233.0	1.1011	discard	reduce MATVEC_X_SHARED_SIZE from 8192 to 4096: no occupancy benefit, slightly slower
+n/a	67.80	2204.0	1.1011	discard	vectorize delta_net inner loops with half4/float4 reads: noise-level, compiler already optimizes

@@ -7,9 +7,11 @@ MoE inference engine for Apple Silicon, currently focused on the GGUF Qwen3.5-35
 ## Current Focus
 
 - Model: `Qwen3.5-35B-A3B-Q4_K_S.gguf`
-- Optimization target: sustained tok/s on the current GGUF-only codebase
+- Best GGUF result: **68.91 tok/s** at `041860b`
+- Historical packed-format peak: `62.39-62.53 tok/s`
 - Bottleneck: GPU dispatch and kernel efficiency, not SSD streaming
-- Active experiment loop: `experiments/qwen35-35B/`
+- Campaign status: current 35B GGUF campaign closed out near the wall
+- Experiment log: `experiments/qwen35-35B/`
 
 ## Quick Start
 
