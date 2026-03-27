@@ -221,8 +221,13 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
                                                     options:MTLResourceStorageModeShared];
 
     // Expert buffers (packed batch) (K × intermediate_dim)
-    int K_max = cfg->num_experts_per_tok < OROME_MAX_ACTIVE ? cfg->num_experts_per_tok : OROME_MAX_ACTIVE;
-    size_t batch_gate_size = (size_t)K_max * cfg->moe_intermediate * sizeof(float);
+    int K_max = cfg->num_experts_per_tok > 0 ? cfg->num_experts_per_tok : 1;
+    if (K_max > OROME_MAX_ACTIVE) K_max = OROME_MAX_ACTIVE;
+    int expert_intermediate = cfg->moe_intermediate > 0 ? cfg->moe_intermediate : 1;
+    int shared_scratch = cfg->shared_intermediate > cfg->moe_intermediate
+        ? cfg->shared_intermediate : cfg->moe_intermediate;
+    if (shared_scratch <= 0) shared_scratch = 1;
+    size_t batch_gate_size = (size_t)K_max * expert_intermediate * sizeof(float);
     size_t batch_out_size = (size_t)K_max * H * sizeof(float);
     ctx->buf_batch_expert_gate = [ctx->device newBufferWithLength:batch_gate_size
                                                           options:MTLResourceStorageModeShared];
@@ -235,11 +240,11 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->buf_topk_indices = [ctx->device newBufferWithLength:K_max * sizeof(uint32_t)
                                                      options:MTLResourceStorageModeShared];
 
-    ctx->buf_shared_gate = [ctx->device newBufferWithLength:cfg->shared_intermediate * sizeof(float)
+    ctx->buf_shared_gate = [ctx->device newBufferWithLength:(size_t)shared_scratch * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
-    ctx->buf_shared_up = [ctx->device newBufferWithLength:cfg->shared_intermediate * sizeof(float)
+    ctx->buf_shared_up = [ctx->device newBufferWithLength:(size_t)shared_scratch * sizeof(float)
                                                   options:MTLResourceStorageModeShared];
-    ctx->buf_shared_act = [ctx->device newBufferWithLength:cfg->shared_intermediate * sizeof(float)
+    ctx->buf_shared_act = [ctx->device newBufferWithLength:(size_t)shared_scratch * sizeof(float)
                                                    options:MTLResourceStorageModeShared];
     ctx->buf_shared_out = [ctx->device newBufferWithLength:H * sizeof(float)
                                                    options:MTLResourceStorageModeShared];

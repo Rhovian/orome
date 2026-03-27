@@ -38,6 +38,11 @@ typedef enum {
     ATTN_LINEAR,        // GatedDeltaNet (linear attention with SSM-style state)
 } AttnLayerType;
 
+typedef enum {
+    FFN_MOE,            // Routed experts + shared expert
+    FFN_DENSE,          // Standard dense SwiGLU FFN
+} FFNType;
+
 // ============================================================================
 // Model configuration — everything that varies between models
 // ============================================================================
@@ -76,10 +81,11 @@ typedef struct {
     float partial_rotary;       // fraction of head_dim that gets rotary, e.g. 0.25
     int rotary_dim;             // derived: head_dim * partial_rotary
 
-    // --- MoE ---
-    int num_experts;            // e.g. 256
-    int num_experts_per_tok;    // default active experts, e.g. 8
-    int moe_intermediate;       // expert FFN hidden dim, e.g. 512
+    // --- Feed-forward block ---
+    FFNType ffn_type;           // MoE for 35B-A3B, dense for 9B
+    int num_experts;            // e.g. 256 for MoE, 0 for dense
+    int num_experts_per_tok;    // default active experts, e.g. 8, 0 for dense
+    int moe_intermediate;       // FFN hidden dim (expert dim for MoE, intermediate dim for dense)
     int shared_intermediate;    // shared expert FFN hidden dim, e.g. 512
     // --- Special tokens ---
     int eos_tokens[4];          // EOS token IDs (up to 4, -1 terminated)
@@ -244,6 +250,9 @@ typedef struct {
     TensorRef shared_up;        // shared expert up projection
     TensorRef shared_down;      // shared expert down projection
     TensorRef shared_expert_gate; // scalar gate for shared expert
+    TensorRef dense_gate;       // dense SwiGLU gate projection
+    TensorRef dense_up;         // dense SwiGLU up projection
+    TensorRef dense_down;       // dense SwiGLU down projection
     union {
         struct {
             TensorRef qkv;      // fused Q+K+V projection
@@ -379,6 +388,7 @@ struct GGUFFile {
     uint32_t alignment;
     // Extracted model config from metadata
     char arch[32];
+    FFNType ffn_type;
     int num_layers, hidden_dim, num_experts, num_experts_per_tok;
     int num_attn_heads, num_kv_heads, moe_intermediate;
     float rope_theta;

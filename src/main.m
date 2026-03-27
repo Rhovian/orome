@@ -28,6 +28,8 @@ static void print_usage(const char *prog) {
         "  --thermal-gen N   Minimum tokens before thermal-K can engage\n"
         "  --serve PORT      Run HTTP/SSE server on PORT\n"
         "  --timing          Print per-token timing\n"
+        "  --gguf-info       Print GGUF tensor/metadata summary and exit\n"
+        "  --layers N        Limit inference to the first N layers\n"
         "  --help            Show this help\n",
         prog);
 }
@@ -114,6 +116,7 @@ int main(int argc, char **argv) {
             snprintf(cfg.name, sizeof(cfg.name), "%s", gf->arch);
             cfg.hidden_dim = gf->hidden_dim;
             cfg.num_layers = gf->num_layers;
+            cfg.ffn_type = gf->ffn_type;
             cfg.num_experts = gf->num_experts;
             cfg.num_experts_per_tok = gf->num_experts_per_tok;
             cfg.moe_intermediate = gf->moe_intermediate;
@@ -193,7 +196,7 @@ int main(int argc, char **argv) {
             }
 
             // Derive shared_intermediate from shared expert gate tensor shape
-            {
+            if (cfg.ffn_type == FFN_MOE) {
                 GGUFTensorInfo *sg = gguf_find_tensor(gf, "blk.0.ffn_gate_shexp.weight");
                 if (sg && sg->n_dims >= 2) {
                     cfg.shared_intermediate = (int)sg->dims[1];
@@ -201,6 +204,10 @@ int main(int argc, char **argv) {
                 } else {
                     cfg.shared_intermediate = cfg.moe_intermediate; // fallback
                 }
+            } else {
+                cfg.num_experts = 0;
+                cfg.num_experts_per_tok = 0;
+                cfg.shared_intermediate = 0;
             }
 
             // EOS tokens (Qwen3.5)
@@ -209,7 +216,11 @@ int main(int argc, char **argv) {
             cfg.eos_tokens[2] = -1;
             cfg.think_end_token = 248069;
 
-            if (active_k > 0) cfg.num_experts_per_tok = active_k;
+            if (cfg.ffn_type == FFN_MOE && active_k > 0) {
+                cfg.num_experts_per_tok = active_k;
+            } else if (cfg.ffn_type == FFN_DENSE && active_k > 0) {
+                fprintf(stderr, "[main] Ignoring --k for dense FFN model\n");
+            }
 
             // Set full_attn_interval and offset so init_derived generates correct layer types
             if (cfg.num_full_attn_layers > 0) {
@@ -237,9 +248,11 @@ int main(int argc, char **argv) {
             }
 
             fprintf(stderr, "[main] GGUF config: %s, %d layers (%d full + %d linear), "
-                    "hidden=%d, experts=%d, K=%d\n",
+                    "hidden=%d, ffn=%s, experts=%d, K=%d\n",
                     cfg.name, cfg.num_layers, cfg.num_full_attn_layers,
-                    cfg.num_linear_layers, cfg.hidden_dim, cfg.num_experts,
+                    cfg.num_linear_layers, cfg.hidden_dim,
+                    cfg.ffn_type == FFN_MOE ? "moe" : "dense",
+                    cfg.num_experts,
                     cfg.num_experts_per_tok);
 
             // Initialize Metal
@@ -301,24 +314,33 @@ int main(int argc, char **argv) {
                                                         ctx, &cfg, &eng->globals);
 
             // Pre-resolve expert layer refs (avoids per-token GGUF hash lookups)
-            eng->expert_layer_cache = calloc(cfg.num_layers, sizeof(ExpertLayerRef));
-            for (int i = 0; i < cfg.num_layers; i++) {
-                eng->expert_layer_cache[i] =
-                    format_resolve_expert_layer(fp, i, cfg.num_experts);
+            if (cfg.ffn_type == FFN_MOE) {
+                eng->expert_layer_cache = calloc(cfg.num_layers, sizeof(ExpertLayerRef));
+                for (int i = 0; i < cfg.num_layers; i++) {
+                    eng->expert_layer_cache[i] =
+                        format_resolve_expert_layer(fp, i, cfg.num_experts);
+                }
+                fprintf(stderr, "[main] Pre-resolved %d expert layer refs\n", cfg.num_layers);
             }
-            fprintf(stderr, "[main] Pre-resolved %d expert layer refs\n", cfg.num_layers);
 
         }
-        if (thermal_k > 0) {
+        if (thermal_k > 0 && cfg.ffn_type == FFN_MOE) {
             eng->thermal.enabled = true;
             eng->thermal.hot_k = thermal_k;
             eng->thermal.proj_threshold_ms = thermal_proj_ms;
             eng->thermal.min_gen = thermal_gen;
             printf("[main] Thermal-K enabled: K→%d when proj EMA > %.0fms (after %d tokens)\n",
                    thermal_k, thermal_proj_ms, thermal_gen);
+        } else if (thermal_k > 0) {
+            fprintf(stderr, "[main] Ignoring --thermal-k for dense FFN model\n");
         }
-        printf("[main] Engine ready: %s, %d layers, K=%d\n",
-               cfg.name, cfg.num_layers, eng->active_experts);
+        if (cfg.ffn_type == FFN_MOE) {
+            printf("[main] Engine ready: %s, %d layers, MoE K=%d\n",
+                   cfg.name, cfg.num_layers, eng->active_experts);
+        } else {
+            printf("[main] Engine ready: %s, %d layers, dense FFN\n",
+                   cfg.name, cfg.num_layers);
+        }
 
         // ---- Run ----
         if (serve_port > 0) {

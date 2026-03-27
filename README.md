@@ -1,12 +1,13 @@
 # Orome
 
-MoE inference engine for Apple Silicon, currently focused on the GGUF Qwen3.5-35B-A3B path.
+Inference engine for Apple Silicon, currently focused on GGUF Qwen3.5 models.
 
 **Hardware**: Mac Studio M2 Max — 38 GPU cores, 96 GB unified memory, NVMe SSD.
 
 ## Current Focus
 
-- Model: `Qwen3.5-35B-A3B-Q4_K_S.gguf`
+- Primary model: `Qwen3.5-35B-A3B-Q4_K_S.gguf`
+- Secondary bring-up target: `Qwen3.5-9B` GGUF
 - Best GGUF result: **68.91 tok/s** at `041860b`
 - Historical packed-format peak: `62.39-62.53 tok/s`
 - Bottleneck: GPU dispatch and kernel efficiency, not SSD streaming
@@ -51,6 +52,18 @@ tools/                 — Benchmarking, plotting, chat client
 ```
 
 The engine is parameterized by `ModelConfig` and GGUF metadata rather than hardcoded dimensions.
+
+## Qwen3.5-9B Notes
+
+Orome now distinguishes MoE vs dense FFN models from GGUF tensor names. The 35B-A3B path remains routed-MoE; Qwen3.5-9B is expected to use the dense SwiGLU FFN path.
+
+If your GGUF download does not include Orome's legacy `vocab.bin`, generate one from the official tokenizer assets:
+
+```bash
+python3 tools/build_vocab_bin.py /path/to/qwen-tokenizer-dir
+```
+
+Place the resulting `vocab.bin` next to the GGUF file or in the tokenizer asset directory that Orome can read.
 
 ## Research Notes
 

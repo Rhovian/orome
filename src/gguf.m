@@ -405,6 +405,24 @@ GGUFFile *gguf_open(const char *path) {
         }
     }
 
+    bool has_moe_tensors = false;
+    bool has_dense_ffn_tensors = false;
+    for (uint64_t i = 0; i < tensor_count; i++) {
+        const char *name = gf->tensors[i].name;
+        if (!name) continue;
+        if (strstr(name, "ffn_gate_exps") || strstr(name, "ffn_up_exps") ||
+            strstr(name, "ffn_down_exps")) {
+            has_moe_tensors = true;
+        } else if (strstr(name, ".ffn_gate.weight") ||
+                   strstr(name, ".ffn_up.weight") ||
+                   strstr(name, ".ffn_down.weight")) {
+            has_dense_ffn_tensors = true;
+        }
+    }
+    if (has_moe_tensors) gf->ffn_type = FFN_MOE;
+    else if (has_dense_ffn_tensors) gf->ffn_type = FFN_DENSE;
+    else gf->ffn_type = gf->num_experts > 0 ? FFN_MOE : FFN_DENSE;
+
     // Infer vocab_size from embedding tensor shape if not in metadata
     if (gf->vocab_size == 0) {
         for (uint64_t i = 0; i < tensor_count; i++) {
@@ -423,22 +441,38 @@ GGUFFile *gguf_open(const char *path) {
 
     // Infer moe_intermediate from tensor shapes if not in metadata
     if (gf->moe_intermediate == 0) {
-        for (uint64_t i = 0; i < tensor_count; i++) {
-            if (gf->tensors[i].name && strstr(gf->tensors[i].name, "ffn_gate_exps")) {
-                for (uint32_t d = 0; d < gf->tensors[i].n_dims; d++) {
-                    uint64_t dim = gf->tensors[i].dims[d];
+        for (uint64_t i = 0; i < tensor_count && gf->moe_intermediate == 0; i++) {
+            const GGUFTensorInfo *ti = &gf->tensors[i];
+            if (!ti->name) continue;
+
+            if (gf->ffn_type == FFN_MOE) {
+                if (!strstr(ti->name, "ffn_gate_exps")) continue;
+                for (uint32_t d = 0; d < ti->n_dims; d++) {
+                    uint64_t dim = ti->dims[d];
                     if (dim != (uint64_t)gf->hidden_dim && dim != (uint64_t)gf->num_experts) {
                         gf->moe_intermediate = (int)dim;
                         break;
                     }
                 }
-                break;
+            } else {
+                if (!strstr(ti->name, ".ffn_gate.weight") &&
+                    !strstr(ti->name, ".ffn_up.weight")) {
+                    continue;
+                }
+                for (uint32_t d = 0; d < ti->n_dims; d++) {
+                    uint64_t dim = ti->dims[d];
+                    if (dim != (uint64_t)gf->hidden_dim) {
+                        gf->moe_intermediate = (int)dim;
+                        break;
+                    }
+                }
             }
         }
     }
 
-    fprintf(stderr, "[gguf] arch=%s layers=%d hidden=%d experts=%d K=%d intermediate=%d vocab=%d\n",
+    fprintf(stderr, "[gguf] arch=%s layers=%d hidden=%d ffn=%s experts=%d K=%d intermediate=%d vocab=%d\n",
             gf->arch, gf->num_layers, gf->hidden_dim,
+            gf->ffn_type == FFN_MOE ? "moe" : "dense",
             gf->num_experts, gf->num_experts_per_tok, gf->moe_intermediate, gf->vocab_size);
 
     // Compute data_offset: current position, aligned up to alignment

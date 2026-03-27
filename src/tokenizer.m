@@ -43,6 +43,8 @@ int tokenizer_init(const char *model_dir) {
     }
 
     fprintf(stderr, "ERROR: Could not load tokenizer from any search path\n");
+    fprintf(stderr, "Hint: build vocab.bin from Hugging Face tokenizer assets with:\n");
+    fprintf(stderr, "  python3 tools/build_vocab_bin.py /path/to/tokenizer_dir\n");
     return -1;
 }
 

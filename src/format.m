@@ -276,20 +276,29 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
             c->post_norm = G_RAW(name);
         }
 
-        // MoE routing gate (F32)
-        snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp.weight", i);
-        c->routing_gate = G_REF(name, cfg->num_experts, H);
+        if (cfg->ffn_type == FFN_MOE) {
+            // MoE routing gate (F32)
+            snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp.weight", i);
+            c->routing_gate = G_REF(name, cfg->num_experts, H);
 
-        // Shared expert (may have different intermediate dim than routed experts)
-        int S = cfg->shared_intermediate > 0 ? cfg->shared_intermediate : M;
-        snprintf(name, sizeof(name), "blk.%d.ffn_gate_shexp.weight", i);
-        c->shared_gate = G_REF(name, S, H);
-        snprintf(name, sizeof(name), "blk.%d.ffn_up_shexp.weight", i);
-        c->shared_up = G_REF(name, S, H);
-        snprintf(name, sizeof(name), "blk.%d.ffn_down_shexp.weight", i);
-        c->shared_down = G_REF(name, H, S);
-        snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp_shexp.weight", i);
-        c->shared_expert_gate = G_REF(name, 1, H); // scalar gate [1, H] matvec
+            // Shared expert (may have different intermediate dim than routed experts)
+            int S = cfg->shared_intermediate > 0 ? cfg->shared_intermediate : M;
+            snprintf(name, sizeof(name), "blk.%d.ffn_gate_shexp.weight", i);
+            c->shared_gate = G_REF(name, S, H);
+            snprintf(name, sizeof(name), "blk.%d.ffn_up_shexp.weight", i);
+            c->shared_up = G_REF(name, S, H);
+            snprintf(name, sizeof(name), "blk.%d.ffn_down_shexp.weight", i);
+            c->shared_down = G_REF(name, H, S);
+            snprintf(name, sizeof(name), "blk.%d.ffn_gate_inp_shexp.weight", i);
+            c->shared_expert_gate = G_REF(name, 1, H); // scalar gate [1, H] matvec
+        } else {
+            snprintf(name, sizeof(name), "blk.%d.ffn_gate.weight", i);
+            c->dense_gate = G_REF(name, M, H);
+            snprintf(name, sizeof(name), "blk.%d.ffn_up.weight", i);
+            c->dense_up = G_REF(name, M, H);
+            snprintf(name, sizeof(name), "blk.%d.ffn_down.weight", i);
+            c->dense_down = G_REF(name, H, M);
+        }
 
         if (cfg->layer_types[i] == ATTN_LINEAR) {
             int conv_dim = cfg->linear_conv_dim;

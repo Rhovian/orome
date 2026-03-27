@@ -48,7 +48,9 @@ Engine *engine_create(ModelConfig *cfg, MetalCtx *ctx, int active_experts) {
     Engine *eng = calloc(1, sizeof(Engine));
     eng->cfg = cfg;
     eng->ctx = ctx;
-    eng->active_experts = active_experts > 0 ? active_experts : cfg->num_experts_per_tok;
+    eng->active_experts = (cfg->ffn_type == FFN_MOE)
+        ? (active_experts > 0 ? active_experts : cfg->num_experts_per_tok)
+        : 0;
     eng->thermal.enabled = false;
     eng->thermal.hot_k = 0;
     eng->thermal.min_gen = 16;
@@ -62,19 +64,20 @@ Engine *engine_create(ModelConfig *cfg, MetalCtx *ctx, int active_experts) {
 
 void engine_free(Engine *eng) {
     if (!eng) return;
+    free(eng->expert_layer_cache);
     free(eng->hidden);
     free(eng);
 }
 
 // Profiling accumulators (reset in engine_reset)
-static double t_attn_total = 0, t_moe_total = 0, t_lmhead_total = 0;
+static double t_attn_total = 0, t_ffn_total = 0, t_lmhead_total = 0;
 static int profile_count = 0;
 
 void engine_reset(Engine *eng) {
     eng->pos = 0;
     thermal_k_reset(&eng->thermal);
     // Reset profile accumulators
-    t_attn_total = 0; t_moe_total = 0; t_lmhead_total = 0;
+    t_attn_total = 0; t_ffn_total = 0; t_lmhead_total = 0;
     profile_count = 0;
 }
 
@@ -337,6 +340,42 @@ static void encode_experts_gguf(id<MTLComputeCommandEncoder> enc,
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 
+static void encode_dense_ffn(id<MTLComputeCommandEncoder> enc,
+                             MetalCtx *ctx, const ModelConfig *cfg,
+                             const LayerTensorCache *lt) {
+    int H = cfg->hidden_dim;
+    int M = cfg->moe_intermediate;
+
+    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_gate,
+        ctx->buf_input, 0, ctx->buf_shared_gate, 0);
+    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_up,
+        ctx->buf_input, 0, ctx->buf_shared_up, 0);
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    [enc setComputePipelineState:ctx->swiglu];
+    [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
+    [enc setBuffer:ctx->buf_shared_up offset:0 atIndex:1];
+    [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:2];
+    { uint dim_val = (uint)M; [enc setBytes:&dim_val length:sizeof(uint) atIndex:3]; }
+    [enc dispatchThreadgroups:MTLSizeMake(((uint)M + 255) / 256, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_down,
+        ctx->buf_shared_act, 0, ctx->buf_h_mid, 0);
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    [enc setComputePipelineState:ctx->residual_add_sq];
+    [enc setBuffer:ctx->buf_residual offset:0 atIndex:0];
+    [enc setBuffer:ctx->buf_h_mid offset:0 atIndex:1];
+    [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:2];
+    [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:3];
+    { uint d = (uint)H; [enc setBytes:&d length:sizeof(uint) atIndex:4]; }
+    [enc dispatchThreadgroups:MTLSizeMake(((uint)H + 255) / 256, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
 // ============================================================================
 // Forward pass: one token
 // ============================================================================
@@ -576,42 +615,50 @@ int engine_step(Engine *eng, int token_id) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
 
 
-            // --- Phase K: MoE routing + shared expert projections ---
-            { size_t sgg_off = n_experts * sizeof(float);
-                const LayerTensorCache *lt = &tcache[layer];
-                bool fuse_routing_shared_gate =
-                    ctx->matvec_f32_pair
-                    && lt->routing_gate.format == QFMT_F32
-                    && lt->shared_expert_gate.format == QFMT_F32
-                    && lt->routing_gate.out_dim == (uint32_t)n_experts
-                    && lt->shared_expert_gate.out_dim == 1
-                    && lt->routing_gate.in_dim == lt->shared_expert_gate.in_dim;
-                if (fuse_routing_shared_gate) {
-                    uint od = (uint)lt->routing_gate.out_dim;
-                    uint id_ = (uint)lt->routing_gate.in_dim;
-                    NSUInteger num_tgs = (od + 1 + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
-                    [enc setComputePipelineState:ctx->matvec_f32_pair];
-                    [enc setBuffer:lt->routing_gate.buffer offset:lt->routing_gate.offset atIndex:0];
-                    [enc setBuffer:lt->shared_expert_gate.buffer offset:lt->shared_expert_gate.offset atIndex:1];
-                    [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
-                    [enc setBuffer:ctx->buf_output offset:0 atIndex:3];
-                    [enc setBytes:&od length:sizeof(uint) atIndex:4];
-                    [enc setBytes:&id_ length:sizeof(uint) atIndex:5];
-                    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(ENGINE_ROWS_PER_TG * 32, 1, 1)];
-                } else {
-                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->routing_gate,
-                        ctx->buf_input, 0, ctx->buf_output, 0);
-                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_expert_gate,
-                        ctx->buf_input, 0, ctx->buf_output, sgg_off);
+            if (cfg->ffn_type == FFN_MOE) {
+                // --- Phase K: MoE routing + shared expert projections ---
+                { size_t sgg_off = n_experts * sizeof(float);
+                    const LayerTensorCache *lt = &tcache[layer];
+                    bool fuse_routing_shared_gate =
+                        ctx->matvec_f32_pair
+                        && lt->routing_gate.format == QFMT_F32
+                        && lt->shared_expert_gate.format == QFMT_F32
+                        && lt->routing_gate.out_dim == (uint32_t)n_experts
+                        && lt->shared_expert_gate.out_dim == 1
+                        && lt->routing_gate.in_dim == lt->shared_expert_gate.in_dim;
+                    if (fuse_routing_shared_gate) {
+                        uint od = (uint)lt->routing_gate.out_dim;
+                        uint id_ = (uint)lt->routing_gate.in_dim;
+                        NSUInteger num_tgs = (od + 1 + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
+                        [enc setComputePipelineState:ctx->matvec_f32_pair];
+                        [enc setBuffer:lt->routing_gate.buffer offset:lt->routing_gate.offset atIndex:0];
+                        [enc setBuffer:lt->shared_expert_gate.buffer offset:lt->shared_expert_gate.offset atIndex:1];
+                        [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
+                        [enc setBuffer:ctx->buf_output offset:0 atIndex:3];
+                        [enc setBytes:&od length:sizeof(uint) atIndex:4];
+                        [enc setBytes:&id_ length:sizeof(uint) atIndex:5];
+                        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(ENGINE_ROWS_PER_TG * 32, 1, 1)];
+                    } else {
+                        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->routing_gate,
+                            ctx->buf_input, 0, ctx->buf_output, 0);
+                        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_expert_gate,
+                            ctx->buf_input, 0, ctx->buf_output, sgg_off);
+                    }
+                    // GPU-resident expert forward
+                    double ffn_t0 = now_ms();
+                    encode_experts_gguf(enc, ctx, cfg,
+                                        &eng->expert_layer_cache[layer],
+                                        &tcache[layer], effective_k);
+                    t1 = now_ms();
+                    t_ffn_total += t1 - ffn_t0;
+                    t_attn_total += t1 - t0;
                 }
-                // GPU-resident expert forward
-                double moe_t0 = now_ms();
-                encode_experts_gguf(enc, ctx, cfg,
-                                    &eng->expert_layer_cache[layer],
-                                    &tcache[layer], effective_k);
+            } else {
+                double ffn_t0 = now_ms();
+                encode_dense_ffn(enc, ctx, cfg, &tcache[layer]);
                 t1 = now_ms();
-                t_moe_total += t1 - moe_t0;
+                t_ffn_total += t1 - ffn_t0;
                 t_attn_total += t1 - t0;
             }
 
@@ -820,42 +867,50 @@ int engine_step(Engine *eng, int token_id) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers]; }
 
 
-            // --- Phase L: MoE routing + shared expert projections ---
-            { size_t sgg_off = n_experts * sizeof(float);
-                const LayerTensorCache *lt = &tcache[layer];
-                bool fuse_routing_shared_gate =
-                    ctx->matvec_f32_pair
-                    && lt->routing_gate.format == QFMT_F32
-                    && lt->shared_expert_gate.format == QFMT_F32
-                    && lt->routing_gate.out_dim == (uint32_t)n_experts
-                    && lt->shared_expert_gate.out_dim == 1
-                    && lt->routing_gate.in_dim == lt->shared_expert_gate.in_dim;
-                if (fuse_routing_shared_gate) {
-                    uint od = (uint)lt->routing_gate.out_dim;
-                    uint id_ = (uint)lt->routing_gate.in_dim;
-                    NSUInteger num_tgs = (od + 1 + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
-                    [enc setComputePipelineState:ctx->matvec_f32_pair];
-                    [enc setBuffer:lt->routing_gate.buffer offset:lt->routing_gate.offset atIndex:0];
-                    [enc setBuffer:lt->shared_expert_gate.buffer offset:lt->shared_expert_gate.offset atIndex:1];
-                    [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
-                    [enc setBuffer:ctx->buf_output offset:0 atIndex:3];
-                    [enc setBytes:&od length:sizeof(uint) atIndex:4];
-                    [enc setBytes:&id_ length:sizeof(uint) atIndex:5];
-                    [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(ENGINE_ROWS_PER_TG * 32, 1, 1)];
-                } else {
-                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->routing_gate,
-                        ctx->buf_input, 0, ctx->buf_output, 0);
-                    format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_expert_gate,
-                        ctx->buf_input, 0, ctx->buf_output, sgg_off);
+            if (cfg->ffn_type == FFN_MOE) {
+                // --- Phase L: MoE routing + shared expert projections ---
+                { size_t sgg_off = n_experts * sizeof(float);
+                    const LayerTensorCache *lt = &tcache[layer];
+                    bool fuse_routing_shared_gate =
+                        ctx->matvec_f32_pair
+                        && lt->routing_gate.format == QFMT_F32
+                        && lt->shared_expert_gate.format == QFMT_F32
+                        && lt->routing_gate.out_dim == (uint32_t)n_experts
+                        && lt->shared_expert_gate.out_dim == 1
+                        && lt->routing_gate.in_dim == lt->shared_expert_gate.in_dim;
+                    if (fuse_routing_shared_gate) {
+                        uint od = (uint)lt->routing_gate.out_dim;
+                        uint id_ = (uint)lt->routing_gate.in_dim;
+                        NSUInteger num_tgs = (od + 1 + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
+                        [enc setComputePipelineState:ctx->matvec_f32_pair];
+                        [enc setBuffer:lt->routing_gate.buffer offset:lt->routing_gate.offset atIndex:0];
+                        [enc setBuffer:lt->shared_expert_gate.buffer offset:lt->shared_expert_gate.offset atIndex:1];
+                        [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
+                        [enc setBuffer:ctx->buf_output offset:0 atIndex:3];
+                        [enc setBytes:&od length:sizeof(uint) atIndex:4];
+                        [enc setBytes:&id_ length:sizeof(uint) atIndex:5];
+                        [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(ENGINE_ROWS_PER_TG * 32, 1, 1)];
+                    } else {
+                        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->routing_gate,
+                            ctx->buf_input, 0, ctx->buf_output, 0);
+                        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->shared_expert_gate,
+                            ctx->buf_input, 0, ctx->buf_output, sgg_off);
+                    }
+                    // GPU-resident expert forward
+                    double ffn_t0 = now_ms();
+                    encode_experts_gguf(enc, ctx, cfg,
+                                        &eng->expert_layer_cache[layer],
+                                        &tcache[layer], effective_k);
+                    t1 = now_ms();
+                    t_ffn_total += t1 - ffn_t0;
+                    t_attn_total += t1 - t0;
                 }
-                // GPU-resident expert forward
-                double moe_t0 = now_ms();
-                encode_experts_gguf(enc, ctx, cfg,
-                                    &eng->expert_layer_cache[layer],
-                                    &tcache[layer], effective_k);
+            } else {
+                double ffn_t0 = now_ms();
+                encode_dense_ffn(enc, ctx, cfg, &tcache[layer]);
                 t1 = now_ms();
-                t_moe_total += t1 - moe_t0;
+                t_ffn_total += t1 - ffn_t0;
                 t_attn_total += t1 - t0;
             }
 
@@ -944,9 +999,9 @@ int engine_step(Engine *eng, int token_id) {
     // Print profile every 10 tokens
     if (profile_count % 10 == 0) {
         double inv = 1.0 / profile_count;
-        double attn_only = t_attn_total - t_moe_total;
-        fprintf(stderr, "[profile] avg/tok: attn=%.1fms moe=%.1fms lmhead=%.1fms\n",
-                attn_only * inv, t_moe_total * inv, t_lmhead_total * inv);
+        double attn_only = t_attn_total - t_ffn_total;
+        fprintf(stderr, "[profile] avg/tok: attn=%.1fms ffn=%.1fms lmhead=%.1fms\n",
+                attn_only * inv, t_ffn_total * inv, t_lmhead_total * inv);
     }
 
     double step_ms = now_ms() - step_start;
