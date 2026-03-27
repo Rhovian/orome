@@ -366,7 +366,7 @@ static void encode_dense_ffn(id<MTLComputeCommandEncoder> enc,
     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
     [enc setComputePipelineState:ctx->residual_add_sq];
-    [enc setBuffer:ctx->buf_residual offset:0 atIndex:0];
+    [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
     [enc setBuffer:ctx->buf_h_mid offset:0 atIndex:1];
     [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:2];
     [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:3];
