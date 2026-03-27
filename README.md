@@ -78,3 +78,6 @@ Place the resulting `vocab.bin` next to the GGUF file or in the tokenizer asset 
 ```
 
 Launches Claude Code or Codex sessions that autonomously run experiments: modify source, build, benchmark, log results, commit or revert. Each session reads `status.md` for handoff, follows `program.md` for protocol, and appends to `results.tsv`.
+
+The benchmark harness now includes a chat-quality canary, and the runner reverts
+session commits if either throughput or visible output quality regresses.

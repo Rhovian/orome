@@ -144,9 +144,15 @@ if ! make clean && make 2>/dev/null; then
 fi
 echo "[runner] Build OK."
 
-# ---- Collect cross-model regression checks ----
-# Each OTHER experiment's cross_check.json defines a quick smoke benchmark.
-# After each successful session, we run all of them to catch regressions.
+# ---- Collect regression checks ----
+# The current experiment can define a self-check in cross_check.json.
+# Each OTHER experiment's cross_check.json defines a quick cross-model smoke check.
+# After each successful session, we run the self-check first, then all cross-model checks.
+SELF_CHECK="$EXPERIMENT_DIR/cross_check.json"
+if [[ ! -f "$SELF_CHECK" ]]; then
+    SELF_CHECK=""
+fi
+
 CROSS_CHECKS=()
 for d in experiments/*/; do
     other="$(basename "$d")"
@@ -154,6 +160,11 @@ for d in experiments/*/; do
     cc="$d/cross_check.json"
     [[ -f "$cc" ]] && CROSS_CHECKS+=("$cc")
 done
+if [[ -n "$SELF_CHECK" ]]; then
+    echo "[runner] Self-check configured: $SELF_CHECK"
+else
+    echo "[runner] No self-check configured"
+fi
 if [[ ${#CROSS_CHECKS[@]} -gt 0 ]]; then
     echo "[runner] Cross-model regression checks: ${CROSS_CHECKS[*]}"
 else
@@ -190,46 +201,126 @@ if best is not None:
 PY
 }
 
+run_check_config() {
+    local cc="$1"
+    local label="$2"
+    local cc_model cc_min_tok cc_tokens cc_k cc_desc cc_prompt
+    cc_model=$(python3 -c "import json; d=json.load(open('$cc')); print(d.get('model') or d.get('model_dir') or '')")
+    cc_min_tok=$(python3 -c "import json; print(json.load(open('$cc'))['min_tok_sec'])")
+    cc_tokens=$(python3 -c "import json; print(json.load(open('$cc')).get('tokens', 5))")
+    cc_k=$(python3 -c "import json; print(json.load(open('$cc')).get('k', 8))")
+    cc_desc=$(python3 -c "import json; print(json.load(open('$cc'))['description'])")
+    cc_prompt=$(python3 -c "import json; print(json.load(open('$cc')).get('prompt', ''))")
+
+    if [[ -z "$cc_model" ]]; then
+        echo "[$label] SKIP: $cc_desc (no model configured: $cc)"
+        return 0
+    fi
+
+    if [[ ! -e "$cc_model" ]]; then
+        echo "[$label] SKIP: $cc_desc (model not found: $cc_model)"
+        return 0
+    fi
+
+    echo "[$label] Running: $cc_desc"
+    local tmp_json tmp_err rc
+    tmp_json=$(mktemp)
+    tmp_err=$(mktemp)
+    rc=0
+    if [[ -n "$cc_prompt" ]]; then
+        python3 tools/benchmark.py \
+            --infer ./orome \
+            --model "$cc_model" \
+            --prompt "$cc_prompt" \
+            --tokens "$cc_tokens" \
+            --k "$cc_k" \
+            --trials 1 \
+            --warmup-runs 0 \
+            --cooldown-sec 0 \
+            --json \
+            --quality-config "$cc" \
+            >"$tmp_json" 2>"$tmp_err" || rc=$?
+    else
+        python3 tools/benchmark.py \
+            --infer ./orome \
+            --model "$cc_model" \
+            --tokens "$cc_tokens" \
+            --k "$cc_k" \
+            --trials 1 \
+            --warmup-runs 0 \
+            --cooldown-sec 0 \
+            --json \
+            --quality-config "$cc" \
+            >"$tmp_json" 2>"$tmp_err" || rc=$?
+    fi
+
+    if [[ ! -s "$tmp_json" ]]; then
+        echo "[$label] FAIL: $cc_desc — benchmark produced no JSON (exit $rc)"
+        echo "  stderr: $(tail -3 "$tmp_err" | tr '\n' ' ')"
+        rm -f "$tmp_json" "$tmp_err"
+        return 1
+    fi
+
+    local parsed tok_sec quality_pass quality_reply quality_reasons
+    parsed=$(python3 - "$tmp_json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+
+print(d.get("tok_sec_median", ""))
+print("yes" if d.get("quality_pass") else "no")
+print((d.get("quality_reply") or "").replace("\n", "\\n"))
+print("; ".join(d.get("quality_reasons") or []))
+PY
+)
+    tok_sec=$(printf '%s\n' "$parsed" | sed -n '1p')
+    quality_pass=$(printf '%s\n' "$parsed" | sed -n '2p')
+    quality_reply=$(printf '%s\n' "$parsed" | sed -n '3p')
+    quality_reasons=$(printf '%s\n' "$parsed" | sed -n '4p')
+
+    if [[ "$quality_pass" != "yes" ]]; then
+        echo "[$label] FAIL: $cc_desc — quality gate failed"
+        [[ -n "$quality_reasons" ]] && echo "  Reason: $quality_reasons"
+        [[ -n "$quality_reply" ]] && echo "  Reply: $quality_reply"
+        [[ -s "$tmp_err" ]] && echo "  stderr: $(tail -3 "$tmp_err" | tr '\n' ' ')"
+        rm -f "$tmp_json" "$tmp_err"
+        return 1
+    fi
+
+    if [[ -z "$tok_sec" ]]; then
+        echo "[$label] FAIL: $cc_desc — could not parse tok/s"
+        [[ -s "$tmp_err" ]] && echo "  stderr: $(tail -3 "$tmp_err" | tr '\n' ' ')"
+        rm -f "$tmp_json" "$tmp_err"
+        return 1
+    fi
+
+    local passed
+    passed=$(python3 -c "print('yes' if $tok_sec >= $cc_min_tok else 'no')")
+    if [[ "$passed" == "yes" ]]; then
+        echo "[$label] PASS: $cc_desc — ${tok_sec} tok/s (min: ${cc_min_tok}); reply: ${quality_reply}"
+        rm -f "$tmp_json" "$tmp_err"
+        return 0
+    fi
+
+    echo "[$label] FAIL: $cc_desc — ${tok_sec} tok/s < ${cc_min_tok} min"
+    [[ -n "$quality_reply" ]] && echo "  Reply: $quality_reply"
+    rm -f "$tmp_json" "$tmp_err"
+    return 1
+}
+
+run_self_check() {
+    [[ -n "$SELF_CHECK" ]] || return 0
+    run_check_config "$SELF_CHECK" "self-check"
+}
+
 run_cross_checks() {
     # Run each cross-model check. Returns 0 if all pass, 1 if any regress.
     local any_fail=0
     for cc in "${CROSS_CHECKS[@]}"; do
-        local cc_model cc_min_tok cc_tokens cc_k cc_desc
-        cc_model=$(python3 -c "import json; d=json.load(open('$cc')); print(d.get('model') or d.get('model_dir') or '')")
-        cc_min_tok=$(python3 -c "import json; print(json.load(open('$cc'))['min_tok_sec'])")
-        cc_tokens=$(python3 -c "import json; print(json.load(open('$cc')).get('tokens', 5))")
-        cc_k=$(python3 -c "import json; print(json.load(open('$cc')).get('k', 8))")
-        cc_desc=$(python3 -c "import json; print(json.load(open('$cc'))['description'])")
-
-        if [[ -z "$cc_model" ]]; then
-            echo "[cross-check] SKIP: $cc_desc (no model configured: $cc)"
-            continue
-        fi
-
-        if [[ ! -e "$cc_model" ]]; then
-            echo "[cross-check] SKIP: $cc_desc (model not found: $cc_model)"
-            continue
-        fi
-
-        echo "[cross-check] Running: $cc_desc"
-        local output
-        output=$(./orome --model "$cc_model" --prompt "Hello" --tokens "$cc_tokens" --k "$cc_k" 2>&1)
-        local tok_sec
-        tok_sec=$(echo "$output" | grep -o '[0-9.]* tok/s' | head -1 | awk '{print $1}')
-
-        if [[ -z "$tok_sec" ]]; then
-            echo "[cross-check] FAIL: $cc_desc — could not parse tok/s"
-            echo "  Output: $(echo "$output" | tail -3)"
+        if ! run_check_config "$cc" "cross-check"; then
             any_fail=1
-        else
-            local passed
-            passed=$(python3 -c "print('yes' if $tok_sec >= $cc_min_tok else 'no')")
-            if [[ "$passed" == "yes" ]]; then
-                echo "[cross-check] PASS: $cc_desc — ${tok_sec} tok/s (min: ${cc_min_tok})"
-            else
-                echo "[cross-check] FAIL: $cc_desc — ${tok_sec} tok/s < ${cc_min_tok} min"
-                any_fail=1
-            fi
         fi
     done
     return $any_fail
@@ -371,17 +462,29 @@ Use them for hypotheses and prior art, not as the live GGUF baseline."
         CONSECUTIVE_FAILURES=0  # reset on success
         echo "Session $SESSION_NUM OK (exit=0) at $(date '+%H:%M:%S') git=$GIT_HEAD_AFTER" >> "$ERROR_LOG"
 
-        # Cross-model regression check (only after successful sessions that changed code)
-        if [[ ${#CROSS_CHECKS[@]} -gt 0 && "$GIT_HEAD_BEFORE" != "$GIT_HEAD_AFTER" ]]; then
-            echo "[runner] Running cross-model regression checks..."
-            if ! run_cross_checks; then
+        # Self-check and cross-model regression checks (only after successful sessions that changed code)
+        if [[ "$GIT_HEAD_BEFORE" != "$GIT_HEAD_AFTER" ]]; then
+            regression_fail=0
+            if [[ -n "$SELF_CHECK" ]]; then
+                echo "[runner] Running self-check..."
+                if ! run_self_check; then
+                    regression_fail=1
+                fi
+            fi
+            if [[ "$regression_fail" -eq 0 && ${#CROSS_CHECKS[@]} -gt 0 ]]; then
+                echo "[runner] Running cross-model regression checks..."
+                if ! run_cross_checks; then
+                    regression_fail=1
+                fi
+            fi
+            if [[ "$regression_fail" -ne 0 ]]; then
                 {
                     echo ""
                     echo "--- Session $SESSION_NUM REGRESSION at $(date '+%Y-%m-%d %H:%M:%S') ---"
                     echo "  Model: $MODEL"
                     echo "  Git before: $GIT_HEAD_BEFORE"
                     echo "  Git after:  $GIT_HEAD_AFTER"
-                    echo "  Cross-model regression detected. Reverting to $GIT_HEAD_BEFORE."
+                    echo "  Regression or quality gate failure detected. Reverting to $GIT_HEAD_BEFORE."
                     echo "---"
                 } >> "$ERROR_LOG"
                 echo "[runner] REGRESSION detected. Reverting session commits..."
