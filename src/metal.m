@@ -108,6 +108,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->batch_swiglu     = make_pipeline(ctx, @"batch_swiglu");
     ctx->rms_norm_qk_w    = make_pipeline(ctx, @"rms_norm_qk_weighted");
     ctx->rope_apply       = make_pipeline(ctx, @"rope_apply");
+    ctx->rms_norm_qk_rope = make_pipeline(ctx, @"rms_norm_qk_rope");
     ctx->kv_cache_write   = make_pipeline(ctx, @"kv_cache_write");
     ctx->softmax_topk     = make_pipeline(ctx, @"softmax_topk_route");
     ctx->copy_buffer      = make_pipeline(ctx, @"copy_buffer");

@@ -729,6 +729,125 @@ kernel void rope_apply(
 }
 
 // ============================================================================
+// Kernel 18b: Fused QK RMS norm + RoPE
+// ============================================================================
+// Combines weighted QK RMS norm and partial rotary embedding into one kernel.
+// Eliminates 1 dispatch + 1 barrier per full-attention layer.
+// Dispatch: num_q_heads threadgroups, head_dim threads each (256)
+
+kernel void rms_norm_qk_rope(
+    device float *q,                  // [num_q_heads * head_dim] in/out
+    device float *k,                  // [num_kv_heads * head_dim] in/out
+    device const uint16_t *q_weight,  // [head_dim] bf16 norm weight for Q
+    device const uint16_t *k_weight,  // [head_dim] bf16 norm weight for K
+    constant uint &head_dim,          // = 256
+    constant uint &num_q_heads,       // = 16
+    constant uint &num_kv_heads,      // = 2
+    constant float &inv_scale,        // = 1/sqrt(head_dim)
+    constant uint &rotary_dim,        // = 64
+    constant uint &pos,               // current position
+    constant float &theta,            // rope_theta
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint half_rot = rotary_dim / 2;
+
+    // --- Q head: RMS norm + RoPE ---
+    if (head < num_q_heads) {
+        uint base = head * head_dim;
+        float qval = (tid < head_dim) ? q[base + tid] : 0;
+
+        float q_sq = qval * qval;
+        float q_simd = simd_sum(q_sq);
+        threadgroup float q_shared[8];
+        if (simd_lane == 0) q_shared[simd_group] = q_simd;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float q_total = 0;
+        if (simd_group == 0) {
+            float v = (simd_lane < 8) ? q_shared[simd_lane] : 0;
+            q_total = simd_sum(v);
+        }
+        threadgroup float q_broadcast;
+        if (tid == 0) q_broadcast = q_total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < head_dim) {
+            float inv_rms = rsqrt(q_broadcast / float(head_dim) + 1e-6f);
+            float w = bf16_to_f32(q_weight[tid]);
+            float normed = qval * inv_rms * w * inv_scale;
+
+            // Apply RoPE to first rotary_dim elements via threadgroup sharing
+            if (tid < rotary_dim) {
+                threadgroup float q_rope[256]; // reuse for RoPE pairs
+                q_rope[tid] = normed;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid < half_rot) {
+                    float freq = 1.0f / pow(theta, float(2 * tid) / float(rotary_dim));
+                    float angle = float(pos) * freq;
+                    float cos_a = cos(angle);
+                    float sin_a = sin(angle);
+                    float q0 = q_rope[tid];
+                    float q1 = q_rope[tid + half_rot];
+                    q[base + tid]            = q0 * cos_a - q1 * sin_a;
+                    q[base + tid + half_rot] = q0 * sin_a + q1 * cos_a;
+                }
+            } else {
+                q[base + tid] = normed;
+            }
+        }
+    }
+
+    // Need barrier before K reuses threadgroup memory
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- K head: RMS norm + RoPE ---
+    if (head < num_kv_heads) {
+        uint base = head * head_dim;
+        float kval = (tid < head_dim) ? k[base + tid] : 0;
+
+        float k_sq = kval * kval;
+        float k_simd = simd_sum(k_sq);
+        threadgroup float k_shared[8];
+        if (simd_lane == 0) k_shared[simd_group] = k_simd;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float k_total = 0;
+        if (simd_group == 0) {
+            float v = (simd_lane < 8) ? k_shared[simd_lane] : 0;
+            k_total = simd_sum(v);
+        }
+        threadgroup float k_broadcast;
+        if (tid == 0) k_broadcast = k_total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < head_dim) {
+            float inv_rms = rsqrt(k_broadcast / float(head_dim) + 1e-6f);
+            float w = bf16_to_f32(k_weight[tid]);
+            float normed = kval * inv_rms * w;
+
+            if (tid < rotary_dim) {
+                threadgroup float k_rope[256];
+                k_rope[tid] = normed;
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid < half_rot) {
+                    float freq = 1.0f / pow(theta, float(2 * tid) / float(rotary_dim));
+                    float angle = float(pos) * freq;
+                    float cos_a = cos(angle);
+                    float sin_a = sin(angle);
+                    float k0 = k_rope[tid];
+                    float k1 = k_rope[tid + half_rot];
+                    k[base + tid]            = k0 * cos_a - k1 * sin_a;
+                    k[base + tid + half_rot] = k0 * sin_a + k1 * cos_a;
+                }
+            } else {
+                k[base + tid] = normed;
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Kernel 19: KV cache write (scatter one token's K/V into cache)
 // ============================================================================
 // Write K[kv_dim] and V[kv_dim] at position pos into the KV cache.

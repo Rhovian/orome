@@ -118,6 +118,7 @@ typedef struct {
     id<MTLComputePipelineState> batch_swiglu;
     id<MTLComputePipelineState> rms_norm_qk_w;
     id<MTLComputePipelineState> rope_apply;
+    id<MTLComputePipelineState> rms_norm_qk_rope;
     id<MTLComputePipelineState> kv_cache_write;
     id<MTLComputePipelineState> softmax_topk;
     id<MTLComputePipelineState> copy_buffer;
