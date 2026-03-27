@@ -27,7 +27,6 @@ typedef struct GGUFTensorInfo GGUFTensorInfo;
 // ============================================================================
 
 #define OROME_MAX_ACTIVE        16      // max active experts per token
-#define OROME_GPU_KV_SEQ        4096    // GPU-side KV cache for attention offload
 
 // ============================================================================
 // Attention layer type
@@ -55,6 +54,7 @@ typedef struct {
     int hidden_dim;             // e.g. 2048
     int num_layers;             // e.g. 40
     int vocab_size;             // e.g. 248320
+    int context_length;         // max context length advertised by the model
     float rms_norm_eps;         // e.g. 1e-6
 
     // --- Full attention ---
@@ -89,13 +89,19 @@ typedef struct {
     int shared_intermediate;    // shared expert FFN hidden dim, e.g. 512
     // --- Special tokens ---
     int eos_tokens[4];          // EOS token IDs (up to 4, -1 terminated)
+    int chat_start_token;
+    int chat_end_token;
+    int think_start_token;
     int think_end_token;
+    bool chat_prefill_think;
 
     // --- Derived (computed during init) ---
     int linear_total_key;       // linear_num_k_heads * linear_key_dim
     int linear_total_value;     // linear_num_v_heads * linear_value_dim
     int linear_conv_dim;        // total_key*2 + total_value
     int kv_dim;                 // num_kv_heads * head_dim
+    int q_heads_per_kv;         // derived grouped-query ratio
+    int linear_v_heads_per_k;   // derived linear-attention sharing ratio
 } ModelConfig;
 
 // Compute derived fields and expert layouts from the core fields.
@@ -109,6 +115,7 @@ typedef struct {
     id<MTLDevice>               device;
     id<MTLCommandQueue>         queue;
     id<MTLLibrary>              library;
+    int                         kv_cache_seq;
 
     // Pipelines
     id<MTLComputePipelineState> norm_sum_sq;
@@ -194,6 +201,7 @@ typedef struct {
 } MetalCtx;
 
 MetalCtx *metal_setup(const ModelConfig *cfg);
+bool      metal_ensure_kv_capacity(MetalCtx *ctx, const ModelConfig *cfg, int seq_len);
 void metal_free(MetalCtx *ctx);
 
 // ============================================================================
@@ -356,6 +364,8 @@ typedef struct {
 int           tokenizer_init(const char *model_dir);
 PromptTokens *tokenizer_encode(const char *text);
 const char   *tokenizer_decode(int token_id);
+int           tokenizer_find_token(const char *text);
+int           tokenizer_find_added_tokens_in_text(const char *text, int *ids, int max_ids);
 void          prompt_tokens_free(PromptTokens *pt);
 
 bool          is_eos_token(const ModelConfig *cfg, int token_id);
@@ -398,6 +408,7 @@ struct GGUFFile {
     int ssm_time_step_rank, ssm_inner_size;
     int full_attention_interval;
     int eos_token_id, padding_token_id;
+    char *chat_template;
     float rope_theta;
     float rms_norm_eps;
     int vocab_size;

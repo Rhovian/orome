@@ -7,7 +7,7 @@
  *   GET  /health              — health check
  *
  * Chat completions parses the full OpenAI messages array and formats it
- * with Qwen chat template (<|im_start|>role\ncontent<|im_end|>).
+ * with model-resolved chat markers when available.
  * Each request resets the engine and re-prefills the entire conversation.
  */
 
@@ -103,6 +103,139 @@ static void sse_send_done(int fd, const char *req_id) {
              "data: [DONE]\n\n",
              req_id);
     http_write_str(fd, chunk);
+}
+
+// ============================================================================
+// Prompt building helpers
+// ============================================================================
+
+typedef struct {
+    int *ids;
+    int count;
+    int cap;
+} PromptBuilder;
+
+static bool prompt_builder_reserve(PromptBuilder *pb, int extra) {
+    if (!pb || extra < 0) return false;
+    if (pb->count + extra <= pb->cap) return true;
+
+    int new_cap = pb->cap > 0 ? pb->cap : 128;
+    while (new_cap < pb->count + extra) {
+        new_cap *= 2;
+    }
+
+    int *new_ids = realloc(pb->ids, (size_t)new_cap * sizeof(int));
+    if (!new_ids) return false;
+    pb->ids = new_ids;
+    pb->cap = new_cap;
+    return true;
+}
+
+static bool prompt_builder_append_token(PromptBuilder *pb, int token_id) {
+    if (token_id < 0) return true;
+    if (!prompt_builder_reserve(pb, 1)) return false;
+    pb->ids[pb->count++] = token_id;
+    return true;
+}
+
+static bool prompt_builder_append_text(PromptBuilder *pb, const char *text) {
+    if (!text || text[0] == '\0') return true;
+    PromptTokens *frag = tokenizer_encode(text);
+    if (!frag) return false;
+    bool ok = prompt_builder_reserve(pb, frag->count);
+    if (ok) {
+        memcpy(pb->ids + pb->count, frag->ids, (size_t)frag->count * sizeof(int));
+        pb->count += frag->count;
+    }
+    prompt_tokens_free(frag);
+    return ok;
+}
+
+static bool string_has_token_prefix(NSString *text, int token_id) {
+    if (token_id < 0 || ![text isKindOfClass:[NSString class]]) return false;
+    const char *tok_text = tokenizer_decode(token_id);
+    if (!tok_text || tok_text[0] == '\0') return false;
+    NSString *prefix = [NSString stringWithUTF8String:tok_text];
+    return prefix ? [text hasPrefix:prefix] : false;
+}
+
+static bool append_chat_turn(PromptBuilder *pb, const ModelConfig *cfg,
+                             const char *role, const char *content,
+                             bool inject_empty_think) {
+    bool use_chat_tokens = cfg->chat_start_token >= 0 && cfg->chat_end_token >= 0;
+
+    if (use_chat_tokens && !prompt_builder_append_token(pb, cfg->chat_start_token)) return false;
+    if (!prompt_builder_append_text(pb, role)) return false;
+    if (!prompt_builder_append_text(pb, "\n")) return false;
+
+    if (inject_empty_think && cfg->think_start_token >= 0 && cfg->think_end_token >= 0) {
+        if (!prompt_builder_append_token(pb, cfg->think_start_token)) return false;
+        if (!prompt_builder_append_text(pb, "\n\n")) return false;
+        if (!prompt_builder_append_token(pb, cfg->think_end_token)) return false;
+        if (!prompt_builder_append_text(pb, "\n\n")) return false;
+    }
+
+    if (!prompt_builder_append_text(pb, content)) return false;
+
+    if (use_chat_tokens) {
+        if (!prompt_builder_append_token(pb, cfg->chat_end_token)) return false;
+        return prompt_builder_append_text(pb, "\n");
+    }
+    return prompt_builder_append_text(pb, "\n\n");
+}
+
+static bool append_generation_prefix(PromptBuilder *pb, const ModelConfig *cfg) {
+    if (cfg->chat_start_token >= 0 && !prompt_builder_append_token(pb, cfg->chat_start_token)) {
+        return false;
+    }
+    if (!prompt_builder_append_text(pb, "assistant\n")) return false;
+    if (cfg->chat_prefill_think &&
+        cfg->think_start_token >= 0 &&
+        cfg->think_end_token >= 0) {
+        if (!prompt_builder_append_token(pb, cfg->think_start_token)) return false;
+        if (!prompt_builder_append_text(pb, "\n\n")) return false;
+        if (!prompt_builder_append_token(pb, cfg->think_end_token)) return false;
+        if (!prompt_builder_append_text(pb, "\n\n")) return false;
+    }
+    return true;
+}
+
+static PromptTokens *build_chat_prompt_tokens(const ModelConfig *cfg, NSArray *messages) {
+    PromptBuilder pb = {0};
+
+    if ([messages isKindOfClass:[NSArray class]] && messages.count > 0) {
+        for (NSDictionary *msg in messages) {
+            NSString *role = msg[@"role"];
+            NSString *content = msg[@"content"];
+            if (![role isKindOfClass:[NSString class]] || ![content isKindOfClass:[NSString class]]) {
+                continue;
+            }
+
+            bool inject_empty_think =
+                cfg->chat_prefill_think &&
+                [role isEqualToString:@"assistant"] &&
+                !string_has_token_prefix(content, cfg->think_start_token);
+            if (!append_chat_turn(&pb, cfg, [role UTF8String], [content UTF8String], inject_empty_think)) {
+                free(pb.ids);
+                return NULL;
+            }
+        }
+    } else {
+        if (!append_chat_turn(&pb, cfg, "user", "Hello", false)) {
+            free(pb.ids);
+            return NULL;
+        }
+    }
+
+    if (!append_generation_prefix(&pb, cfg)) {
+        free(pb.ids);
+        return NULL;
+    }
+
+    PromptTokens *pt = calloc(1, sizeof(PromptTokens));
+    pt->ids = pb.ids;
+    pt->count = pb.count;
+    return pt;
 }
 
 // ============================================================================
@@ -205,7 +338,7 @@ void serve_loop(Engine *eng, int port) {
             @autoreleasepool {
             // Parse JSON body
             char *body_start = strstr(req, "\r\n\r\n");
-            char *prompt = NULL;
+            PromptTokens *pt = NULL;
             int max_tokens = 256;
             float temperature = 0.6f;
             int top_k = 20;
@@ -221,33 +354,35 @@ void serve_loop(Engine *eng, int port) {
                     if (mt) max_tokens = [mt intValue];
                     NSNumber *temp = json[@"temperature"];
                     if (temp) temperature = [temp floatValue];
-
-                    // Build chat-templated prompt from messages array
-                    NSArray *messages = json[@"messages"];
-                    if ([messages isKindOfClass:[NSArray class]] && messages.count > 0) {
-                        NSMutableString *chat = [NSMutableString new];
-                        for (NSDictionary *msg in messages) {
-                            NSString *role = msg[@"role"];
-                            NSString *content = msg[@"content"];
-                            if (!role || !content) continue;
-                            // For assistant messages, wrap in think block if not present
-                            if ([role isEqualToString:@"assistant"]
-                                && ![content hasPrefix:@"<think>"]) {
-                                [chat appendFormat:@"<|im_start|>assistant\n<think>\n</think>\n%@<|im_end|>\n",
-                                 content];
-                            } else {
-                                [chat appendFormat:@"<|im_start|>%@\n%@<|im_end|>\n",
-                                 role, content];
-                            }
-                        }
-                        // Add assistant turn prefix for generation
-                        [chat appendString:@"<|im_start|>assistant\n"];
-                        prompt = strdup([chat UTF8String]);
-                    }
+                    pt = build_chat_prompt_tokens(eng->cfg, json[@"messages"]);
                 }
             }
 
-            if (!prompt) prompt = strdup("<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n");
+            if (!pt) {
+                pt = build_chat_prompt_tokens(eng->cfg, nil);
+            }
+            if (!pt) {
+                http_write_str(client_fd,
+                    "HTTP/1.1 500 Internal Server Error\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Connection: close\r\n\r\n"
+                    "{\"error\":\"failed to build prompt\"}\n");
+                free(req);
+                close(client_fd);
+                continue;
+            }
+            int needed_seq = pt->count + (max_tokens > 0 ? max_tokens : 0);
+            if (!metal_ensure_kv_capacity(eng->ctx, eng->cfg, needed_seq > 0 ? needed_seq : 1)) {
+                prompt_tokens_free(pt);
+                http_write_str(client_fd,
+                    "HTTP/1.1 500 Internal Server Error\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Connection: close\r\n\r\n"
+                    "{\"error\":\"failed to size KV cache\"}\n");
+                free(req);
+                close(client_fd);
+                continue;
+            }
 
             // SSE headers
             http_write_str(client_fd,
@@ -259,15 +394,11 @@ void serve_loop(Engine *eng, int port) {
 
             // Tokenize and prefill full conversation (greedy — no sampling)
             engine_reset(eng);
-            PromptTokens *pt = tokenizer_encode(prompt);
-            free(prompt);
             int next_token = 0;
-            if (pt) {
-                for (int i = 0; i < pt->count; i++) {
-                    next_token = engine_step(eng, pt->ids[i]);
-                }
-                prompt_tokens_free(pt);
+            for (int i = 0; i < pt->count; i++) {
+                next_token = engine_step(eng, pt->ids[i]);
             }
+            prompt_tokens_free(pt);
 
             // Re-sample the first token after prefill
             if (temperature > 0) {
@@ -279,18 +410,18 @@ void serve_loop(Engine *eng, int port) {
             // Generate — detect and filter think blocks dynamically
             char req_id[32];
             snprintf(req_id, sizeof(req_id), "cmpl-%d", (int)eng->pos);
-            int think_start_token = 248068;  // <think>
-            int think_end_token = eng->cfg->think_end_token;  // </think> = 248069
+            int think_start_token = eng->cfg->think_start_token;
+            int think_end_token = eng->cfg->think_end_token;
             bool in_think = false;
             for (int i = 0; i < max_tokens; i++) {
                 if (is_eos_token(eng->cfg, next_token)) break;
 
-                if (next_token == think_start_token) {
+                if (think_start_token >= 0 && next_token == think_start_token) {
                     in_think = true;
                     next_token = sample_next(eng, next_token, temperature, top_k);
                     continue;
                 }
-                if (next_token == think_end_token) {
+                if (think_end_token >= 0 && next_token == think_end_token) {
                     in_think = false;
                     next_token = sample_next(eng, next_token, temperature, top_k);
                     // Skip newline after </think>

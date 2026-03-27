@@ -219,9 +219,11 @@ void bpe_free(bpe_tokenizer *tok) {
     for (uint32_t i = 0; i < tok->num_added; i++) free(tok->added[i].str);
     free(tok->added);
     free(tok->ht_ids); free(tok->ht_keys); free(tok->ht_klens);
-    uint32_t mt_cap = tok->mt_mask + 1;
-    for (uint32_t i = 0; i < mt_cap; i++)
-        if (tok->mt_prio[i] != 0xFFFFFFFF) free(tok->mt_keys[i]);
+    if (tok->mt_prio && tok->mt_keys) {
+        uint32_t mt_cap = tok->mt_mask + 1;
+        for (uint32_t i = 0; i < mt_cap; i++)
+            if (tok->mt_prio[i] != 0xFFFFFFFF) free(tok->mt_keys[i]);
+    }
     free(tok->mt_prio); free(tok->mt_keys); free(tok->mt_klens);
     memset(tok, 0, sizeof(*tok));
 }

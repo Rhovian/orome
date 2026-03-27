@@ -387,6 +387,14 @@ int engine_step(Engine *eng, int token_id) {
     int H = cfg->hidden_dim;
     int pos = eng->pos;
     double step_start = now_ms();
+    MetalCtx *ctx = eng->ctx;
+    LayerTensorCache *tcache = eng->tensor_cache;
+
+    if (cfg->num_full_attn_layers > 0 &&
+        !metal_ensure_kv_capacity(ctx, cfg, pos + 1)) {
+        fprintf(stderr, "ERROR: KV cache unavailable for token position %d\n", pos);
+        return cfg->eos_tokens[0] >= 0 ? cfg->eos_tokens[0] : 0;
+    }
 
     // 1. Embedding
     memset(eng->hidden, 0, H * sizeof(float));
@@ -395,9 +403,6 @@ int engine_step(Engine *eng, int token_id) {
     // 2. Layer loop — fused O-proj + post-norm + MoE routing in one GPU commit
     int full_idx = 0, linear_idx = 0;
     double t0, t1;
-    MetalCtx *ctx = eng->ctx;
-    LayerTensorCache *tcache = eng->tensor_cache;
-
     // Upload hidden to GPU once before the layer loop.
     // Hidden state stays on GPU (in buf_moe_hidden) throughout all layers.
     memcpy([ctx->buf_moe_hidden contents], eng->hidden, H * sizeof(float));
@@ -419,7 +424,6 @@ int engine_step(Engine *eng, int token_id) {
             int total_key = cfg->linear_total_key;
             int conv_dim = cfg->linear_conv_dim;
             int n_v_heads = cfg->linear_num_v_heads;
-            int n_k_heads = cfg->linear_num_k_heads;
             int key_dim = cfg->linear_key_dim;
             int value_dim = cfg->linear_value_dim;
 
@@ -524,7 +528,7 @@ int engine_step(Engine *eng, int token_id) {
             // --- Phase D+F: GatedDeltaNet with fused QK RMS norm ---
             // QK norm is now computed inline within delta_net's shared memory loading.
             // Q/K from buf_conv_output (raw, pre-norm), V at offset 2*total_key
-            { uint k_per_v = (uint)(n_v_heads / n_k_heads);
+            { uint k_per_v = (uint)cfg->linear_v_heads_per_k;
               float inv_s = 1.0f / sqrtf((float)key_dim);
             [enc setComputePipelineState:ctx->delta_net];
             [enc setBuffer:ctx->buf_linear_state[linear_idx] offset:0 atIndex:0];
@@ -764,9 +768,9 @@ int engine_step(Engine *eng, int token_id) {
             [enc setBuffer:ctx->buf_kv_k[full_idx] offset:0 atIndex:1];
             [enc setBuffer:ctx->buf_attn_scores offset:0 atIndex:2];
             { uint hd_val = (uint)hd, kvd = (uint)kv_dim;
-              uint sl = (uint)seq_len, ss = (uint)OROME_GPU_KV_SEQ;
+              uint sl = (uint)seq_len, ss = (uint)ctx->kv_cache_seq;
               float scale = 1.0f;  // already scaled in QK norm
-              uint hpk = (uint)(n_heads / n_kv);
+              uint hpk = (uint)cfg->q_heads_per_kv;
               uint nst = (uint)seq_len;
               [enc setBytes:&hd_val length:sizeof(uint) atIndex:3];
               [enc setBytes:&kvd length:sizeof(uint) atIndex:4];
@@ -782,7 +786,7 @@ int engine_step(Engine *eng, int token_id) {
             // --- Phase G: Softmax ---
             [enc setComputePipelineState:ctx->attn_softmax];
             [enc setBuffer:ctx->buf_attn_scores offset:0 atIndex:0];
-            { uint sl = (uint)seq_len, ss = (uint)OROME_GPU_KV_SEQ;
+            { uint sl = (uint)seq_len, ss = (uint)ctx->kv_cache_seq;
               [enc setBytes:&sl length:sizeof(uint) atIndex:1];
               [enc setBytes:&ss length:sizeof(uint) atIndex:2]; }
             [enc dispatchThreadgroups:MTLSizeMake(n_heads, 1, 1)
@@ -796,8 +800,8 @@ int engine_step(Engine *eng, int token_id) {
             [enc setBuffer:ctx->buf_kv_v[full_idx] offset:0 atIndex:1];
             [enc setBuffer:ctx->buf_attn_output offset:0 atIndex:2];
             { uint hd_val = (uint)hd, kvd = (uint)kv_dim;
-              uint sl = (uint)seq_len, ss = (uint)OROME_GPU_KV_SEQ;
-              uint hpk = (uint)(n_heads / n_kv);
+              uint sl = (uint)seq_len, ss = (uint)ctx->kv_cache_seq;
+              uint hpk = (uint)cfg->q_heads_per_kv;
               [enc setBytes:&hd_val length:sizeof(uint) atIndex:3];
               [enc setBytes:&kvd length:sizeof(uint) atIndex:4];
               [enc setBytes:&sl length:sizeof(uint) atIndex:5];

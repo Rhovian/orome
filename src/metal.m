@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #include "orome.h"
 
@@ -163,23 +164,13 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->buf_combine_params = [ctx->device newBufferWithLength:(OROME_MAX_ACTIVE + 2) * sizeof(float)
                                                        options:MTLResourceStorageModeShared];
 
+    ctx->kv_cache_seq = 0;
+
     // KV cache GPU buffers (full attention layers only)
     int n_full = cfg->num_full_attn_layers;
     ctx->buf_kv_k = (__strong id<MTLBuffer> *)calloc(n_full, sizeof(id<MTLBuffer>));
     ctx->buf_kv_v = (__strong id<MTLBuffer> *)calloc(n_full, sizeof(id<MTLBuffer>));
-    size_t kv_size = (size_t)OROME_GPU_KV_SEQ * cfg->kv_dim * sizeof(float);
-    for (int i = 0; i < n_full; i++) {
-        ctx->buf_kv_k[i] = [ctx->device newBufferWithLength:kv_size
-                                                    options:MTLResourceStorageModeShared];
-        ctx->buf_kv_v[i] = [ctx->device newBufferWithLength:kv_size
-                                                    options:MTLResourceStorageModeShared];
-        if (ctx->buf_kv_k[i]) memset([ctx->buf_kv_k[i] contents], 0, kv_size);
-        if (ctx->buf_kv_v[i]) memset([ctx->buf_kv_v[i] contents], 0, kv_size);
-    }
-
-    ctx->buf_attn_scores = [ctx->device newBufferWithLength:
-        (size_t)cfg->num_attn_heads * OROME_GPU_KV_SEQ * sizeof(float)
-        options:MTLResourceStorageModeShared];
+    ctx->buf_attn_scores = nil;
     // 2× for attn_output_gate: Q projection stores [Q, gate] concatenated
     ctx->buf_attn_output = [ctx->device newBufferWithLength:
         (size_t)cfg->num_attn_heads * cfg->head_dim * 2 * sizeof(float)
@@ -252,6 +243,69 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     printf("[metal] Buffers allocated for %s (%d layers, %d hidden)\n",
            cfg->name, cfg->num_layers, cfg->hidden_dim);
     return ctx;
+}
+
+bool metal_ensure_kv_capacity(MetalCtx *ctx, const ModelConfig *cfg, int seq_len) {
+    if (!ctx || !cfg || seq_len <= 0) return seq_len <= 0;
+    if (cfg->num_full_attn_layers == 0) return true;
+    if (cfg->context_length > 0 && seq_len > cfg->context_length) {
+        fprintf(stderr, "ERROR: requested sequence length %d exceeds model context %d\n",
+                seq_len, cfg->context_length);
+        return false;
+    }
+    if (seq_len <= ctx->kv_cache_seq) return true;
+
+    int new_seq = ctx->kv_cache_seq > 0 ? ctx->kv_cache_seq : 256;
+    while (new_seq < seq_len) {
+        if (new_seq > INT_MAX / 2) {
+            new_seq = seq_len;
+            break;
+        }
+        new_seq *= 2;
+    }
+    if (cfg->context_length > 0 && new_seq > cfg->context_length) {
+        new_seq = cfg->context_length;
+    }
+    if (new_seq < seq_len) {
+        fprintf(stderr, "ERROR: could not grow KV cache to %d tokens\n", seq_len);
+        return false;
+    }
+
+    size_t old_kv_size = (size_t)ctx->kv_cache_seq * cfg->kv_dim * sizeof(float);
+    size_t new_kv_size = (size_t)new_seq * cfg->kv_dim * sizeof(float);
+    for (int i = 0; i < cfg->num_full_attn_layers; i++) {
+        id<MTLBuffer> new_k = [ctx->device newBufferWithLength:new_kv_size
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> new_v = [ctx->device newBufferWithLength:new_kv_size
+                                                       options:MTLResourceStorageModeShared];
+        if (!new_k || !new_v) {
+            fprintf(stderr, "ERROR: failed to allocate KV cache buffers for %d tokens\n", new_seq);
+            return false;
+        }
+        memset([new_k contents], 0, new_kv_size);
+        memset([new_v contents], 0, new_kv_size);
+        if (ctx->buf_kv_k[i] && old_kv_size > 0) {
+            memcpy([new_k contents], [ctx->buf_kv_k[i] contents], old_kv_size);
+        }
+        if (ctx->buf_kv_v[i] && old_kv_size > 0) {
+            memcpy([new_v contents], [ctx->buf_kv_v[i] contents], old_kv_size);
+        }
+        ctx->buf_kv_k[i] = new_k;
+        ctx->buf_kv_v[i] = new_v;
+    }
+
+    size_t score_size = (size_t)cfg->num_attn_heads * new_seq * sizeof(float);
+    id<MTLBuffer> new_scores = [ctx->device newBufferWithLength:score_size
+                                                        options:MTLResourceStorageModeShared];
+    if (!new_scores) {
+        fprintf(stderr, "ERROR: failed to allocate attention score buffer for %d tokens\n", new_seq);
+        return false;
+    }
+    memset([new_scores contents], 0, score_size);
+    ctx->buf_attn_scores = new_scores;
+    ctx->kv_cache_seq = new_seq;
+    fprintf(stderr, "[metal] KV cache capacity: %d tokens\n", ctx->kv_cache_seq);
+    return true;
 }
 
 void metal_free(MetalCtx *ctx) {

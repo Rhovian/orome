@@ -318,6 +318,8 @@ GGUFFile *gguf_open(const char *path) {
     gf->mmap_base = mapped;
     gf->file_size = file_size;
     gf->num_tensors = tensor_count;
+    gf->eos_token_id = -1;
+    gf->padding_token_id = -1;
     gf->alignment = 32; // default
     gf->tensors = calloc(tensor_count, sizeof(GGUFTensorInfo));
 
@@ -397,6 +399,8 @@ GGUFFile *gguf_open(const char *path) {
                     gf->eos_token_id = (int)read_value_uint(&r, vtype);
                 } else if (strcmp(key, "tokenizer.ggml.padding_token_id") == 0) {
                     gf->padding_token_id = (int)read_value_uint(&r, vtype);
+                } else if (strcmp(key, "tokenizer.chat_template") == 0) {
+                    gf->chat_template = read_string(&r);
                 } else {
                     // Tokenizer metadata — skip for now
                     skip_value(&r, vtype);
@@ -517,6 +521,7 @@ void gguf_close(GGUFFile *gf) {
     if (!gf) return;
     if (gf->mmap_base) munmap(gf->mmap_base, gf->file_size);
     if (gf->fd >= 0) close(gf->fd);
+    free(gf->chat_template);
     for (uint64_t i = 0; i < gf->num_tensors; i++) {
         free(gf->tensors[i].name);
     }
@@ -629,6 +634,14 @@ void model_config_init_derived(ModelConfig *cfg) {
     cfg->linear_total_value = cfg->linear_num_v_heads * cfg->linear_value_dim;
     cfg->linear_conv_dim = cfg->linear_total_key * 2 + cfg->linear_total_value;
     cfg->kv_dim = cfg->num_kv_heads * cfg->head_dim;
+    cfg->q_heads_per_kv =
+        (cfg->num_kv_heads > 0 && cfg->num_attn_heads % cfg->num_kv_heads == 0)
+        ? (cfg->num_attn_heads / cfg->num_kv_heads)
+        : 0;
+    cfg->linear_v_heads_per_k =
+        (cfg->linear_num_k_heads > 0 && cfg->linear_num_v_heads % cfg->linear_num_k_heads == 0)
+        ? (cfg->linear_num_v_heads / cfg->linear_num_k_heads)
+        : 0;
 
     if (cfg->layer_types) {
         int full_count = 0, lin_count = 0;

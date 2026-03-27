@@ -16,6 +16,272 @@
 
 #include "orome.h"
 
+static void add_unique_token(int *tokens, int max_tokens, int *count, int token_id) {
+    if (!tokens || !count || token_id < 0 || *count >= max_tokens) return;
+    for (int i = 0; i < *count; i++) {
+        if (tokens[i] == token_id) return;
+    }
+    tokens[(*count)++] = token_id;
+}
+
+static GGUFTensorInfo *find_first_layer_tensor(GGUFFile *gf, const ModelConfig *cfg,
+                                               AttnLayerType layer_type, const char *suffix) {
+    char name[128];
+    for (int i = 0; i < cfg->num_layers; i++) {
+        if (cfg->layer_types[i] != layer_type) continue;
+        snprintf(name, sizeof(name), "blk.%d.%s", i, suffix);
+        GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
+        if (ti) return ti;
+    }
+    return NULL;
+}
+
+static int template_collect_added_tokens_from_text(const char *text, int *ids, int max_ids) {
+    if (!text || !ids || max_ids <= 0) return 0;
+
+    int count = 0;
+    const char *p = text;
+    while (*p && count < max_ids) {
+        const char *lt = strchr(p, '<');
+        if (!lt) break;
+        const char *gt = strchr(lt + 1, '>');
+        if (!gt) break;
+
+        size_t len = (size_t)(gt - lt + 1);
+        if (len > 1 && len < 256) {
+            char token[256];
+            memcpy(token, lt, len);
+            token[len] = '\0';
+
+            int token_id = tokenizer_find_token(token);
+            if (token_id >= 0) {
+                ids[count++] = token_id;
+            }
+        }
+
+        p = gt + 1;
+    }
+
+    if (count == 0) {
+        count = tokenizer_find_added_tokens_in_text(text, ids, max_ids);
+    }
+    return count;
+}
+
+static int template_collect_added_tokens_from_literals(const char *expr, int *ids, int max_ids) {
+    if (!expr || !ids || max_ids <= 0) return 0;
+
+    int count = 0;
+    const char *p = expr;
+    while (*p && count < max_ids) {
+        if (*p != '\'' && *p != '"') {
+            p++;
+            continue;
+        }
+
+        char quote = *p++;
+        const char *start = p;
+        bool escape = false;
+        while (*p) {
+            if (escape) {
+                escape = false;
+            } else if (*p == '\\') {
+                escape = true;
+            } else if (*p == quote) {
+                break;
+            }
+            p++;
+        }
+
+        size_t len = (size_t)(p - start);
+        char *literal = malloc(len + 1);
+        if (!literal) break;
+        memcpy(literal, start, len);
+        literal[len] = '\0';
+
+        int tmp[16];
+        int tmp_count = template_collect_added_tokens_from_text(literal, tmp, 16);
+        for (int i = 0; i < tmp_count && count < max_ids; i++) {
+            ids[count++] = tmp[i];
+        }
+        free(literal);
+
+        if (*p == quote) p++;
+    }
+
+    return count;
+}
+
+static const char *skip_jinja_tag_prefix(const char *tag) {
+    while (*tag == ' ' || *tag == '\t' || *tag == '\r' || *tag == '\n' || *tag == '-') {
+        tag++;
+    }
+    return tag;
+}
+
+static bool jinja_tag_starts_with(const char *tag, const char *prefix) {
+    if (!tag || !prefix) return false;
+    tag = skip_jinja_tag_prefix(tag);
+    size_t prefix_len = strlen(prefix);
+    return strncmp(tag, prefix, prefix_len) == 0;
+}
+
+typedef enum {
+    TEMPLATE_ROLE_NONE = 0,
+    TEMPLATE_ROLE_SYSTEM,
+    TEMPLATE_ROLE_USER,
+    TEMPLATE_ROLE_ASSISTANT,
+    TEMPLATE_ROLE_TOOL,
+} TemplateRole;
+
+static TemplateRole template_role_from_tag(const char *tag) {
+    if (!tag) return TEMPLATE_ROLE_NONE;
+    if (strstr(tag, "message.role == \"system\"") || strstr(tag, "message.role == 'system'")) {
+        return TEMPLATE_ROLE_SYSTEM;
+    }
+    if (strstr(tag, "message.role == \"user\"") || strstr(tag, "message.role == 'user'")) {
+        return TEMPLATE_ROLE_USER;
+    }
+    if (strstr(tag, "message.role == \"assistant\"") || strstr(tag, "message.role == 'assistant'")) {
+        return TEMPLATE_ROLE_ASSISTANT;
+    }
+    if (strstr(tag, "message.role == \"tool\"") || strstr(tag, "message.role == 'tool'")) {
+        return TEMPLATE_ROLE_TOOL;
+    }
+    return TEMPLATE_ROLE_NONE;
+}
+
+static void resolve_chat_tokens_from_template(ModelConfig *cfg, const char *chat_template) {
+    if (!cfg || !chat_template || chat_template[0] == '\0') return;
+
+    enum { MAX_TEMPLATE_TOKENS = 16 };
+    int generation_tokens[MAX_TEMPLATE_TOKENS];
+    int generation_count = 0;
+    int generation_if_depth = 0;
+    int message_loop_depth = 0;
+    TemplateRole current_role = TEMPLATE_ROLE_NONE;
+
+    const char *p = chat_template;
+    while (*p) {
+        if (p[0] == '{' && p[1] == '%') {
+            const char *end = strstr(p + 2, "%}");
+            if (!end) break;
+
+            size_t len = (size_t)(end - (p + 2));
+            char *tag = malloc(len + 1);
+            if (tag) {
+                memcpy(tag, p + 2, len);
+                tag[len] = '\0';
+
+                if (jinja_tag_starts_with(tag, "if") && strstr(tag, "add_generation_prompt")) {
+                    generation_if_depth = generation_if_depth > 0 ? generation_if_depth + 1 : 1;
+                } else if (generation_if_depth > 0 && jinja_tag_starts_with(tag, "if")) {
+                    generation_if_depth++;
+                } else if (generation_if_depth > 0 && jinja_tag_starts_with(tag, "endif")) {
+                    generation_if_depth--;
+                }
+
+                if (jinja_tag_starts_with(tag, "for") && strstr(tag, "message in messages")) {
+                    message_loop_depth++;
+                    current_role = TEMPLATE_ROLE_NONE;
+                } else if (message_loop_depth > 0 && jinja_tag_starts_with(tag, "endfor")) {
+                    message_loop_depth--;
+                    if (message_loop_depth == 0) current_role = TEMPLATE_ROLE_NONE;
+                } else if (message_loop_depth > 0) {
+                    TemplateRole tagged_role = template_role_from_tag(tag);
+                    if (tagged_role != TEMPLATE_ROLE_NONE) {
+                        current_role = tagged_role;
+                    }
+                }
+
+                free(tag);
+            }
+
+            p = end + 2;
+            continue;
+        }
+
+        if (p[0] == '{' && p[1] == '{') {
+            const char *end = strstr(p + 2, "}}");
+            if (!end) break;
+
+            size_t len = (size_t)(end - (p + 2));
+            char *expr = malloc(len + 1);
+            if (expr) {
+                memcpy(expr, p + 2, len);
+                expr[len] = '\0';
+
+                int ids[MAX_TEMPLATE_TOKENS];
+                int id_count = template_collect_added_tokens_from_literals(expr, ids, MAX_TEMPLATE_TOKENS);
+                bool has_message_role = strstr(expr, "message.role") != NULL;
+                bool has_reasoning = strstr(expr, "reasoning_content") != NULL;
+
+                if (message_loop_depth > 0 &&
+                    current_role == TEMPLATE_ROLE_USER &&
+                    has_message_role &&
+                    id_count > 0) {
+                    cfg->chat_start_token = ids[0];
+                    if (id_count >= 2) cfg->chat_end_token = ids[id_count - 1];
+                } else if (message_loop_depth > 0 &&
+                           current_role == TEMPLATE_ROLE_ASSISTANT &&
+                           has_message_role &&
+                           id_count > 0 &&
+                           cfg->chat_start_token < 0) {
+                    cfg->chat_start_token = ids[0];
+                }
+                if (message_loop_depth > 0 &&
+                    current_role == TEMPLATE_ROLE_ASSISTANT &&
+                    has_reasoning &&
+                    id_count >= 3) {
+                    cfg->think_start_token = ids[1];
+                    cfg->think_end_token = ids[id_count - 1];
+                }
+                if (generation_if_depth > 0 && id_count > 0) {
+                    for (int i = 0; i < id_count && generation_count < MAX_TEMPLATE_TOKENS; i++) {
+                        generation_tokens[generation_count++] = ids[i];
+                    }
+                }
+
+                free(expr);
+            }
+
+            p = end + 2;
+            continue;
+        }
+
+        p++;
+    }
+
+    if (cfg->chat_start_token < 0 && generation_count > 0) {
+        cfg->chat_start_token = generation_tokens[0];
+    }
+
+    if ((cfg->think_start_token < 0 || cfg->think_end_token < 0) && generation_count >= 3) {
+        int inner_start = 0;
+        if (cfg->chat_start_token >= 0 && generation_tokens[0] == cfg->chat_start_token) {
+            inner_start = 1;
+        }
+        if (generation_count - inner_start >= 2) {
+            if (cfg->think_start_token < 0) cfg->think_start_token = generation_tokens[inner_start];
+            if (cfg->think_end_token < 0) cfg->think_end_token = generation_tokens[generation_count - 1];
+        }
+    }
+
+    if (cfg->think_start_token >= 0 && cfg->think_end_token >= 0) {
+        bool saw_think_start = false;
+        for (int i = 0; i < generation_count; i++) {
+            if (!saw_think_start && generation_tokens[i] == cfg->think_start_token) {
+                saw_think_start = true;
+                continue;
+            }
+            if (saw_think_start && generation_tokens[i] == cfg->think_end_token) {
+                cfg->chat_prefill_think = true;
+                break;
+            }
+        }
+    }
+}
+
 static void print_usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [options]\n"
@@ -121,27 +387,13 @@ int main(int argc, char **argv) {
             cfg.num_experts_per_tok = gf->num_experts_per_tok;
             cfg.moe_intermediate = gf->moe_intermediate;
             cfg.vocab_size = gf->vocab_size;
+            cfg.context_length = gf->context_length;
 
             // Attention config — detect from GGUF metadata
             cfg.num_attn_heads = gf->num_attn_heads;
             cfg.num_kv_heads = gf->num_kv_heads;
-            cfg.rope_theta = gf->rope_theta > 0 ? gf->rope_theta : 1000000.0f;
-            cfg.rms_norm_eps = gf->rms_norm_eps > 0 ? gf->rms_norm_eps : 1e-6f;
-
-            // Prefer GGUF metadata for attention geometry, fall back to tensor shapes.
-            cfg.head_dim = gf->attn_key_length;
-            for (int i = 0; i < cfg.num_layers && cfg.head_dim == 0; i++) {
-                char kname[128];
-                snprintf(kname, sizeof(kname), "blk.%d.attn_k.weight", i);
-                GGUFTensorInfo *ki = gguf_find_tensor(gf, kname);
-                if (ki && ki->n_dims >= 2 && cfg.num_kv_heads > 0) {
-                    cfg.head_dim = (int)ki->dims[1] / cfg.num_kv_heads;
-                    fprintf(stderr, "[main] K tensor shape: out=%d / kv_heads=%d → head_dim=%d\n",
-                            (int)ki->dims[1], cfg.num_kv_heads, cfg.head_dim);
-                }
-            }
-            if (cfg.head_dim == 0) cfg.head_dim = cfg.hidden_dim / cfg.num_attn_heads;
-            if (cfg.head_dim == 0) cfg.head_dim = 256; // fallback
+            cfg.rope_theta = gf->rope_theta;
+            cfg.rms_norm_eps = gf->rms_norm_eps;
 
             // Detect layer types from GGUF tensors
             cfg.layer_types = calloc(cfg.num_layers, sizeof(AttnLayerType));
@@ -162,42 +414,100 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[main] GGUF layer detection: %d full + %d linear\n",
                     cfg.num_full_attn_layers, cfg.num_linear_layers);
 
-            // Linear attention params — infer from GGUF tensor shapes
-            cfg.linear_key_dim = gf->ssm_state_size > 0 ? gf->ssm_state_size : 128;
+            // Prefer GGUF metadata for attention geometry, then infer from tensor shapes.
+            cfg.head_dim = gf->attn_key_length;
+            if (cfg.head_dim == 0 && cfg.num_full_attn_layers > 0) {
+                GGUFTensorInfo *ki = find_first_layer_tensor(gf, &cfg, ATTN_FULL, "attn_k.weight");
+                if (ki && ki->n_dims >= 2 && cfg.num_kv_heads > 0) {
+                    cfg.head_dim = (int)ki->dims[1] / cfg.num_kv_heads;
+                    fprintf(stderr, "[main] K tensor shape: out=%d / kv_heads=%d -> head_dim=%d\n",
+                            (int)ki->dims[1], cfg.num_kv_heads, cfg.head_dim);
+                }
+            }
+            if (cfg.head_dim == 0 && cfg.num_attn_heads > 0) {
+                cfg.head_dim = cfg.hidden_dim / cfg.num_attn_heads;
+            }
+            if (cfg.head_dim <= 0) {
+                fprintf(stderr, "ERROR: Could not infer attention head_dim from GGUF metadata or tensors\n");
+                return 1;
+            }
+            if (gf->attn_value_length > 0 && gf->attn_value_length != cfg.head_dim) {
+                fprintf(stderr,
+                        "ERROR: attention.value_length=%d differs from key/head_dim=%d; "
+                        "variable full-attention V dims are not yet supported\n",
+                        gf->attn_value_length, cfg.head_dim);
+                return 1;
+            }
+            if (cfg.rms_norm_eps <= 0.0f) {
+                fprintf(stderr, "ERROR: Missing RMS norm epsilon in GGUF metadata\n");
+                return 1;
+            }
+
+            if (gf->rope_dimension_count > 0) {
+                cfg.partial_rotary = (float)gf->rope_dimension_count / (float)cfg.head_dim;
+            } else if (cfg.num_full_attn_layers == 0) {
+                cfg.partial_rotary = 0.0f;
+            } else {
+                fprintf(stderr, "ERROR: Missing rope.dimension_count for model with full-attention layers\n");
+                return 1;
+            }
+            if (cfg.partial_rotary > 0.0f && cfg.rope_theta <= 0.0f) {
+                fprintf(stderr, "ERROR: Missing rope.freq_base for model with rotary attention\n");
+                return 1;
+            }
+
             cfg.linear_num_k_heads = gf->ssm_group_count;
             cfg.linear_num_v_heads = gf->ssm_time_step_rank;
-            cfg.linear_value_dim =
-                (gf->ssm_inner_size > 0 && gf->ssm_time_step_rank > 0)
-                ? (gf->ssm_inner_size / gf->ssm_time_step_rank)
-                : 128;
-            cfg.partial_rotary =
-                (gf->rope_dimension_count > 0 && cfg.head_dim > 0)
-                ? ((float)gf->rope_dimension_count / (float)cfg.head_dim)
-                : 0.25f;
-            cfg.conv_kernel_size = gf->ssm_conv_kernel > 0 ? gf->ssm_conv_kernel : 4;
+            cfg.linear_key_dim = gf->ssm_state_size;
+            cfg.conv_kernel_size = gf->ssm_conv_kernel;
 
-            if (cfg.linear_num_v_heads <= 0 || cfg.linear_num_k_heads <= 0 || cfg.linear_value_dim <= 0) {
-                // Fall back to tensor shapes when the GGUF lacks explicit SSM metadata.
-                for (int i = 0; i < cfg.num_layers; i++) {
-                    if (cfg.layer_types[i] != ATTN_LINEAR) continue;
+            int linear_total_value = gf->ssm_inner_size;
+            if (cfg.num_linear_layers > 0) {
+                GGUFTensorInfo *norm_ti = find_first_layer_tensor(gf, &cfg, ATTN_LINEAR, "ssm_norm.weight");
+                GGUFTensorInfo *alpha_ti = find_first_layer_tensor(gf, &cfg, ATTN_LINEAR, "ssm_alpha.weight");
+                GGUFTensorInfo *qkv_ti = find_first_layer_tensor(gf, &cfg, ATTN_LINEAR, "attn_qkv.weight");
+                GGUFTensorInfo *out_ti = find_first_layer_tensor(gf, &cfg, ATTN_LINEAR, "ssm_out.weight");
+                GGUFTensorInfo *conv_ti = find_first_layer_tensor(gf, &cfg, ATTN_LINEAR, "ssm_conv1d.weight");
 
-                    char alpha_name[128];
-                    char qkv_name[128];
-                    snprintf(alpha_name, sizeof(alpha_name), "blk.%d.ssm_alpha.weight", i);
-                    snprintf(qkv_name, sizeof(qkv_name), "blk.%d.attn_qkv.weight", i);
-
-                    GGUFTensorInfo *alpha_ti = gguf_find_tensor(gf, alpha_name);
-                    GGUFTensorInfo *qkv_ti = gguf_find_tensor(gf, qkv_name);
-                    if (alpha_ti && alpha_ti->n_dims >= 2 && qkv_ti && qkv_ti->n_dims >= 2) {
-                        int qkv_dim = (int)qkv_ti->dims[1];
-                        cfg.linear_num_v_heads = (int)alpha_ti->dims[1];
-                        cfg.linear_num_k_heads = (qkv_dim - cfg.linear_num_v_heads * cfg.linear_value_dim)
-                                               / (2 * cfg.linear_key_dim);
-                        fprintf(stderr, "[main] GGUF linear attn: qkv_dim=%d v_heads=%d k_heads=%d\n",
-                                qkv_dim, cfg.linear_num_v_heads, cfg.linear_num_k_heads);
-                    }
-                    break;
+                if (cfg.linear_key_dim <= 0 && norm_ti && norm_ti->n_dims >= 1) {
+                    cfg.linear_key_dim = (int)norm_ti->dims[0];
                 }
+                if (cfg.linear_num_v_heads <= 0 && alpha_ti && alpha_ti->n_dims >= 2) {
+                    cfg.linear_num_v_heads = (int)alpha_ti->dims[1];
+                }
+                if (linear_total_value <= 0 && out_ti && out_ti->n_dims >= 2) {
+                    linear_total_value = (int)out_ti->dims[0];
+                }
+                if (cfg.conv_kernel_size <= 0 && conv_ti && conv_ti->n_dims >= 1) {
+                    cfg.conv_kernel_size = (int)conv_ti->dims[0];
+                }
+                if (cfg.linear_num_k_heads <= 0 &&
+                    qkv_ti && qkv_ti->n_dims >= 2 &&
+                    cfg.linear_key_dim > 0 &&
+                    cfg.linear_num_v_heads > 0 &&
+                    linear_total_value > 0) {
+                    int qkv_dim = (int)qkv_ti->dims[1];
+                    cfg.linear_num_k_heads = (qkv_dim - linear_total_value) /
+                                             (2 * cfg.linear_key_dim);
+                    fprintf(stderr, "[main] GGUF linear attn: qkv_dim=%d v_heads=%d k_heads=%d\n",
+                            qkv_dim, cfg.linear_num_v_heads, cfg.linear_num_k_heads);
+                }
+            }
+
+            if (cfg.linear_num_v_heads > 0 && linear_total_value > 0) {
+                cfg.linear_value_dim = linear_total_value / cfg.linear_num_v_heads;
+            }
+
+            if (cfg.num_linear_layers > 0 &&
+                (cfg.linear_num_v_heads <= 0 || cfg.linear_num_k_heads <= 0 ||
+                 cfg.linear_key_dim <= 0 || cfg.linear_value_dim <= 0 ||
+                 cfg.conv_kernel_size <= 0)) {
+                fprintf(stderr,
+                        "ERROR: Could not infer linear-attention config "
+                        "(k_heads=%d v_heads=%d key_dim=%d value_dim=%d conv=%d)\n",
+                        cfg.linear_num_k_heads, cfg.linear_num_v_heads,
+                        cfg.linear_key_dim, cfg.linear_value_dim, cfg.conv_kernel_size);
+                return 1;
             }
 
             // Derive shared_intermediate from shared expert gate tensor shape
@@ -215,11 +525,12 @@ int main(int argc, char **argv) {
                 cfg.shared_intermediate = 0;
             }
 
-            // EOS tokens (Qwen3.5)
-            cfg.eos_tokens[0] = gf->eos_token_id > 0 ? gf->eos_token_id : 248046;
-            cfg.eos_tokens[1] = 248044;
-            cfg.eos_tokens[2] = -1;
-            cfg.think_end_token = 248069;
+            for (int i = 0; i < 4; i++) cfg.eos_tokens[i] = -1;
+            cfg.chat_start_token = -1;
+            cfg.chat_end_token = -1;
+            cfg.think_start_token = -1;
+            cfg.think_end_token = -1;
+            cfg.chat_prefill_think = false;
 
             if (cfg.ffn_type == FFN_MOE && active_k > 0) {
                 cfg.num_experts_per_tok = active_k;
@@ -228,6 +539,16 @@ int main(int argc, char **argv) {
             }
 
             model_config_init_derived(&cfg);
+            if (cfg.num_full_attn_layers > 0 && cfg.q_heads_per_kv <= 0) {
+                fprintf(stderr, "ERROR: Invalid grouped-query ratio: q_heads=%d kv_heads=%d\n",
+                        cfg.num_attn_heads, cfg.num_kv_heads);
+                return 1;
+            }
+            if (cfg.num_linear_layers > 0 && cfg.linear_v_heads_per_k <= 0) {
+                fprintf(stderr, "ERROR: Invalid linear-attention head ratio: v_heads=%d k_heads=%d\n",
+                        cfg.linear_num_v_heads, cfg.linear_num_k_heads);
+                return 1;
+            }
 
             if (max_layers > 0 && max_layers < cfg.num_layers) {
                 fprintf(stderr, "[main] Limiting to %d layers (was %d)\n", max_layers, cfg.num_layers);
@@ -263,40 +584,22 @@ int main(int argc, char **argv) {
                 return 1;
             }
 
-            // Load tokenizer from the first vocab.bin we can actually read.
-            // GGUF embeds vocab metadata, but text tokenization still uses the
-            // external BPE vocab.bin from the legacy 35B assets.
-            char tok_dir[512];
-            strncpy(tok_dir, model_dir, sizeof(tok_dir));
-            tok_dir[sizeof(tok_dir) - 1] = '\0';
-            char *last_slash = strrchr(tok_dir, '/');
-            if (last_slash) *last_slash = '\0';
-            const char *tok_candidates[] = {
-                NULL,  // current working directory
-                tok_dir,
-                "/Users/j/models/Qwen3.5-35B-A3B-4bit",
-                NULL
-            };
-            int tok_loaded = -1;
-            for (int i = 0; tok_candidates[i] != NULL || i == 0; i++) {
-                if (tok_candidates[i] == NULL) {
-                    if (access("vocab.bin", R_OK) == 0) {
-                        tok_loaded = tokenizer_init(NULL);
-                        if (tok_loaded == 0) break;
-                    }
-                    continue;
-                }
-
-                char tok_vocab[1024];
-                snprintf(tok_vocab, sizeof(tok_vocab), "%s/vocab.bin", tok_candidates[i]);
-                if (access(tok_vocab, R_OK) != 0) continue;
-                tok_loaded = tokenizer_init(tok_candidates[i]);
-                if (tok_loaded == 0) break;
-            }
+            // Load tokenizer from the model directory when available.
+            // Text tokenization still uses vocab.bin today, but it can be
+            // generated from either GGUF metadata or Hugging Face assets.
+            int tok_loaded = tokenizer_init(model_dir);
             if (tok_loaded != 0) {
                 fprintf(stderr, "ERROR: Could not load tokenizer\n");
                 return 1;
             }
+
+            // Resolve special tokens from tokenizer.chat_template structure when available.
+            int eos_count = 0;
+            resolve_chat_tokens_from_template(&cfg, gf->chat_template);
+
+            add_unique_token(cfg.eos_tokens, 4, &eos_count, gf->eos_token_id);
+            add_unique_token(cfg.eos_tokens, 4, &eos_count, cfg.chat_end_token);
+            add_unique_token(cfg.eos_tokens, 4, &eos_count, tokenizer_find_token("<|endoftext|>"));
 
             fprintf(stderr, "[main] GGUF: creating engine...\n");
             eng = engine_create(&cfg, ctx,
@@ -345,9 +648,14 @@ int main(int argc, char **argv) {
             if (prompt_text[0] == '[') {
                 // Parse raw token IDs: "[248045,846,198]"
                 pt = calloc(1, sizeof(PromptTokens));
-                pt->ids = calloc(256, sizeof(int));
+                int cap = 64;
+                pt->ids = calloc(cap, sizeof(int));
                 const char *p = prompt_text + 1;
-                while (*p && *p != ']' && pt->count < 256) {
+                while (*p && *p != ']') {
+                    if (pt->count == cap) {
+                        cap *= 2;
+                        pt->ids = realloc(pt->ids, (size_t)cap * sizeof(int));
+                    }
                     pt->ids[pt->count++] = atoi(p);
                     while (*p && *p != ',' && *p != ']') p++;
                     if (*p == ',') p++;
@@ -361,6 +669,12 @@ int main(int argc, char **argv) {
             }
 
             printf("[main] Prompt: \"%s\" (%d tokens)\n", prompt_text, pt->count);
+            int needed_seq = pt->count + (max_tokens > 0 ? max_tokens : 0);
+            if (!metal_ensure_kv_capacity(ctx, &cfg, needed_seq > 0 ? needed_seq : 1)) {
+                fprintf(stderr, "ERROR: Failed to size KV cache for %d tokens\n", needed_seq);
+                prompt_tokens_free(pt);
+                return 1;
+            }
 
             // Prefill
             double t_start = now_ms();
