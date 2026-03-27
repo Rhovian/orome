@@ -261,6 +261,10 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
     // Global tensors
     if (globals) {
         globals->lm_head = G_REF("output.weight", cfg->vocab_size, H);
+        if (!globals->lm_head.buffer) {
+            // Qwen3.5 ties the LM head to token embeddings in GGUF exports.
+            globals->lm_head = G_REF("token_embd.weight", cfg->vocab_size, H);
+        }
         globals->final_norm = G_RAW("output_norm.weight");
     }
 
@@ -304,13 +308,17 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
             int conv_dim = cfg->linear_conv_dim;
             int total_value = cfg->linear_num_v_heads * cfg->linear_value_dim;
             int n_v = cfg->linear_num_v_heads;
+            bool need_v_head_reorder =
+                cfg->linear_num_v_heads > 0 &&
+                cfg->linear_num_k_heads > 0 &&
+                cfg->linear_num_v_heads != cfg->linear_num_k_heads;
 
             // QKV: 8192 rows = Q(2048) + K(2048) + V(4096)
             // V portion (rows 4096-8191) is head-interleaved like Z gate
             snprintf(name, sizeof(name), "blk.%d.attn_qkv.weight", i);
             {
                 GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
-                if (ti && ti->n_dims >= 2) {
+                if (need_v_head_reorder && ti && ti->n_dims >= 2) {
                     int _rows = (int)ti->dims[1];
                     int _bpr = ((int)ti->dims[0] / 32) * 34;
                     size_t _total = (size_t)_rows * _bpr;
@@ -350,7 +358,7 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
             snprintf(name, sizeof(name), "blk.%d.attn_gate.weight", i);
             {
                 GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
-                if (ti && ti->n_dims >= 2 && ti->dims[1] == (uint64_t)total_value) {
+                if (need_v_head_reorder && ti && ti->n_dims >= 2 && ti->dims[1] == (uint64_t)total_value) {
                     int _rows = total_value, _half = _rows / 2;
                     int _bpr = ((int)ti->dims[0] / 32) * 34;
                     size_t _total = (size_t)_rows * _bpr;
@@ -403,8 +411,15 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
                 } else { out_ref = G_REF(name, n_v, H); } \
             } while(0)
 
-            DEINTERLEAVE_Q8_ROWS("ssm_alpha.weight", c->lin.a);
-            DEINTERLEAVE_Q8_ROWS("ssm_beta.weight", c->lin.b);
+            if (need_v_head_reorder) {
+                DEINTERLEAVE_Q8_ROWS("ssm_alpha.weight", c->lin.a);
+                DEINTERLEAVE_Q8_ROWS("ssm_beta.weight", c->lin.b);
+            } else {
+                snprintf(name, sizeof(name), "blk.%d.ssm_alpha.weight", i);
+                c->lin.a = G_REF(name, n_v, H);
+                snprintf(name, sizeof(name), "blk.%d.ssm_beta.weight", i);
+                c->lin.b = G_REF(name, n_v, H);
+            }
             #undef DEINTERLEAVE_Q8_ROWS
             // Output projection (ssm_out in GGUF)
             // The GGUF stores ssm_out with head-interleaved Q8_0 blocks along in_dim.
@@ -413,7 +428,7 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
             snprintf(name, sizeof(name), "blk.%d.ssm_out.weight", i);
             {
                 GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
-                if (ti && ti->n_dims >= 2) {
+                if (need_v_head_reorder && ti && ti->n_dims >= 2) {
                     int in_dim = (int)ti->dims[0];  // 4096 (total_value)
                     int out_dim = (int)ti->dims[1];  // 2048 (H)
                     int n_heads = cfg->linear_num_v_heads;  // 32
@@ -472,7 +487,7 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
             snprintf(name, sizeof(name), "blk.%d.ssm_conv1d.weight", i);
             {
                 GGUFTensorInfo *ti = gguf_find_tensor(gf, name);
-                if (ti && ti->type == 0 && ti->dims[0] == 4) {
+                if (need_v_head_reorder && ti && ti->type == 0 && ti->dims[0] == 4) {
                     int cd = (int)ti->dims[1];  // 8192
                     int qk_ch = 2 * cfg->linear_num_k_heads * cfg->linear_key_dim;  // 4096
                     int v_ch = total_value;  // 4096
@@ -521,8 +536,15 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
                 } else { out_ref = G_RAW_F32(name); } \
             } while(0)
 
-            DEINTERLEAVE_F32_RAW("ssm_a", c->lin.A_log);
-            DEINTERLEAVE_F32_RAW("ssm_dt.bias", c->lin.dt_bias);
+            if (need_v_head_reorder) {
+                DEINTERLEAVE_F32_RAW("ssm_a", c->lin.A_log);
+                DEINTERLEAVE_F32_RAW("ssm_dt.bias", c->lin.dt_bias);
+            } else {
+                snprintf(name, sizeof(name), "blk.%d.ssm_a", i);
+                c->lin.A_log = G_RAW_F32(name);
+                snprintf(name, sizeof(name), "blk.%d.ssm_dt.bias", i);
+                c->lin.dt_bias = G_RAW_F32(name);
+            }
             #undef DEINTERLEAVE_F32_RAW
             // Output norm (ssm_norm in GGUF)
             snprintf(name, sizeof(name), "blk.%d.ssm_norm.weight", i);

@@ -427,7 +427,8 @@ int engine_step(Engine *eng, int token_id) {
             int key_dim = cfg->linear_key_dim;
             int value_dim = cfg->linear_value_dim;
 
-            bool skip_copy_norm = (layer > 0 && ctx->moe_combine_copy_sq);
+            bool skip_copy_norm =
+                (cfg->ffn_type == FFN_MOE && layer > 0 && ctx->moe_combine_copy_sq);
             id<MTLComputeCommandEncoder> enc = fwd_enc;
             if (!skip_copy_norm) {
                 [enc setComputePipelineState:ctx->copy_buffer];
@@ -679,7 +680,8 @@ int engine_step(Engine *eng, int token_id) {
             int kv_dim = cfg->kv_dim;
             int seq_len = pos + 1;
 
-            bool skip_copy_norm = (layer > 0 && ctx->moe_combine_copy_sq);
+            bool skip_copy_norm =
+                (cfg->ffn_type == FFN_MOE && layer > 0 && ctx->moe_combine_copy_sq);
             id<MTLComputeCommandEncoder> enc = fwd_enc;
             if (!skip_copy_norm) {
                 [enc setComputePipelineState:ctx->copy_buffer];
