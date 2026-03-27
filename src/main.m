@@ -358,7 +358,6 @@ int main(int argc, char **argv) {
                     while (*p && *p != ',' && *p != ']') p++;
                     if (*p == ',') p++;
                 }
-                fprintf(stderr, "[main] Raw token IDs: %d tokens\n", pt->count);
             } else {
                 pt = tokenizer_encode(prompt_text);
                 if (!pt) {
@@ -381,8 +380,6 @@ int main(int argc, char **argv) {
             // Generate
             double gen_start = now_ms();
             int generated = 0;
-            fprintf(stderr, "[gguf] first predicted token: %d '%s' (eos=%d)\n",
-                    next_token, tokenizer_decode(next_token), is_eos_token(&cfg, next_token));
             for (int i = 0; i < max_tokens; i++) {
                 if (is_eos_token(&cfg, next_token)) break;
 

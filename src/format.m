@@ -431,7 +431,6 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
                 if (need_v_head_reorder && ti && ti->n_dims >= 2) {
                     int in_dim = (int)ti->dims[0];  // 4096 (total_value)
                     int out_dim = (int)ti->dims[1];  // 2048 (H)
-                    int n_heads = cfg->linear_num_v_heads;  // 32
                     int head_dim_vals = cfg->linear_value_dim;  // 128
                     int blocks_per_head = head_dim_vals / 32;  // 4 Q8_0 blocks per head
                     int total_blocks = in_dim / 32;  // 128 blocks per row
@@ -473,8 +472,6 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
                         .pipeline = format_pipeline_for(ctx, fmt),
                         .format = fmt, .out_dim = (uint32_t)out_dim, .in_dim = (uint32_t)in_dim,
                     };
-                    if (i == 0) fprintf(stderr, "[format] De-interleaved ssm_out (%d blocks/row, %d heads)\n",
-                                        total_blocks, n_heads);
                 } else {
                     c->lin.o = G_REF(name, H, total_value);
                 }
@@ -581,8 +578,6 @@ LayerTensorCache *build_tensor_cache_gguf(GGUFFile *gf, id<MTLBuffer> model_buf,
                   c->full.q = (TensorRef){ .buffer = db, .offset = 0,
                       .pipeline = format_pipeline_for(ctx, fmt),
                       .format = fmt, .out_dim = (uint32_t)q_out, .in_dim = (uint32_t)H };
-                  if (i == cfg->num_layers - 1 || cfg->layer_types[i+1] != ATTN_FULL)
-                      fprintf(stderr, "[format] De-interleaved attn_q Q+gate (%d heads × %d hd)\n", n_heads, hd);
               } else {
                   c->full.q = G_REF(name, q_out, H);
               } }

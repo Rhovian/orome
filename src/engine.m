@@ -391,10 +391,6 @@ int engine_step(Engine *eng, int token_id) {
     // 1. Embedding
     memset(eng->hidden, 0, H * sizeof(float));
     embed_lookup_gguf(eng->gf, cfg, token_id, eng->hidden);
-    if (eng->pos < 2) {
-        fprintf(stderr, "[gguf] embed[%d] first 4: %.6f %.6f %.6f %.6f\n",
-                token_id, eng->hidden[0], eng->hidden[1], eng->hidden[2], eng->hidden[3]);
-    }
 
     // 2. Layer loop — fused O-proj + post-norm + MoE routing in one GPU commit
     int full_idx = 0, linear_idx = 0;
@@ -564,29 +560,6 @@ int engine_step(Engine *eng, int token_id) {
             format_dispatch_matvec(enc, ctx, (TensorRef *)&tcache[layer].lin.o,
                 ctx->buf_linear_q, 0, ctx->buf_h_mid, 0);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-            // DIAG: all phase outputs for layer 0
-            if (eng->pos == 0 && layer == 0) {
-                [enc endEncoding]; [fwd_cmd commit]; [fwd_cmd waitUntilCompleted];
-                float *co = (float *)[ctx->buf_conv_output contents];
-                float *dout = (float *)[ctx->buf_linear_v contents];
-                float *gn = (float *)[ctx->buf_linear_q contents];
-                float *op = (float *)[ctx->buf_h_mid contents];
-                float cmx=0, dmx=0, gmx=0, omx=0;
-                int tv = n_v_heads * value_dim;
-                for (int i=0;i<conv_dim;i++) { float a=fabsf(co[i]); if(a>cmx) cmx=a; }
-                for (int i=0;i<tv;i++) { float a=fabsf(dout[i]); if(a>dmx) dmx=a; }
-                for (int i=0;i<tv;i++) { float a=fabsf(gn[i]); if(a>gmx) gmx=a; }
-                for (int i=0;i<H;i++) { float a=fabsf(op[i]); if(a>omx) omx=a; }
-                float gsum=0, osum=0;
-                for (int i=0;i<tv;i++) gsum+=fabsf(gn[i]);
-                for (int i=0;i<H;i++) osum+=fabsf(op[i]);
-                fprintf(stderr, "[L0] conv=%.4f delta=%.6f gated=%.4f(mean=%.6f) oproj=%.4f(mean=%.6f)\n",
-                        cmx, dmx, gmx, gsum/tv, omx, osum/H);
-                fwd_cmd = [ctx->queue commandBuffer];
-                fwd_enc = [fwd_cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-                enc = fwd_enc;
-            }
             // --- Phase I+J: Fused residual add + sum_sq → buf_moe_hidden ---
             { uint num_tgs = ((uint)H + 255) / 256;
             [enc setComputePipelineState:ctx->residual_add_sq];
