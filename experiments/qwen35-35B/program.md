@@ -26,6 +26,10 @@ Secondary goals:
 - Keep TTFT low
 - Preserve output correctness
 
+The benchmark harness now includes a chat quality canary. A run is not valid if
+the visible answer is empty, garbled, or fails the canary keyword check, even if
+tok/s improves.
+
 ## Current Baseline
 
 Treat the current HEAD baseline as approximately:
@@ -39,6 +43,9 @@ Use the benchmark harness as the source of truth:
 ```bash
 python3 tools/benchmark.py --trials 1 --warmup-runs 1 --cooldown-sec 0 --json
 ```
+
+The command above now exits non-zero if the quality canary fails. Treat that as
+a correctness regression, not a benchmark success.
 
 The old `62.53 tok/s` result is historically important, but it came from the previous 35B format/layout. It is not the current baseline for this GGUF-only codebase.
 
@@ -155,7 +162,7 @@ Secondary files if needed for a specific optimization:
 - `src/main.m`
 - `src/gguf.m`
 
-## What You CANNOT Modify
+## What You Should Not Modify During Experiment Runs
 
 - `tools/benchmark.py`
 - `experiments/qwen35-35B/program.md`
@@ -180,17 +187,20 @@ python3 tools/benchmark.py --trials 1 --warmup-runs 1 --cooldown-sec 0 --json \
   2> experiments/qwen35-35B/bench_err.txt
 ```
 
-5. Append a row to `results.tsv`.
-6. Decide:
+5. If the benchmark command fails its quality gate, treat the experiment as a
+   discard even if tok/s appears higher in the partial output.
+6. Append a row to `results.tsv`.
+7. Decide:
    - Better tok/s: keep it, `git add -A`, commit it.
    - Same or worse: discard it and revert source changes cleanly.
+   - Quality regression: discard it and revert source changes cleanly.
    - Crash or build failure after reasonable fix attempts: log `crash`, revert, move on.
-7. Update `status.md` with:
+8. Update `status.md` with:
    - current best result
    - what you tried
    - what worked / failed
    - the next 2-4 best ideas
-8. Continue until interrupted.
+9. Continue until interrupted.
 
 ## Results Format
 

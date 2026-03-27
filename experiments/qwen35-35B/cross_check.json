@@ -1,7 +1,13 @@
 {
   "model": "/Users/j/Code/lllm/models/Qwen3.5-35B-A3B-Q4_K_S.gguf",
-  "min_tok_sec": 40.0,
+  "min_tok_sec": 65.0,
   "tokens": 5,
   "k": 8,
-  "description": "35B GGUF smoke regression check"
+  "description": "35B GGUF smoke regression check",
+  "quality_system": "You are a concise helpful assistant.",
+  "quality_prompt": "Reply with one short sentence: what color is the sky on a clear day?",
+  "quality_must_contain": ["blue"],
+  "quality_max_tokens": 24,
+  "quality_temperature": 0.2,
+  "quality_timeout_sec": 30.0
 }
