@@ -14,6 +14,31 @@ Inference engine for Apple Silicon, currently focused on GGUF Qwen3.5 models.
 - Campaign status: current 35B GGUF campaign closed out near the wall
 - Experiment logs: `experiments/qwen35-9B/`, `experiments/qwen35-27B/`, `experiments/qwen35-35B/`
 
+## Fixed-Token Comparison vs llama.cpp
+
+The repo includes a reproducible fixed-token comparison harness in
+`tools/compare_orome_llama.py`. These numbers are best read as sustained
+generation throughput on the same machine, not as a claim about end-to-end
+latency or exact prompt-processing parity across engines.
+
+Method:
+- Mac Studio M2 Max, same GGUF files, same prompt (`Hello`)
+- 100 generated tokens, context size `256`, 3-trial median
+- Orome via `tools/benchmark.py --skip-quality-check`
+- llama.cpp via `llama-completion` with greedy settings and `--no-warmup`
+
+| Model | Orome tok/s | llama.cpp tok/s | Winner |
+| --- | ---: | ---: | --- |
+| Qwen3.5-9B-Q8_0 | 35.62 | 30.58 | Orome |
+| Qwen3.5-27B-Q4_K_M | 9.68 | 14.08 | llama.cpp |
+| Qwen3.5-35B-A3B-Q4_K_S | 64.68 | 49.51 | Orome |
+
+Reproduce:
+
+```bash
+python3 tools/compare_orome_llama.py --models 9B 27B 35B --tokens 100 --trials 3
+```
+
 ## Quick Start
 
 ```bash
