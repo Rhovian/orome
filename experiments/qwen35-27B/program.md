@@ -29,13 +29,13 @@ Secondary goals:
 
 The parity target for this campaign is local `llama.cpp` on the same machine, not just Orome's past numbers. The runner now validates successful 27B sessions against both Orome-only checks and Orome-vs-llama compare harnesses.
 
-The benchmark harness includes a multi-case quality suite. For 27B, the runner now uses the same three semantic prompts we use for local quality comparison (`capital`, `opposite`, `sky`) instead of a bare `Hello` canary. The current floor is intentionally set to the observed baseline: at least 1 of those 3 cases must pass. A run is not valid if the model collapses to `0/3`, even if tok/s improves.
+The benchmark harness includes a multi-case quality suite. For 27B, the runner now uses the same three semantic prompts we use for local quality comparison (`capital`, `opposite`, `sky`) instead of a bare `Hello` canary. The current Orome-only floor is intentionally set to the observed baseline: at least 2 of those 3 cases must pass. A run is not valid if it drops below `2/3`, even if tok/s improves.
 
 ## Current Baseline
 
 Treat the current HEAD baseline as approximately:
 
-- `9.5-10.0 tok/s`
+- `17.8-18.0 tok/s`
 
 Use the benchmark harness as the source of truth:
 
@@ -53,6 +53,11 @@ python3 tools/benchmark.py \
 ```
 
 The command above exits non-zero if the 27B quality suite falls below its configured case-pass floor. Treat that as a correctness regression, not a benchmark success.
+
+The runner also performs local `llama.cpp` parity checks after a kept session. The current parity floors are:
+
+- Orome throughput must be at least `1.0x` local `llama.cpp` on the fixed 100-token compare
+- Orome quality must hit at least `2/3` cases in at least `2` of `3` repeated compare runs
 
 ## Local llama.cpp Reference
 

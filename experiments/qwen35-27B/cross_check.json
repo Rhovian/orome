@@ -1,7 +1,7 @@
 {
   "model": "/Users/j/Code/lllm/models/Qwen3.5-27B-Q4_K_M.gguf",
   "prompt": "Hello",
-  "min_tok_sec": 9.0,
+  "min_tok_sec": 17.0,
   "tokens": 5,
   "k": 0,
   "description": "27B dense GGUF smoke regression check",
@@ -33,7 +33,7 @@
   "quality_timeout_sec": 30.0,
   "quality_runs": 1,
   "quality_min_passes": 1,
-  "quality_case_min_passes": 1,
+  "quality_case_min_passes": 2,
   "llama_compare": {
     "enabled": true,
     "model_alias": "27B",
@@ -50,12 +50,12 @@
       "trials": 3,
       "warmup_runs": 0,
       "cooldown_sec": 0.0,
-      "min_ratio_orome_over_llama": 0.75
+      "min_ratio_orome_over_llama": 1.0
     },
     "quality": {
       "runs": 3,
-      "min_orome_passes": 1,
-      "min_runs_passing": 1
+      "min_orome_passes": 2,
+      "min_runs_passing": 2
     }
   }
 }
