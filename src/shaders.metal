@@ -2444,6 +2444,145 @@ kernel void shared_gate_up_swiglu_q8_0(
 }
 
 // ============================================================================
+// Llama-style fused gate+up+swiglu Q4_K (register-only, no shared memory)
+// ============================================================================
+
+kernel void fused_gate_up_swiglu_q4k_llama(
+    device const uint8_t*       gate_data       [[buffer(0)]],
+    device const uint8_t*       up_data         [[buffer(1)]],
+    device const float*         x               [[buffer(2)]],
+    device float*               out             [[buffer(3)]],
+    constant uint&              out_dim         [[buffer(4)]],
+    constant uint&              in_dim          [[buffer(5)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short NSG = 2;
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short ix = short(tiisg / 8);
+    const short it = short(tiisg % 8);
+    const short iq = short(it / 4);
+    const short ir = short(it % 4);
+
+    const int nb = int(in_dim / 256);
+    const int row = int(tgpig.x * NSG + sgitg);
+    if (row >= int(out_dim)) return;
+
+    const uint row_bytes = uint(nb * 144);
+    device const float * y = x;
+
+    float yl[16];
+    float yh[16];
+    float gate_sum = 0.f;
+    float up_sum = 0.f;
+
+    device const float * y4 = y + ix * 256 + 64 * iq + 8 * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *) sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i + 0];   sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i + 32];  sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+
+        // Gate row
+        {
+            device const uint8_t * sb = gate_data + uint(row) * row_bytes + uint(ib) * 144u;
+            device const uint16_t * sc = (device const uint16_t *) (sb + 4) + iq;
+            device const uint16_t * q1 = (device const uint16_t *) (sb + 16) + 16 * iq + 4 * ir;
+            device const half     * dh = (device const half *) sb;
+
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t * q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xF000);
+            }
+
+            gate_sum += float(dh[0]) * (
+                (acc1[0] + (1.f / 256.f) * acc1[1]) * float(sc8[0]) +
+                (acc1[2] + (1.f / 256.f) * acc1[3]) * float(sc8[1]) * (1.f / 16.f) +
+                (acc2[0] + (1.f / 256.f) * acc2[1]) * float(sc8[4]) +
+                (acc2[2] + (1.f / 256.f) * acc2[3]) * float(sc8[5]) * (1.f / 16.f)) -
+                float(dh[1]) * (
+                    sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                    sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+        }
+
+        // Up row (reuse yl, yh, sumy)
+        {
+            device const uint8_t * sb = up_data + uint(row) * row_bytes + uint(ib) * 144u;
+            device const uint16_t * sc = (device const uint16_t *) (sb + 4) + iq;
+            device const uint16_t * q1 = (device const uint16_t *) (sb + 16) + 16 * iq + 4 * ir;
+            device const half     * dh = (device const half *) sb;
+
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t * q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xF000);
+            }
+
+            up_sum += float(dh[0]) * (
+                (acc1[0] + (1.f / 256.f) * acc1[1]) * float(sc8[0]) +
+                (acc1[2] + (1.f / 256.f) * acc1[3]) * float(sc8[1]) * (1.f / 16.f) +
+                (acc2[0] + (1.f / 256.f) * acc2[1]) * float(sc8[4]) +
+                (acc2[2] + (1.f / 256.f) * acc2[3]) * float(sc8[5]) * (1.f / 16.f)) -
+                float(dh[1]) * (
+                    sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                    sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+        }
+
+        y4 += 4 * 256;
+    }
+
+    float gate_total = simd_sum(gate_sum);
+    float up_total = simd_sum(up_sum);
+    if (tiisg == 0) {
+        float silu_gate = gate_total / (1.0f + exp(-gate_total));
+        out[row] = silu_gate * up_total;
+    }
+}
+
+// ============================================================================
 // Dynamic Q4_K batched expert down projection (per-expert packed input)
 // ============================================================================
 

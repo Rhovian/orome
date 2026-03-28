@@ -169,6 +169,7 @@ typedef struct {
     id<MTLComputePipelineState> batch_expert_gate_up_swiglu_q4k_dyn;
     id<MTLComputePipelineState> shared_gate_up_swiglu_q4k;
     id<MTLComputePipelineState> shared_gate_up_swiglu_q8_0;
+    id<MTLComputePipelineState> fused_gate_up_swiglu_q4k_llama;
     id<MTLComputePipelineState> batch_expert_down_q4k_dyn;
     id<MTLComputePipelineState> batch_expert_down_q5k_dyn;
 

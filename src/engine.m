@@ -331,19 +331,13 @@ static void encode_dense_ffn(id<MTLComputeCommandEncoder> enc,
     int M = cfg->moe_intermediate;
 
     // Try fused gate+up+swiglu path (avoids intermediate buffers + 2 dispatches)
-    id<MTLComputePipelineState> fused_pipe = nil;
+    // Prefer llama-style register-only kernel when available (no shared memory)
     if (lt->dense_gate.format == QFMT_GGUF_Q4_K
-            && lt->dense_up.format == QFMT_GGUF_Q4_K) {
-        fused_pipe = ctx->shared_gate_up_swiglu_q4k;
-    } else if (lt->dense_gate.format == QFMT_GGUF_Q8_0
-                   && lt->dense_up.format == QFMT_GGUF_Q8_0) {
-        fused_pipe = ctx->shared_gate_up_swiglu_q8_0;
-    }
-
-    if (fused_pipe) {
+            && lt->dense_up.format == QFMT_GGUF_Q4_K
+            && ctx->fused_gate_up_swiglu_q4k_llama) {
         uint od = (uint)M, id_ = (uint)lt->dense_gate.in_dim;
-        NSUInteger num_tgs = (od + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
-        [enc setComputePipelineState:fused_pipe];
+        NSUInteger num_tgs = (od + 1) / 2;  // NSG=2, 1 row per simdgroup
+        [enc setComputePipelineState:ctx->fused_gate_up_swiglu_q4k_llama];
         [enc setBuffer:lt->dense_gate.buffer offset:lt->dense_gate.offset atIndex:0];
         [enc setBuffer:lt->dense_up.buffer offset:lt->dense_up.offset atIndex:1];
         [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
@@ -351,23 +345,47 @@ static void encode_dense_ffn(id<MTLComputeCommandEncoder> enc,
         [enc setBytes:&od length:sizeof(uint) atIndex:4];
         [enc setBytes:&id_ length:sizeof(uint) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(ENGINE_ROWS_PER_TG * 32, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     } else {
-        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_gate,
-            ctx->buf_input, 0, ctx->buf_shared_gate, 0);
-        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_up,
-            ctx->buf_input, 0, ctx->buf_shared_up, 0);
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        id<MTLComputePipelineState> fused_pipe = nil;
+        if (lt->dense_gate.format == QFMT_GGUF_Q4_K
+                && lt->dense_up.format == QFMT_GGUF_Q4_K) {
+            fused_pipe = ctx->shared_gate_up_swiglu_q4k;
+        } else if (lt->dense_gate.format == QFMT_GGUF_Q8_0
+                       && lt->dense_up.format == QFMT_GGUF_Q8_0) {
+            fused_pipe = ctx->shared_gate_up_swiglu_q8_0;
+        }
 
-        [enc setComputePipelineState:ctx->swiglu];
-        [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
-        [enc setBuffer:ctx->buf_shared_up offset:0 atIndex:1];
-        [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:2];
-        { uint dim_val = (uint)M; [enc setBytes:&dim_val length:sizeof(uint) atIndex:3]; }
-        [enc dispatchThreadgroups:MTLSizeMake(((uint)M + 255) / 256, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (fused_pipe) {
+            uint od = (uint)M, id_ = (uint)lt->dense_gate.in_dim;
+            NSUInteger num_tgs = (od + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
+            [enc setComputePipelineState:fused_pipe];
+            [enc setBuffer:lt->dense_gate.buffer offset:lt->dense_gate.offset atIndex:0];
+            [enc setBuffer:lt->dense_up.buffer offset:lt->dense_up.offset atIndex:1];
+            [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
+            [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:3];
+            [enc setBytes:&od length:sizeof(uint) atIndex:4];
+            [enc setBytes:&id_ length:sizeof(uint) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(ENGINE_ROWS_PER_TG * 32, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        } else {
+            format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_gate,
+                ctx->buf_input, 0, ctx->buf_shared_gate, 0);
+            format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_up,
+                ctx->buf_input, 0, ctx->buf_shared_up, 0);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            [enc setComputePipelineState:ctx->swiglu];
+            [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_shared_up offset:0 atIndex:1];
+            [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:2];
+            { uint dim_val = (uint)M; [enc setBytes:&dim_val length:sizeof(uint) atIndex:3]; }
+            [enc dispatchThreadgroups:MTLSizeMake(((uint)M + 255) / 256, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
     }
 
     format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_down,
