@@ -7,11 +7,31 @@
   "description": "27B dense GGUF smoke regression check",
   "quality_check": true,
   "quality_system": "",
-  "quality_prompt": "Hello",
-  "quality_must_contain": [],
-  "quality_max_tokens": 64,
-  "quality_temperature": 0.2,
+  "quality_cases": [
+    {
+      "name": "capital",
+      "prompt": "The capital of France is",
+      "must_contain": ["paris"],
+      "tokens": 8,
+      "temperature": 0.2
+    },
+    {
+      "name": "opposite",
+      "prompt": "The opposite of hot is",
+      "must_contain": ["cold"],
+      "tokens": 8,
+      "temperature": 0.2
+    },
+    {
+      "name": "sky",
+      "prompt": "The sky is",
+      "must_contain": ["blue"],
+      "tokens": 16,
+      "temperature": 0.2
+    }
+  ],
   "quality_timeout_sec": 30.0,
-  "quality_runs": 3,
-  "quality_min_passes": 3
+  "quality_runs": 1,
+  "quality_min_passes": 1,
+  "quality_case_min_passes": 1
 }

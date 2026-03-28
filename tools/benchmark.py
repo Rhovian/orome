@@ -34,6 +34,8 @@ DEFAULT_QUALITY_PROMPT = "Hello"
 DEFAULT_QUALITY_MUST_CONTAIN = []
 DEFAULT_QUALITY_RUNS = 1
 DEFAULT_QUALITY_MIN_PASSES = 1
+DEFAULT_QUALITY_CASES = None
+DEFAULT_QUALITY_CASE_MIN_PASSES = 1
 
 
 def parse_metrics(output):
@@ -66,6 +68,27 @@ def normalize_quality_needles(value):
     if isinstance(value, str):
         return [value]
     return [str(item) for item in value]
+
+
+def normalize_quality_cases(value):
+    if value is None:
+        return None
+    cases = []
+    for idx, case in enumerate(value):
+        if not isinstance(case, dict):
+            raise ValueError(f"quality_cases[{idx}] must be an object")
+        prompt = str(case.get("prompt", "")).strip()
+        if not prompt:
+            raise ValueError(f"quality_cases[{idx}] is missing a prompt")
+        cases.append({
+            "name": str(case.get("name", f"case_{idx+1}")),
+            "prompt": prompt,
+            "must_contain": normalize_quality_needles(case.get("must_contain", [])),
+            "tokens": int(case.get("tokens", 64)),
+            "system": str(case.get("system", DEFAULT_QUALITY_SYSTEM)),
+            "temperature": float(case.get("temperature", case.get("quality_temperature", 0.2))),
+        })
+    return cases
 
 
 def build_infer_cmd(infer_path, model=None, k=None, extra_args=None):
@@ -363,6 +386,69 @@ def run_quality_probes(cwd, infer_path, model, k, extra_args, *, system_prompt,
     return aggregate
 
 
+def run_quality_case_suite(cwd, infer_path, model, k, extra_args, *, cases,
+                           timeout_sec, runs, min_passes, min_case_passes):
+    case_results = []
+    case_pass_count = 0
+    for case in cases:
+        result = run_quality_probes(
+            cwd, infer_path, model, k, extra_args,
+            system_prompt=case.get("system", DEFAULT_QUALITY_SYSTEM),
+            user_prompt=case["prompt"],
+            must_contain=case["must_contain"],
+            max_tokens=case["tokens"],
+            temperature=case["temperature"],
+            timeout_sec=timeout_sec,
+            runs=runs,
+            min_passes=min_passes,
+        )
+        case_results.append({
+            "name": case["name"],
+            "prompt": case["prompt"],
+            "must_contain": case["must_contain"],
+            "tokens": case["tokens"],
+            "quality_pass": result["quality_pass"],
+            "quality_reply": result["quality_reply"],
+            "quality_reasons": result["quality_reasons"],
+            "quality_runs": result["quality_runs"],
+            "quality_pass_count": result["quality_pass_count"],
+            "quality_min_passes": result["quality_min_passes"],
+            "quality_probe_results": result["quality_probe_results"],
+        })
+        if result["quality_pass"]:
+            case_pass_count += 1
+
+    min_case_passes = max(1, int(min_case_passes))
+    min_case_passes = min(min_case_passes, len(case_results))
+    suite_pass = case_pass_count >= min_case_passes
+    first_fail = next((case for case in case_results if not case["quality_pass"]), None)
+    last_case = case_results[-1] if case_results else None
+
+    reasons = []
+    if not suite_pass:
+        reasons.append(
+            f"quality cases passed {case_pass_count}/{len(case_results)} (need {min_case_passes})"
+        )
+        if first_fail:
+            reasons.extend(first_fail.get("quality_reasons") or [])
+
+    return {
+        "quality_pass": suite_pass,
+        "quality_reply": (first_fail or last_case or {}).get("quality_reply", ""),
+        "quality_reasons": reasons,
+        "quality_case_results": case_results,
+        "quality_case_pass_count": case_pass_count,
+        "quality_case_count": len(case_results),
+        "quality_case_min_passes": min_case_passes,
+        "quality_runs": runs,
+        "quality_pass_count": case_pass_count,
+        "quality_min_passes": min_case_passes,
+        "quality_probe_results": [],
+        "quality_server_log_tail": [],
+        "quality_raw_response": "",
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run a repeatable orome benchmark")
     parser.add_argument("--infer", default="./orome", help="Path to orome binary")
@@ -385,6 +471,8 @@ def main():
     parser.add_argument("--quality-timeout-sec", type=float, default=30.0, help="Timeout for server startup and quality probe")
     parser.add_argument("--quality-runs", type=int, default=DEFAULT_QUALITY_RUNS, help="Number of sequential quality probes to run")
     parser.add_argument("--quality-min-passes", type=int, default=DEFAULT_QUALITY_MIN_PASSES, help="Minimum number of passing probes required")
+    parser.add_argument("--quality-cases", help="Optional JSON array of quality cases")
+    parser.add_argument("--quality-case-min-passes", type=int, default=DEFAULT_QUALITY_CASE_MIN_PASSES, help="Minimum number of passing quality cases required")
     args = parser.parse_args()
 
     cwd = Path(__file__).resolve().parent.parent  # tools/ -> project root
@@ -402,6 +490,8 @@ def main():
     quality_timeout_sec = args.quality_timeout_sec
     quality_runs = args.quality_runs
     quality_min_passes = args.quality_min_passes
+    quality_cases = normalize_quality_cases(json.loads(args.quality_cases)) if args.quality_cases else DEFAULT_QUALITY_CASES
+    quality_case_min_passes = args.quality_case_min_passes
 
     if args.quality_config:
         with open(args.quality_config) as f:
@@ -417,6 +507,8 @@ def main():
         quality_timeout_sec = quality_cfg.get("quality_timeout_sec", quality_timeout_sec)
         quality_runs = quality_cfg.get("quality_runs", quality_runs)
         quality_min_passes = quality_cfg.get("quality_min_passes", quality_min_passes)
+        quality_cases = normalize_quality_cases(quality_cfg.get("quality_cases", quality_cases))
+        quality_case_min_passes = quality_cfg.get("quality_case_min_passes", quality_case_min_passes)
 
     if not args.json:
         print("=== orome benchmark (M2 Max 96GB) ===")
@@ -430,7 +522,11 @@ def main():
         print(f"cool-down:    {args.cooldown_sec:.0f}s")
         print(f"quality gate: {'on' if quality_enabled else 'off'}")
         if quality_enabled:
-            print(f"quality runs: {quality_runs} (min passes: {quality_min_passes})")
+            if quality_cases:
+                print(f"quality cases: {len(quality_cases)} (min passing cases: {quality_case_min_passes})")
+                print(f"per-case runs: {quality_runs} (min passes per case: {quality_min_passes})")
+            else:
+                print(f"quality runs: {quality_runs} (min passes: {quality_min_passes})")
         if args.extra:
             print(f"extra args:   {args.extra}")
         print()
@@ -483,21 +579,33 @@ def main():
     exit_code = 0
     if quality_enabled:
         if not args.json:
-            if quality_runs > 1:
+            if quality_cases:
+                print(f"[quality] running {len(quality_cases)}-case quality suite")
+            elif quality_runs > 1:
                 print(f"[quality] running chat coherence canary ({quality_runs} sequential runs)")
             else:
                 print("[quality] running chat coherence canary")
-        quality_result = run_quality_probes(
-            cwd, infer_path, args.model, args.k, args.extra,
-            system_prompt=quality_system,
-            user_prompt=quality_prompt,
-            must_contain=quality_must_contain,
-            max_tokens=quality_max_tokens,
-            temperature=quality_temperature,
-            timeout_sec=quality_timeout_sec,
-            runs=quality_runs,
-            min_passes=quality_min_passes,
-        )
+        if quality_cases:
+            quality_result = run_quality_case_suite(
+                cwd, infer_path, args.model, args.k, args.extra,
+                cases=quality_cases,
+                timeout_sec=quality_timeout_sec,
+                runs=quality_runs,
+                min_passes=quality_min_passes,
+                min_case_passes=quality_case_min_passes,
+            )
+        else:
+            quality_result = run_quality_probes(
+                cwd, infer_path, args.model, args.k, args.extra,
+                system_prompt=quality_system,
+                user_prompt=quality_prompt,
+                must_contain=quality_must_contain,
+                max_tokens=quality_max_tokens,
+                temperature=quality_temperature,
+                timeout_sec=quality_timeout_sec,
+                runs=quality_runs,
+                min_passes=quality_min_passes,
+            )
         result.update({
             "quality_pass": quality_result["quality_pass"],
             "quality_reply": quality_result["quality_reply"],
@@ -506,6 +614,10 @@ def main():
             "quality_pass_count": quality_result["quality_pass_count"],
             "quality_min_passes": quality_result["quality_min_passes"],
             "quality_probe_results": quality_result["quality_probe_results"],
+            "quality_case_results": quality_result.get("quality_case_results", []),
+            "quality_case_pass_count": quality_result.get("quality_case_pass_count", 0),
+            "quality_case_count": quality_result.get("quality_case_count", 0),
+            "quality_case_min_passes": quality_result.get("quality_case_min_passes", 0),
         })
         if quality_result.get("quality_server_log_tail"):
             result["quality_server_log_tail"] = quality_result["quality_server_log_tail"]
@@ -513,7 +625,10 @@ def main():
             result["quality_raw_response"] = quality_result["quality_raw_response"]
         if not args.json:
             if quality_result["quality_pass"]:
-                if quality_runs > 1:
+                if quality_cases:
+                    print(f"[quality] PASS: {quality_result['quality_case_pass_count']}/{quality_result['quality_case_count']} cases")
+                    print(f"[quality] final reply: {quality_result['quality_reply']!r}")
+                elif quality_runs > 1:
                     print(f"[quality] PASS: {quality_result['quality_pass_count']}/{quality_result['quality_runs']} runs")
                     print(f"[quality] final reply: {quality_result['quality_reply']!r}")
                 else:
@@ -532,6 +647,10 @@ def main():
         result["quality_pass_count"] = 0
         result["quality_min_passes"] = 0
         result["quality_probe_results"] = []
+        result["quality_case_results"] = []
+        result["quality_case_pass_count"] = 0
+        result["quality_case_count"] = 0
+        result["quality_case_min_passes"] = 0
 
     if args.json:
         print(json.dumps(result))
