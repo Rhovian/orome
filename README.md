@@ -9,9 +9,6 @@ Inference engine for Apple Silicon, currently focused on GGUF Qwen3.5 models.
 - Supported autoresearch models: `Qwen3.5-9B-Q8_0.gguf`, `Qwen3.5-27B-Q4_K_M.gguf`, `Qwen3.5-35B-A3B-Q4_K_S.gguf`
 - Primary model: `Qwen3.5-35B-A3B-Q4_K_S.gguf`
 - Best GGUF result: **68.91 tok/s** at `041860b`
-- Historical packed-format peak: `62.39-62.53 tok/s`
-- Bottleneck: GPU dispatch and kernel efficiency, not SSD streaming
-- Campaign status: current 35B GGUF campaign closed out near the wall
 - Experiment logs: `experiments/qwen35-9B/`, `experiments/qwen35-27B/`, `experiments/qwen35-35B/`
 
 ## Fixed-Token Comparison vs llama.cpp
