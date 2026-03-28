@@ -188,12 +188,45 @@ By contrast, `llama.cpp` was imperfect but much healthier:
 This points more toward a 27B-specific inference-path bug than a general
 quality-harness or prompt issue.
 
+### 8. Token-level divergence is real, but it is not always a first-token failure
+
+We now have a local token-trace helper in:
+
+- `tools/compare_orome_llama_tokens.py`
+
+It runs Orome and `llama.cpp` one at a time and reconstructs continuation
+token IDs with local `../llama.cpp/build/bin/llama-tokenize`.
+
+Initial `27B` traces:
+
+- Prompt `The sky is`
+  - Orome continuation: ` a`, ` deep`, `!!!!`, `!!`
+  - llama.cpp continuation: ` blue`, ` because`, ` of`, ...
+  - first divergence: token `1`
+- Prompt `The opposite of hot is`
+  - Orome continuation starts with ` cold`
+  - llama.cpp continuation also starts with ` cold`
+  - first divergence: token `2` when Orome emits punctuation spam instead of
+    `.` and continuing text
+- Prompt `The capital of France is`
+  - Orome continuation starts with ` Paris.`
+  - llama.cpp continuation also starts with ` Paris.`
+  - first divergence: token `3`
+
+This is important because it narrows the failure mode:
+
+- `27B` is not purely broken on the first sampled token
+- some prompts stay correct for one or two tokens before diverging
+- that makes recurrent-state update / multi-step logits corruption more likely
+  than a pure tokenizer or first-token sampler bug
+
 ## Working Hypothesis
 
 Current likely ranking of causes:
 
 1. Primary correctness/perf gap: 27B `Q5_K/Q6_K` inference path is diverging
-   from expected behavior, likely on hot recurrent/attention projections
+   from expected behavior, likely on hot recurrent/attention projections and/or
+   stateful multi-step updates
 2. Secondary perf gap: hybrid linear-attention / recurrent Gated Delta Net
    fusion and scheduling
 3. Unlikely main issue: tokenizer, prompt scaffolding, dense FFN logic, or
@@ -236,6 +269,17 @@ Goal:
 
 - separate "bad logits immediately" from "state update corruption after a
   correct start"
+
+Status:
+
+- partially complete
+- we now know both modes exist:
+  - immediate divergence on `The sky is`
+  - delayed divergence after `1-2` correct continuation tokens on `opposite`
+    and `capital`
+- next refinement should compare internal logits or step-by-step hidden-state
+  behavior around the first bad transition, especially at token `2` and token
+  `3` on the delayed-divergence prompts
 
 ### Phase 3: Build targeted 27B microbenches
 
