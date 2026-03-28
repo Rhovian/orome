@@ -90,7 +90,6 @@ Place the resulting `vocab.bin` next to the GGUF file or in the tokenizer asset 
 
 ## Research Notes
 
-- **[Qwen3.5-35B-A3B](docs/qwen-35b-a3b.md)** — historical packed-format dispatch campaign notes. Useful for hypotheses, but the current source tree is GGUF-only and runs at different absolute numbers.
 - **[experiments/qwen35-9B/program.md](experiments/qwen35-9B/program.md)** — autonomous optimization brief for the 9B dense GGUF path.
 - **[experiments/qwen35-27B/program.md](experiments/qwen35-27B/program.md)** — autonomous optimization brief for the 27B dense GGUF path.
 - **[experiments/qwen35-35B/program.md](experiments/qwen35-35B/program.md)** — current autonomous optimization brief for the GGUF-era codebase.
