@@ -11,5 +11,7 @@
   "quality_must_contain": [],
   "quality_max_tokens": 64,
   "quality_temperature": 0.2,
-  "quality_timeout_sec": 30.0
+  "quality_timeout_sec": 30.0,
+  "quality_runs": 3,
+  "quality_min_passes": 3
 }

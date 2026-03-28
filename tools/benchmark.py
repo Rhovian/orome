@@ -32,6 +32,8 @@ PROJ_RE = re.compile(r"proj=([0-9.]+)")
 DEFAULT_QUALITY_SYSTEM = ""
 DEFAULT_QUALITY_PROMPT = "Hello"
 DEFAULT_QUALITY_MUST_CONTAIN = []
+DEFAULT_QUALITY_RUNS = 1
+DEFAULT_QUALITY_MIN_PASSES = 1
 
 
 def parse_metrics(output):
@@ -307,6 +309,60 @@ def run_quality_probe(cwd, infer_path, model, k, extra_args, *, system_prompt,
     return result
 
 
+def run_quality_probes(cwd, infer_path, model, k, extra_args, *, system_prompt,
+                       user_prompt, must_contain, max_tokens, temperature,
+                       timeout_sec, runs, min_passes):
+    runs = max(1, int(runs))
+    min_passes = max(1, int(min_passes))
+    min_passes = min(min_passes, runs)
+
+    probes = []
+    pass_count = 0
+    for _ in range(runs):
+        probe = run_quality_probe(
+            cwd, infer_path, model, k, extra_args,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            must_contain=must_contain,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            timeout_sec=timeout_sec,
+        )
+        probes.append(probe)
+        if probe.get("quality_pass"):
+            pass_count += 1
+
+    aggregate = {
+        "quality_pass": pass_count >= min_passes,
+        "quality_reply": probes[-1]["quality_reply"] if probes else "",
+        "quality_reasons": [],
+        "quality_runs": runs,
+        "quality_pass_count": pass_count,
+        "quality_min_passes": min_passes,
+        "quality_probe_results": probes,
+    }
+
+    if probes:
+        aggregate["quality_server_log_tail"] = probes[-1].get("quality_server_log_tail", [])
+        aggregate["quality_raw_response"] = probes[-1].get("quality_raw_response", "")
+    else:
+        aggregate["quality_server_log_tail"] = []
+        aggregate["quality_raw_response"] = ""
+
+    if aggregate["quality_pass"]:
+        if runs > 1:
+            aggregate["quality_reasons"] = [f"quality passed {pass_count}/{runs} runs"]
+    else:
+        reasons = [f"quality passed {pass_count}/{runs} runs (need {min_passes})"]
+        first_fail = next((p for p in probes if not p.get("quality_pass")), None)
+        if first_fail:
+            reasons.extend(first_fail.get("quality_reasons") or [])
+            aggregate["quality_reply"] = first_fail.get("quality_reply", aggregate["quality_reply"])
+        aggregate["quality_reasons"] = reasons
+
+    return aggregate
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run a repeatable orome benchmark")
     parser.add_argument("--infer", default="./orome", help="Path to orome binary")
@@ -327,6 +383,8 @@ def main():
     parser.add_argument("--quality-max-tokens", type=int, default=64, help="Max tokens for the quality canary reply")
     parser.add_argument("--quality-temperature", type=float, default=0.2, help="Sampling temperature for the quality canary")
     parser.add_argument("--quality-timeout-sec", type=float, default=30.0, help="Timeout for server startup and quality probe")
+    parser.add_argument("--quality-runs", type=int, default=DEFAULT_QUALITY_RUNS, help="Number of sequential quality probes to run")
+    parser.add_argument("--quality-min-passes", type=int, default=DEFAULT_QUALITY_MIN_PASSES, help="Minimum number of passing probes required")
     args = parser.parse_args()
 
     cwd = Path(__file__).resolve().parent.parent  # tools/ -> project root
@@ -342,6 +400,8 @@ def main():
     quality_max_tokens = args.quality_max_tokens
     quality_temperature = args.quality_temperature
     quality_timeout_sec = args.quality_timeout_sec
+    quality_runs = args.quality_runs
+    quality_min_passes = args.quality_min_passes
 
     if args.quality_config:
         with open(args.quality_config) as f:
@@ -355,6 +415,8 @@ def main():
         quality_max_tokens = quality_cfg.get("quality_max_tokens", quality_max_tokens)
         quality_temperature = quality_cfg.get("quality_temperature", quality_temperature)
         quality_timeout_sec = quality_cfg.get("quality_timeout_sec", quality_timeout_sec)
+        quality_runs = quality_cfg.get("quality_runs", quality_runs)
+        quality_min_passes = quality_cfg.get("quality_min_passes", quality_min_passes)
 
     if not args.json:
         print("=== orome benchmark (M2 Max 96GB) ===")
@@ -367,6 +429,8 @@ def main():
         print(f"warm-up runs: {args.warmup_runs}")
         print(f"cool-down:    {args.cooldown_sec:.0f}s")
         print(f"quality gate: {'on' if quality_enabled else 'off'}")
+        if quality_enabled:
+            print(f"quality runs: {quality_runs} (min passes: {quality_min_passes})")
         if args.extra:
             print(f"extra args:   {args.extra}")
         print()
@@ -419,8 +483,11 @@ def main():
     exit_code = 0
     if quality_enabled:
         if not args.json:
-            print("[quality] running chat coherence canary")
-        quality_result = run_quality_probe(
+            if quality_runs > 1:
+                print(f"[quality] running chat coherence canary ({quality_runs} sequential runs)")
+            else:
+                print("[quality] running chat coherence canary")
+        quality_result = run_quality_probes(
             cwd, infer_path, args.model, args.k, args.extra,
             system_prompt=quality_system,
             user_prompt=quality_prompt,
@@ -428,11 +495,17 @@ def main():
             max_tokens=quality_max_tokens,
             temperature=quality_temperature,
             timeout_sec=quality_timeout_sec,
+            runs=quality_runs,
+            min_passes=quality_min_passes,
         )
         result.update({
             "quality_pass": quality_result["quality_pass"],
             "quality_reply": quality_result["quality_reply"],
             "quality_reasons": quality_result["quality_reasons"],
+            "quality_runs": quality_result["quality_runs"],
+            "quality_pass_count": quality_result["quality_pass_count"],
+            "quality_min_passes": quality_result["quality_min_passes"],
+            "quality_probe_results": quality_result["quality_probe_results"],
         })
         if quality_result.get("quality_server_log_tail"):
             result["quality_server_log_tail"] = quality_result["quality_server_log_tail"]
@@ -440,7 +513,11 @@ def main():
             result["quality_raw_response"] = quality_result["quality_raw_response"]
         if not args.json:
             if quality_result["quality_pass"]:
-                print(f"[quality] PASS: {quality_result['quality_reply']!r}")
+                if quality_runs > 1:
+                    print(f"[quality] PASS: {quality_result['quality_pass_count']}/{quality_result['quality_runs']} runs")
+                    print(f"[quality] final reply: {quality_result['quality_reply']!r}")
+                else:
+                    print(f"[quality] PASS: {quality_result['quality_reply']!r}")
             else:
                 print("[quality] FAIL: " + "; ".join(quality_result["quality_reasons"]))
                 if quality_result["quality_reply"]:
@@ -451,6 +528,10 @@ def main():
         result["quality_pass"] = None
         result["quality_reply"] = ""
         result["quality_reasons"] = []
+        result["quality_runs"] = 0
+        result["quality_pass_count"] = 0
+        result["quality_min_passes"] = 0
+        result["quality_probe_results"] = []
 
     if args.json:
         print(json.dumps(result))

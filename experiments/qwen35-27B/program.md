@@ -26,7 +26,7 @@ Secondary goals:
 - Preserve output correctness
 - Do not regress 9B dense or 35B MoE
 
-The benchmark harness includes a chat quality canary. A run is not valid if the visible answer is empty, garbled, or otherwise fails the quality gate, even if tok/s improves.
+The benchmark harness includes a chat quality canary. For 27B, that gate is intentionally stricter than the other supported models: it runs 3 sequential probes and requires all 3 to pass. A run is not valid if the visible answer is empty, garbled, or otherwise fails that repeated quality gate, even if tok/s improves.
 
 ## Current Baseline
 
@@ -49,7 +49,7 @@ python3 tools/benchmark.py \
   --json
 ```
 
-The command above exits non-zero if the quality canary fails. Treat that as a correctness regression, not a benchmark success.
+The command above exits non-zero if the repeated 27B quality gate fails. Treat that as a correctness regression, not a benchmark success.
 
 ## Architecture Guidance
 
