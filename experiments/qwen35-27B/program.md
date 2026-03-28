@@ -14,17 +14,18 @@ This is a dense-model campaign. Preserve generic logic and keep the other suppor
 
 ## The Goal
 
-Maximize sustained throughput on the current dense GGUF path:
+Improve 27B output quality and stability from the current parity-winning backend without materially giving back throughput:
 
 - Model: `Qwen3.5-27B-Q4_K_M.gguf`
 - Benchmark target: 100 generated tokens
 - Active experts: `K=0`
-- Primary metric: tok/s
+- Throughput floor: keep Orome in the current `~17.8 tok/s` band
+- Quality target: make the semantic suite more consistently pass and eliminate raw think/punctuation collapse behavior
 
 Secondary goals:
 
 - Keep TTFT low
-- Preserve output correctness
+- Preserve or improve the current lead over local `llama.cpp`
 - Do not regress 9B dense or 35B MoE
 
 The parity target for this campaign is local `llama.cpp` on the same machine, not just Orome's past numbers. The runner now validates successful 27B sessions against both Orome-only checks and Orome-vs-llama compare harnesses.
@@ -37,7 +38,7 @@ Treat the current HEAD baseline as approximately:
 
 - `17.8-18.0 tok/s`
 
-Use the benchmark harness as the source of truth:
+Use the benchmark harness as the source of truth for the local Orome-only floor:
 
 ```bash
 python3 tools/benchmark.py \
@@ -58,6 +59,12 @@ The runner also performs local `llama.cpp` parity checks after a kept session. T
 
 - Orome throughput must be at least `1.0x` local `llama.cpp` on the fixed 100-token compare
 - Orome quality must hit at least `2/3` cases in at least `2` of `3` repeated compare runs
+
+This means the optimization priority is now:
+
+1. Keep Orome ahead of local `llama.cpp` on throughput
+2. Improve repeated quality behavior on the semantic suite
+3. Only then chase additional tok/s
 
 ## Local llama.cpp Reference
 
@@ -153,9 +160,10 @@ python3 tools/benchmark.py \
 7. If you keep a result locally, expect the runner to also run the Orome-vs-llama throughput compare and the repeated Orome-vs-llama quality compare before the session is accepted.
 8. Append a row to `results.tsv`.
 9. Decide:
-   - Better tok/s: keep it, `git add -A`, commit it.
-   - Same or worse: discard it and revert source changes cleanly.
-   - Quality regression: discard it and revert source changes cleanly.
+   - Better or equal quality at roughly the same throughput: keep it, `git add -A`, commit it.
+   - Better tok/s with the same or better repeated quality: keep it, `git add -A`, commit it.
+   - Quality regression: discard it and revert source changes cleanly, even if tok/s improves.
+   - Material throughput regression: discard it and revert source changes cleanly, even if one quality case improves.
    - Crash or build failure after reasonable fix attempts: log `crash`, revert, move on.
 10. Update `status.md` with:
    - current best result

@@ -1,7 +1,7 @@
 {
   "model": "/Users/j/Code/lllm/models/Qwen3.5-27B-Q4_K_M.gguf",
   "prompt": "Hello",
-  "min_tok_sec": 17.0,
+  "min_tok_sec": 17.5,
   "tokens": 5,
   "k": 0,
   "description": "27B dense GGUF smoke regression check",
