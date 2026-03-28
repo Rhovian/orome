@@ -242,8 +242,14 @@ static PromptTokens *build_chat_prompt_tokens(const ModelConfig *cfg, NSArray *m
 // Sampling helper — runs engine_step then samples from logits
 // ============================================================================
 
+static inline int model_step(Engine *eng, int token_id) {
+    return model_uses_qwen35_dense_hybrid(eng->cfg)
+        ? engine_step_qwen35_dense_hybrid(eng, token_id)
+        : engine_step(eng, token_id);
+}
+
 static int sample_next(Engine *eng, int token_id, float temperature, int top_k) {
-    engine_step(eng, token_id);
+    model_step(eng, token_id);
     const float *logits = (const float *)[eng->ctx->buf_output contents];
     return cpu_sample_topk(logits, eng->cfg->vocab_size, top_k, temperature);
 }
@@ -396,7 +402,7 @@ void serve_loop(Engine *eng, int port) {
             engine_reset(eng);
             int next_token = 0;
             for (int i = 0; i < pt->count; i++) {
-                next_token = engine_step(eng, pt->ids[i]);
+                next_token = model_step(eng, pt->ids[i]);
             }
             prompt_tokens_free(pt);
 

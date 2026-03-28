@@ -41,6 +41,33 @@ Quality basis:
 This changes the priority. `27B` is not just underperforming; it is also
 qualitatively broken in Orome on a small, simple completion suite.
 
+## Decision Checkpoint
+
+We now have a separate `27B` backend file and a safer intermediate baseline.
+That is worth keeping.
+
+Current working rule:
+
+- keep the separate `27B` backend
+- keep the proven `Q5_K/Q6_K` llama-style matvec win
+- treat `~11.7 tok/s` as the current known-good optimization baseline
+- stop expanding the per-family `Q4_K` experiment scaffolding for now
+
+Why:
+
+- selective `Q4_K` experiments recovered throughput, but they increased output
+  variance instead of producing a stable step toward parity
+- even the more faithful `full_q` probe still collapsed, so the missing
+  fidelity is not just a row-layout issue
+- the larger remaining gap is more likely in the surrounding hybrid runtime
+  and delta-net / full-attention flow than in one more `Q4_K` kernel toggle
+
+Practical consequence:
+
+- future work should start from the known-good `Q5_K/Q6_K` backend state
+- future parity work should focus on the rest of llama.cpp's 27B hybrid
+  implementation, not more branching `Q4_K` path experiments
+
 ## What We Know
 
 ### 1. 27B is not just "another dense model"
@@ -251,6 +278,18 @@ python3 tools/compare_orome_llama_quality.py --models 9B 27B 35B --json
 Keep `9B` and `35B` in the loop as guardrails while working on `27B`.
 
 Do not resume blind 27B-only autoresearch until the major gap is explained.
+
+### Phase 1.5: Freeze the current backend baseline
+
+Before more parity work:
+
+- preserve the separate backend file at `src/engine_qwen35_hybrid.m`
+- preserve the `Q5_K/Q6_K` llama-style matvec path
+- avoid adding more `Q4_K` family switches unless a broader runtime port makes
+  a specific tensor family truly llama-faithful
+
+This avoids repeating the same loop of recovering perf with experimental
+`Q4_K` routing and then losing confidence in stability.
 
 ### Phase 2: Find the first bad 27B generated token
 

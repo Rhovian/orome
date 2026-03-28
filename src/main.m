@@ -69,6 +69,12 @@ static void utf8_buf_flush(Utf8Buf *u) {
     u->len = 0;
 }
 
+static inline int model_step(Engine *eng, int token_id) {
+    return model_uses_qwen35_dense_hybrid(eng->cfg)
+        ? engine_step_qwen35_dense_hybrid(eng, token_id)
+        : engine_step(eng, token_id);
+}
+
 static void add_unique_token(int *tokens, int max_tokens, int *count, int token_id) {
     if (!tokens || !count || token_id < 0 || *count >= max_tokens) return;
     for (int i = 0; i < *count; i++) {
@@ -733,7 +739,7 @@ int main(int argc, char **argv) {
             double t_start = now_ms();
             int next_token = 0;
             for (int i = 0; i < pt->count; i++) {
-                next_token = engine_step(eng, pt->ids[i]);
+                next_token = model_step(eng, pt->ids[i]);
             }
             double ttft = now_ms() - t_start;
             printf("TTFT: %.1f ms\n", ttft);
@@ -750,7 +756,7 @@ int main(int argc, char **argv) {
                 fflush(stdout);
 
                 double tok_start = timing ? now_ms() : 0;
-                next_token = engine_step(eng, next_token);
+                next_token = model_step(eng, next_token);
                 generated++;
 
                 if (timing) {

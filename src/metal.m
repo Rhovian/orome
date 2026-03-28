@@ -133,8 +133,11 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->decay_beta_f32 = make_pipeline(ctx, @"compute_decay_beta_f32");
     ctx->matvec_f32 = make_pipeline(ctx, @"matvec_f32");
     ctx->matvec_f32_pair = make_pipeline(ctx, @"matvec_f32_pair");
+    ctx->matvec_q4k_llama = make_pipeline(ctx, @"dequant_matvec_q4k_llama");
     ctx->matvec_q5k = make_pipeline(ctx, @"dequant_matvec_q5k");
+    ctx->matvec_q5k_llama = make_pipeline(ctx, @"dequant_matvec_q5k_llama");
     ctx->matvec_q6k = make_pipeline(ctx, @"dequant_matvec_q6k");
+    ctx->matvec_q6k_llama = make_pipeline(ctx, @"dequant_matvec_q6k_llama");
 
     if (!ctx->matvec_q4k || !ctx->norm_sum_sq || !ctx->norm_apply) {
         fprintf(stderr, "ERROR: Required Metal pipelines missing\n");

@@ -6,7 +6,8 @@ LDFLAGS =
 # Multi-file build
 OROME_TARGET = orome
 OROME_SRCS = src/main.m src/engine.m src/metal.m \
-             src/kernels.m src/tokenizer.m src/server.m src/gguf.m src/format.m
+             src/kernels.m src/tokenizer.m src/server.m src/gguf.m src/format.m \
+             src/engine_qwen35_hybrid.m
 OROME_OBJS = $(OROME_SRCS:.m=.o)
 
 # Metal shaders
