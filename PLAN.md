@@ -17,6 +17,8 @@ Comparison basis:
 - llama.cpp: `c46758d`
 - Method: same machine, same GGUF files, prompt `Hello`, `100` generated
   tokens, context size `256`, `5`-trial median
+- Local llama.cpp source is available one directory up at `../llama.cpp`
+  (absolute path `/Users/j/Code/lllm/llama.cpp`)
 
 This means the problem is not "Orome is generally slower than llama.cpp."
 It is much more likely that `27B` is exposing one or two path-specific gaps.
@@ -33,6 +35,8 @@ Quality basis:
 - llama.cpp: `c46758d`
 - Method: same machine, same GGUF files, greedy raw completion, prompt suite
   `capital`, `opposite`, `sky`
+- Local llama.cpp source is available one directory up at `../llama.cpp`
+  (absolute path `/Users/j/Code/lllm/llama.cpp`)
 
 This changes the priority. `27B` is not just underperforming; it is also
 qualitatively broken in Orome on a small, simple completion suite.
@@ -112,6 +116,7 @@ Relevant code:
 
 - `../llama.cpp/ggml/src/ggml-metal/ggml-metal-impl.h`
 - `../llama.cpp/ggml/src/ggml-metal/ggml-metal-device.cpp`
+- Local repo root: `../llama.cpp`
 
 ### 5. Orome's Q5_K and Q6_K kernels are simpler than llama.cpp's
 
@@ -130,6 +135,7 @@ Relevant code:
   - `src/shaders.metal`
 - llama.cpp:
   - `../llama.cpp/ggml/src/ggml-metal/ggml-metal.metal`
+  - repo root: `../llama.cpp`
 
 ### 6. llama.cpp is taking a fused Gated Delta Net path on 27B
 
@@ -157,6 +163,7 @@ Relevant code:
   - `src/engine.m`
 - llama.cpp:
   - `../llama.cpp/src/models/qwen3next.cpp`
+  - repo root: `../llama.cpp`
 
 ### 7. Orome's 27B replies are semantically right, then collapse into punctuation spam
 
