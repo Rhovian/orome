@@ -33,5 +33,29 @@
   "quality_timeout_sec": 30.0,
   "quality_runs": 1,
   "quality_min_passes": 1,
-  "quality_case_min_passes": 1
+  "quality_case_min_passes": 1,
+  "llama_compare": {
+    "enabled": true,
+    "model_alias": "27B",
+    "repo": "/Users/j/Code/lllm/llama.cpp",
+    "source_hints": [
+      "src/models/qwen35.cpp",
+      "src/models/delta-net-base.cpp",
+      "src/llama-context.cpp",
+      "ggml/src/ggml-metal/ggml-metal.metal",
+      "ggml/src/ggml-metal/ggml-metal-device.cpp"
+    ],
+    "throughput": {
+      "tokens": 100,
+      "trials": 3,
+      "warmup_runs": 0,
+      "cooldown_sec": 0.0,
+      "min_ratio_orome_over_llama": 0.75
+    },
+    "quality": {
+      "runs": 3,
+      "min_orome_passes": 1,
+      "min_runs_passing": 1
+    }
+  }
 }

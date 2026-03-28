@@ -10,6 +10,7 @@ This is a dense-model campaign. Preserve generic logic and keep the other suppor
 2. Read `results.tsv` next. It is the live 27B campaign log.
 3. Read the source files you plan to modify before changing anything.
 4. The runner will place you on branch `autoresearch/orome-27B`.
+5. Use local `../llama.cpp` as the reference implementation for parity work on this model.
 
 ## The Goal
 
@@ -25,6 +26,8 @@ Secondary goals:
 - Keep TTFT low
 - Preserve output correctness
 - Do not regress 9B dense or 35B MoE
+
+The parity target for this campaign is local `llama.cpp` on the same machine, not just Orome's past numbers. The runner now validates successful 27B sessions against both Orome-only checks and Orome-vs-llama compare harnesses.
 
 The benchmark harness includes a multi-case quality suite. For 27B, the runner now uses the same three semantic prompts we use for local quality comparison (`capital`, `opposite`, `sky`) instead of a bare `Hello` canary. The current floor is intentionally set to the observed baseline: at least 1 of those 3 cases must pass. A run is not valid if the model collapses to `0/3`, even if tok/s improves.
 
@@ -50,6 +53,27 @@ python3 tools/benchmark.py \
 ```
 
 The command above exits non-zero if the 27B quality suite falls below its configured case-pass floor. Treat that as a correctness regression, not a benchmark success.
+
+## Local llama.cpp Reference
+
+Use the local reference repo at:
+
+- `/Users/j/Code/lllm/llama.cpp`
+
+Useful local comparison commands:
+
+```bash
+python3 tools/compare_orome_llama.py --models 27B --json
+python3 tools/compare_orome_llama_quality.py --models 27B --json
+```
+
+Start from these local llama.cpp files before guessing:
+
+- `/Users/j/Code/lllm/llama.cpp/src/models/qwen35.cpp`
+- `/Users/j/Code/lllm/llama.cpp/src/models/delta-net-base.cpp`
+- `/Users/j/Code/lllm/llama.cpp/src/llama-context.cpp`
+- `/Users/j/Code/lllm/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal`
+- `/Users/j/Code/lllm/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.cpp`
 
 ## Architecture Guidance
 
@@ -121,18 +145,19 @@ python3 tools/benchmark.py \
 ```
 
 6. If the benchmark command fails its quality gate, treat the experiment as a discard even if tok/s appears higher in partial output.
-7. Append a row to `results.tsv`.
-8. Decide:
+7. If you keep a result locally, expect the runner to also run the Orome-vs-llama throughput compare and the repeated Orome-vs-llama quality compare before the session is accepted.
+8. Append a row to `results.tsv`.
+9. Decide:
    - Better tok/s: keep it, `git add -A`, commit it.
    - Same or worse: discard it and revert source changes cleanly.
    - Quality regression: discard it and revert source changes cleanly.
    - Crash or build failure after reasonable fix attempts: log `crash`, revert, move on.
-9. Update `status.md` with:
+10. Update `status.md` with:
    - current best result
    - what you tried
    - what worked / failed
    - the next 2-4 best ideas
-10. Continue until interrupted.
+11. Continue until interrupted.
 
 The runner owns the final `## Runner Validation` section in `status.md` and normalizes the retained `keep` row in `results.tsv` to the final commit hash after post-session checks. Do not hand-edit that runner-managed section.
 
