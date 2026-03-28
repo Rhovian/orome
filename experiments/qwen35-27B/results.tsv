@@ -12,3 +12,4 @@ f4f5815	9.73	1762.0	0.0	keep	skip copy+norm for dense layers (reuse residual_add
 8c47bc7	11.79	1840.0	0.0	baseline	session baseline (post-hybrid engine + llama Q5K/Q6K kernels)
 8c47bc7	13.06	1852.0	0.0	keep	enable llama Q4K kernel for lm_head + attn O-proj (fix mask bug + enable OTHER|FULL_O|LINEAR_O)
 979f235	17.27	1793.0	0.0	keep	llama-style fused gate+up+swiglu Q4K kernel (register-only, no shared memory)
+83ad18a	17.80	1820.0	0.0	keep	enable FULL_Q for llama Q4K dispatch (gated Q projection, 16 full-attn layers)

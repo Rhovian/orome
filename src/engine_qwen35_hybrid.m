@@ -22,7 +22,7 @@ typedef enum {
     HYBRID_Q4_ALL        = 0x3Fu,
 } HybridQ4Mask;
 
-#define HYBRID_Q4_DEFAULT_MASK (HYBRID_Q4_OTHER | HYBRID_Q4_FULL_O | HYBRID_Q4_LINEAR_O)
+#define HYBRID_Q4_DEFAULT_MASK (HYBRID_Q4_OTHER | HYBRID_Q4_FULL_O | HYBRID_Q4_LINEAR_O | HYBRID_Q4_FULL_Q)
 
 static uint32_t hybrid_q4_mask(void) {
     static bool initialized = false;
