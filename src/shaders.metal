@@ -438,6 +438,131 @@ kernel void gated_delta_net_step(
     output[v_base + vi] = out_val;
 }
 
+// L2-normalize Q and K vectors in-place for llama-style fused GDN.
+// Both outputs are unit-length; Q scaling by 1/sqrt(key_dim) happens in the
+// delta-net kernel itself.
+kernel void l2_norm_qk_unit(
+    device float *q,              // [num_k_heads * key_dim] in/out
+    device float *k,              // [num_k_heads * key_dim] in/out
+    constant uint &key_dim,
+    constant float &inv_scale,    // = 1/sqrt(key_dim)
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint base = head * key_dim;
+
+    float qval = (tid < key_dim) ? q[base + tid] : 0;
+    float q_sq = qval * qval;
+    float q_simd = simd_sum(q_sq);
+    threadgroup float q_shared[4];
+    if (simd_lane == 0) q_shared[simd_group] = q_simd;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_total = 0;
+    if (simd_group == 0) {
+        float v = (simd_lane < 4) ? q_shared[simd_lane] : 0;
+        q_total = simd_sum(v);
+    }
+    threadgroup float q_broadcast;
+    if (tid == 0) q_broadcast = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) q_broadcast = q_total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_inv_l2 = rsqrt(q_broadcast + 1e-6f);
+    if (tid < key_dim) {
+        q[base + tid] = qval * q_inv_l2;
+    }
+
+    float kval = (tid < key_dim) ? k[base + tid] : 0;
+    float k_sq = kval * kval;
+    float k_simd = simd_sum(k_sq);
+    threadgroup float k_shared[4];
+    if (simd_lane == 0) k_shared[simd_group] = k_simd;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float k_total = 0;
+    if (simd_group == 0) {
+        float v = (simd_lane < 4) ? k_shared[simd_lane] : 0;
+        k_total = simd_sum(v);
+    }
+    threadgroup float k_broadcast;
+    if (tid == 0) k_broadcast = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) k_broadcast = k_total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float k_inv_l2 = rsqrt(k_broadcast + 1e-6f);
+    if (tid < key_dim) {
+        k[base + tid] = kval * k_inv_l2;
+    }
+}
+
+// Llama-style fused autoregressive Gated Delta Net for the 27B hybrid backend.
+// Expects Q/K already L2-normalized; applies the final 1/sqrt(key_dim) scale to
+// the output inside the kernel, matching ggml's fused GDN contract.
+kernel void gated_delta_net_step_llama_f32(
+    device float *state,             // [n_v_heads * 128 * 128] persistent F32 state
+    device const float *q,           // [num_k_heads * 128], unit L2
+    device const float *k,           // [num_k_heads * 128], unit L2
+    device const float *v,           // [n_v_heads * 128]
+    device const float *g_decay,     // [n_v_heads], exp(-A * softplus)
+    device const float *beta_gate,   // [n_v_heads], sigmoid(beta)
+    device float *output,            // [n_v_heads * 128]
+    constant uint &num_k_heads,
+    constant float &q_scale,         // 1/sqrt(key_dim)
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tpitg [[thread_position_in_threadgroup]]
+) {
+    uint tx = tpitg.x;               // 0..31
+    uint ty = tpitg.y;               // 0..3
+
+    uint head_id = tgpig.y;
+    uint vi = tgpig.x * 4 + ty;
+    if (vi >= 128) return;
+
+    uint kh = head_id % num_k_heads;
+    uint state_base = head_id * 128 * 128 + vi * 128;
+    uint qk_base = kh * 128;
+    uint v_base = head_id * 128;
+
+    float ls0 = state[state_base + tx * 4 + 0];
+    float ls1 = state[state_base + tx * 4 + 1];
+    float ls2 = state[state_base + tx * 4 + 2];
+    float ls3 = state[state_base + tx * 4 + 3];
+
+    float g = g_decay[head_id];
+    float beta = beta_gate[head_id];
+
+    float s_k = 0.0f;
+    ls0 *= g; s_k += ls0 * k[qk_base + tx * 4 + 0];
+    ls1 *= g; s_k += ls1 * k[qk_base + tx * 4 + 1];
+    ls2 *= g; s_k += ls2 * k[qk_base + tx * 4 + 2];
+    ls3 *= g; s_k += ls3 * k[qk_base + tx * 4 + 3];
+    s_k = simd_sum(s_k);
+
+    float d = (v[v_base + vi] - s_k) * beta;
+
+    float y = 0.0f;
+    float k0 = k[qk_base + tx * 4 + 0];
+    float k1 = k[qk_base + tx * 4 + 1];
+    float k2 = k[qk_base + tx * 4 + 2];
+    float k3 = k[qk_base + tx * 4 + 3];
+
+    ls0 += k0 * d; y += ls0 * q[qk_base + tx * 4 + 0];
+    ls1 += k1 * d; y += ls1 * q[qk_base + tx * 4 + 1];
+    ls2 += k2 * d; y += ls2 * q[qk_base + tx * 4 + 2];
+    ls3 += k3 * d; y += ls3 * q[qk_base + tx * 4 + 3];
+    y = simd_sum(y);
+
+    if (tx == 0) {
+        output[v_base + vi] = y * q_scale;
+    }
+
+    state[state_base + tx * 4 + 0] = ls0;
+    state[state_base + tx * 4 + 1] = ls1;
+    state[state_base + tx * 4 + 2] = ls2;
+    state[state_base + tx * 4 + 3] = ls3;
+}
+
 
 // ============================================================================
 // Kernel 11: Conv1d depthwise step (single token, incremental inference)
