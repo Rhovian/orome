@@ -1,4 +1,4 @@
-# 27B Performance Gap Plan
+# 27B Gap Plan
 
 ## Why This Exists
 
@@ -20,6 +20,22 @@ Comparison basis:
 
 This means the problem is not "Orome is generally slower than llama.cpp."
 It is much more likely that `27B` is exposing one or two path-specific gaps.
+
+We now also have a separate greedy completion quality comparison:
+
+- `9B`: Orome `3/3` pass vs `llama.cpp` `3/3` pass
+- `27B`: Orome `0/3` pass vs `llama.cpp` `2/3` pass
+- `35B`: Orome `3/3` pass vs `llama.cpp` `3/3` pass
+
+Quality basis:
+
+- Orome: `3632102`
+- llama.cpp: `c46758d`
+- Method: same machine, same GGUF files, greedy raw completion, prompt suite
+  `capital`, `opposite`, `sky`
+
+This changes the priority. `27B` is not just underperforming; it is also
+qualitatively broken in Orome on a small, simple completion suite.
 
 ## What We Know
 
@@ -142,13 +158,39 @@ Relevant code:
 - llama.cpp:
   - `../llama.cpp/src/models/qwen3next.cpp`
 
+### 7. Orome's 27B replies are semantically right, then collapse into punctuation spam
+
+The new greedy-quality harness shows a consistent `27B` failure mode in Orome:
+
+- `The capital of France is` -> `Paris!!!!!!!`
+- `The opposite of hot is` -> `cold!!!!!!!`
+- `The sky is` -> `a deep blue,!!!!!!!!!!!!`
+
+That matters because it suggests:
+
+- tokenization and prompt construction are probably not the primary problem
+- the model is initially on the right track
+- something in the 27B generation path appears to destabilize after the first
+  token or two
+
+By contrast, `llama.cpp` was imperfect but much healthier:
+
+- `2/3` pass on the same suite
+- one failure was a raw `<think>` marker after a correct factual answer
+
+This points more toward a 27B-specific inference-path bug than a general
+quality-harness or prompt issue.
+
 ## Working Hypothesis
 
 Current likely ranking of causes:
 
-1. Primary gap: `Q5_K/Q6_K` Metal matvec performance on 27B-sized shapes
-2. Secondary gap: hybrid linear-attention / recurrent Gated Delta Net fusion
-3. Unlikely main issue: tokenizer, dense FFN logic, or generic output quality
+1. Primary correctness/perf gap: 27B `Q5_K/Q6_K` inference path is diverging
+   from expected behavior, likely on hot recurrent/attention projections
+2. Secondary perf gap: hybrid linear-attention / recurrent Gated Delta Net
+   fusion and scheduling
+3. Unlikely main issue: tokenizer, prompt scaffolding, dense FFN logic, or
+   generic output quality
 
 ## Plan
 
@@ -160,11 +202,35 @@ Use the existing comparison harness as the outer truth source:
 python3 tools/compare_orome_llama.py --models 9B 27B 35B --tokens 100 --trials 5 --json
 ```
 
+And use the quality harness as a hard correctness gate:
+
+```bash
+python3 tools/compare_orome_llama_quality.py --models 9B 27B 35B --json
+```
+
 Keep `9B` and `35B` in the loop as guardrails while working on `27B`.
 
 Do not resume blind 27B-only autoresearch until the major gap is explained.
 
-### Phase 2: Build targeted 27B microbenches
+### Phase 2: Find the first bad 27B generated token
+
+Before more tuning, we need to localize the correctness failure.
+
+Immediate task:
+
+- run a token-by-token Orome vs llama.cpp compare on one simple prompt such as
+  `The sky is`
+- capture the first `8` generated tokens from each engine
+- identify the first divergence point
+- determine whether the collapse starts immediately after token `1`, or only
+  after recurrent state has been updated a few times
+
+Goal:
+
+- separate "bad logits immediately" from "state update corruption after a
+  correct start"
+
+### Phase 3: Build targeted 27B microbenches
 
 We need shape-specific measurements for the expensive kernels rather than only
 whole-model tok/s.
@@ -181,7 +247,7 @@ Goal:
 - determine how much of the whole-model gap is explained by `Q5_K/Q6_K`
   matvec throughput alone
 
-### Phase 3: Make quant dispatch genuinely per-format
+### Phase 4: Make quant dispatch genuinely per-format
 
 Replace the current one-size-fits-all matvec dispatch policy with
 format-specific tuning.
@@ -197,18 +263,19 @@ Constraints:
 - no 27B-specific tensor-shape hacks in shared logic
 - tuning should be driven by format and shape class, not model name
 
-### Phase 4: Re-test whole-model 27B after quant work
+### Phase 5: Re-test whole-model 27B after quant work
 
 After each meaningful quant-kernel change:
 
 1. rebuild
 2. rerun the fixed-token comparison
-3. rerun the standard model smoke/canary path
+3. rerun the quality comparison
+4. rerun the standard model smoke/canary path
 
 If the bulk of the 27B gap closes here, resume normal autoresearch from the
 new baseline.
 
-### Phase 5: If needed, investigate the linear / recurrent path
+### Phase 6: If needed, investigate the linear / recurrent path
 
 If `Q5_K/Q6_K` tuning does not explain most of the gap, then profile the
 linear-attention stack directly.
@@ -233,12 +300,15 @@ Questions to answer:
 - Preserve generic shared logic. Do not hardcode a `27B` shape into the engine.
 - Do not regress `9B` dense or `35B` MoE while chasing `27B`.
 - Keep inference runs serialized. Never overlap heavy Orome and llama.cpp runs.
+- Treat 27B quality as a release blocker, not just a benchmark caveat.
 - Prefer small, explainable changes over broad speculative rewrites.
 
 ## Success Criteria
 
 This plan is successful if we can do both of these:
 
-1. explain where the majority of the `27B` gap to `llama.cpp` comes from
-2. recover meaningful `27B` tok/s without sacrificing the current `9B` and
+1. explain why `27B` is both slower than `llama.cpp` and qualitatively unstable
+   in Orome
+2. restore coherent `27B` output on the simple comparison suite
+3. recover meaningful `27B` tok/s without sacrificing the current `9B` and
    `35B` advantages
