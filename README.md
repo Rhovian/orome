@@ -23,20 +23,21 @@ latency or exact prompt-processing parity across engines.
 
 Method:
 - Mac Studio M2 Max, same GGUF files, same prompt (`Hello`)
-- 100 generated tokens, context size `256`, 3-trial median
+- 100 generated tokens, context size `256`, 5-trial median
 - Orome via `tools/benchmark.py --skip-quality-check`
 - llama.cpp via `llama-completion` with greedy settings and `--no-warmup`
+- Orome `ceb9d82`, llama.cpp `c46758d`
 
 | Model | Orome tok/s | llama.cpp tok/s | Winner |
 | --- | ---: | ---: | --- |
-| Qwen3.5-9B-Q8_0 | 35.62 | 30.58 | Orome |
-| Qwen3.5-27B-Q4_K_M | 9.68 | 14.08 | llama.cpp |
-| Qwen3.5-35B-A3B-Q4_K_S | 64.68 | 49.51 | Orome |
+| Qwen3.5-9B-Q8_0 | 35.32 | 31.22 | Orome |
+| Qwen3.5-27B-Q4_K_M | 9.61 | 14.38 | llama.cpp |
+| Qwen3.5-35B-A3B-Q4_K_S | 65.15 | 51.34 | Orome |
 
 Reproduce:
 
 ```bash
-python3 tools/compare_orome_llama.py --models 9B 27B 35B --tokens 100 --trials 3
+python3 tools/compare_orome_llama.py --models 9B 27B 35B --tokens 100 --trials 5 --json
 ```
 
 ## Quick Start
