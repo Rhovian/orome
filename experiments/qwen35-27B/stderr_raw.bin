@@ -1,0 +1,19 @@
+[gguf] version=3 tensors=851 metadata=49
+[gguf] arch=qwen35 layers=64 hidden=5120 ffn=dense experts=0 K=0 intermediate=17408 vocab=248320
+[gguf] data_offset=10993568 (10.5 MB into file)
+[main] GGUF layer detection: 16 full + 48 linear
+[main] GGUF config: qwen35, 64 layers (16 full + 48 linear), hidden=5120, ffn=dense, experts=0, K=0
+[format] GGUF wrapped as Metal buffer (15.6 GB)
+bpe_load_gguf: 248320 vocab, 247587 merges, 276 added tokens
+[main] GGUF: creating engine...
+[metal] KV cache capacity: 256 tokens
+[profile] avg/tok: attn=0.4ms ffn=0.1ms lmhead=268.6ms
+[profile] avg/tok: attn=0.5ms ffn=0.1ms lmhead=186.0ms
+[profile] avg/tok: attn=0.5ms ffn=0.1ms lmhead=158.6ms
+[profile] avg/tok: attn=0.5ms ffn=0.1ms lmhead=144.7ms
+[profile] avg/tok: attn=0.5ms ffn=0.1ms lmhead=136.5ms
+[profile] avg/tok: attn=0.5ms ffn=0.3ms lmhead=131.0ms
+[profile] avg/tok: attn=0.5ms ffn=0.3ms lmhead=127.1ms
+[profile] avg/tok: attn=0.5ms ffn=0.3ms lmhead=124.2ms
+[profile] avg/tok: attn=0.5ms ffn=0.3ms lmhead=121.9ms
+[profile] avg/tok: attn=0.4ms ffn=0.2ms lmhead=120.1ms

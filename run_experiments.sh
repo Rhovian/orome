@@ -21,7 +21,9 @@
 #   ./run_experiments.sh <model> --agent codex --sessions 5   # run 5 Codex sessions then stop
 #
 # Experiment targets are discovered from experiments/*/program.md.
-# Current repo target:
+# Current repo targets:
+#   qwen35-9B    — Qwen3.5-9B dense GGUF optimization
+#   qwen35-27B   — Qwen3.5-27B dense GGUF optimization
 #   qwen35-35B   — Qwen3.5-35B-A3B GGUF optimization
 #
 # To stop: Ctrl+C or kill this script. Current experiment will finish.
@@ -144,6 +146,188 @@ if ! make clean && make 2>/dev/null; then
 fi
 echo "[runner] Build OK."
 
+validate_cross_check_config() {
+    local cc="$1"
+    python3 - "$cc" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+with open(path) as f:
+    d = json.load(f)
+
+missing = [k for k in ("model", "min_tok_sec", "description") if not d.get(k)]
+if missing:
+    print(f"missing required keys: {', '.join(missing)}")
+    sys.exit(1)
+
+if d.get("quality_check", True) is False:
+    print("quality_check is disabled")
+    sys.exit(1)
+PY
+}
+
+validate_cross_check_suite() {
+    local suite_fail=0
+    local count=0
+    local d name cc reason
+
+    for d in experiments/*/; do
+        [[ -f "$d/program.md" ]] || continue
+        count=$((count + 1))
+        name="$(basename "$d")"
+        cc="$d/cross_check.json"
+
+        if [[ ! -f "$cc" ]]; then
+            echo "[runner] FATAL: $name is missing cross_check.json" | tee -a "$ERROR_LOG"
+            suite_fail=1
+            continue
+        fi
+
+        if ! reason="$(validate_cross_check_config "$cc" 2>&1)"; then
+            echo "[runner] FATAL: invalid cross_check.json for $name: $reason" | tee -a "$ERROR_LOG"
+            suite_fail=1
+        fi
+    done
+
+    if [[ "$count" -eq 0 ]]; then
+        echo "[runner] FATAL: no experiment targets found under experiments/" | tee -a "$ERROR_LOG"
+        exit 1
+    fi
+
+    if [[ "$suite_fail" -ne 0 ]]; then
+        exit 1
+    fi
+
+    echo "[runner] Cross-check suite validated for $count experiment targets."
+}
+
+validate_cross_check_suite
+
+sanitize_summary_field() {
+    printf '%s' "$1" | tr '\t\r\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+
+declare -a CHECK_SUMMARIES=()
+
+reset_check_summaries() {
+    CHECK_SUMMARIES=()
+}
+
+record_check_summary() {
+    local label status desc tok min_tok reply reasons
+    label="$(sanitize_summary_field "${1:-}")"
+    status="$(sanitize_summary_field "${2:-}")"
+    desc="$(sanitize_summary_field "${3:-}")"
+    tok="$(sanitize_summary_field "${4:-}")"
+    min_tok="$(sanitize_summary_field "${5:-}")"
+    reply="$(sanitize_summary_field "${6:-}")"
+    reasons="$(sanitize_summary_field "${7:-}")"
+    CHECK_SUMMARIES+=("${label}"$'\t'"${status}"$'\t'"${desc}"$'\t'"${tok}"$'\t'"${min_tok}"$'\t'"${reply}"$'\t'"${reasons}")
+}
+
+actualize_results_keep_commit() {
+    local results_file="$1"
+    local commit_sha="$2"
+    [[ -f "$results_file" ]] || return 0
+
+    python3 - "$results_file" "$commit_sha" <<'PY'
+import csv
+import io
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+commit_sha = sys.argv[2]
+short = commit_sha[:7]
+
+with path.open(newline="") as f:
+    rows = list(csv.DictReader(f, delimiter="\t"))
+
+target_idx = None
+for idx, row in enumerate(rows):
+    if row.get("status") == "keep" and row.get("commit", "").endswith("+dirty"):
+        target_idx = idx
+
+if target_idx is None:
+    raise SystemExit(0)
+
+rows[target_idx]["commit"] = short
+
+fieldnames = rows[0].keys() if rows else ["commit", "tok_sec", "ttft_ms", "proj_avg_ms", "status", "description"]
+buf = io.StringIO()
+writer = csv.DictWriter(buf, fieldnames=fieldnames, delimiter="\t", lineterminator="\n")
+writer.writeheader()
+writer.writerows(rows)
+path.write_text(buf.getvalue())
+PY
+}
+
+actualize_status_file() {
+    local status_file="$1"
+    local branch_name="$2"
+    local commit_sha="$3"
+    local session_note="${4:-}"
+    local worktree_state="clean"
+    local section
+
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        worktree_state="dirty"
+    fi
+
+    section="## Runner Validation
+
+- Session commit: \`${commit_sha:0:7}\`
+- Branch: \`${branch_name}\`
+- Working tree after runner checks: \`${worktree_state}\`"
+
+    if [[ -n "$session_note" ]]; then
+        section="$section
+- Runner note: ${session_note}"
+    fi
+
+    if [[ ${#CHECK_SUMMARIES[@]} -gt 0 ]]; then
+        local entry label status desc tok min_tok reply reasons
+        for entry in "${CHECK_SUMMARIES[@]}"; do
+            IFS=$'\t' read -r label status desc tok min_tok reply reasons <<<"$entry"
+            if [[ "$status" == "PASS" ]]; then
+                section="$section
+- ${label}: pass — ${desc}"
+                [[ -n "$tok" && -n "$min_tok" ]] && section="$section (${tok} tok/s, min ${min_tok})"
+                [[ -n "$reply" ]] && section="$section; reply: ${reply}"
+            elif [[ "$status" == "SKIP" ]]; then
+                section="$section
+- ${label}: skip — ${desc}"
+                [[ -n "$reasons" ]] && section="$section; ${reasons}"
+            else
+                section="$section
+- ${label}: fail — ${desc}"
+                [[ -n "$reasons" ]] && section="$section; reason: ${reasons}"
+                [[ -n "$reply" ]] && section="$section; reply: ${reply}"
+            fi
+        done
+    fi
+
+    STATUS_SECTION="$section" python3 - "$status_file" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+section = os.environ["STATUS_SECTION"].rstrip() + "\n"
+
+text = path.read_text() if path.exists() else ""
+marker = "## Runner Validation"
+if marker in text:
+    text = text.split(marker, 1)[0].rstrip() + "\n\n" + section
+else:
+    text = (text.rstrip() + "\n\n" + section) if text.strip() else section
+
+path.write_text(text)
+PY
+}
+
 # ---- Collect regression checks ----
 # The current experiment can define a self-check in cross_check.json.
 # Each OTHER experiment's cross_check.json defines a quick cross-model smoke check.
@@ -214,11 +398,13 @@ run_check_config() {
 
     if [[ -z "$cc_model" ]]; then
         echo "[$label] SKIP: $cc_desc (no model configured: $cc)"
+        record_check_summary "$label" "SKIP" "$cc_desc" "" "" "" "no model configured"
         return 0
     fi
 
     if [[ ! -e "$cc_model" ]]; then
         echo "[$label] SKIP: $cc_desc (model not found: $cc_model)"
+        record_check_summary "$label" "SKIP" "$cc_desc" "" "" "" "model not found: $cc_model"
         return 0
     fi
 
@@ -257,6 +443,7 @@ run_check_config() {
     if [[ ! -s "$tmp_json" ]]; then
         echo "[$label] FAIL: $cc_desc — benchmark produced no JSON (exit $rc)"
         echo "  stderr: $(tail -3 "$tmp_err" | tr '\n' ' ')"
+        record_check_summary "$label" "FAIL" "$cc_desc" "" "$cc_min_tok" "" "benchmark produced no JSON (exit $rc)"
         rm -f "$tmp_json" "$tmp_err"
         return 1
     fi
@@ -285,6 +472,7 @@ PY
         [[ -n "$quality_reasons" ]] && echo "  Reason: $quality_reasons"
         [[ -n "$quality_reply" ]] && echo "  Reply: $quality_reply"
         [[ -s "$tmp_err" ]] && echo "  stderr: $(tail -3 "$tmp_err" | tr '\n' ' ')"
+        record_check_summary "$label" "FAIL" "$cc_desc" "$tok_sec" "$cc_min_tok" "$quality_reply" "$quality_reasons"
         rm -f "$tmp_json" "$tmp_err"
         return 1
     fi
@@ -292,6 +480,7 @@ PY
     if [[ -z "$tok_sec" ]]; then
         echo "[$label] FAIL: $cc_desc — could not parse tok/s"
         [[ -s "$tmp_err" ]] && echo "  stderr: $(tail -3 "$tmp_err" | tr '\n' ' ')"
+        record_check_summary "$label" "FAIL" "$cc_desc" "" "$cc_min_tok" "$quality_reply" "could not parse tok/s"
         rm -f "$tmp_json" "$tmp_err"
         return 1
     fi
@@ -300,12 +489,14 @@ PY
     passed=$(python3 -c "print('yes' if $tok_sec >= $cc_min_tok else 'no')")
     if [[ "$passed" == "yes" ]]; then
         echo "[$label] PASS: $cc_desc — ${tok_sec} tok/s (min: ${cc_min_tok}); reply: ${quality_reply}"
+        record_check_summary "$label" "PASS" "$cc_desc" "$tok_sec" "$cc_min_tok" "$quality_reply" ""
         rm -f "$tmp_json" "$tmp_err"
         return 0
     fi
 
     echo "[$label] FAIL: $cc_desc — ${tok_sec} tok/s < ${cc_min_tok} min"
     [[ -n "$quality_reply" ]] && echo "  Reply: $quality_reply"
+    record_check_summary "$label" "FAIL" "$cc_desc" "$tok_sec" "$cc_min_tok" "$quality_reply" "${tok_sec} tok/s < ${cc_min_tok} min"
     rm -f "$tmp_json" "$tmp_err"
     return 1
 }
@@ -416,10 +607,17 @@ Use them for hypotheses and prior art, not as the live GGUF baseline."
 - Results: \`experiments/$MODEL/results.tsv\`
 - Historical results: \`experiments/$MODEL/results.historical.tsv\`
 - Status: \`experiments/$MODEL/status.md\`
-- Bench errors: \`experiments/$MODEL/bench_err.txt\`"
+- Bench errors: \`experiments/$MODEL/bench_err.txt\`
+
+## Runner Post-Processing
+
+- After a successful session, the runner normalizes the retained \`keep\` row in \`results.tsv\` to the final commit hash.
+- The runner also refreshes a \`## Runner Validation\` section in \`status.md\` with authoritative self-check and cross-check outcomes.
+- Do not guess whether runner-managed validation did or did not run; leave that section to the runner."
 
     # Snapshot the codebase state before the session (for recovery)
     GIT_HEAD_BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+    reset_check_summaries
 
     # Launch agent session and stream output to the log in real time.
     run_agent_session "$PROMPT" 2>&1 | tee "$SESSION_LOG"
@@ -490,7 +688,13 @@ Use them for hypotheses and prior art, not as the live GGUF baseline."
                 echo "[runner] REGRESSION detected. Reverting session commits..."
                 git reset --hard "$GIT_HEAD_BEFORE" 2>/dev/null || true
                 echo "[runner] Reverted to $GIT_HEAD_BEFORE"
+                actualize_status_file "$EXPERIMENT_DIR/status.md" "$(git branch --show-current)" "$GIT_HEAD_BEFORE" "Session changes were reverted after runner validation failed."
+            else
+                actualize_results_keep_commit "$EXPERIMENT_DIR/results.tsv" "$GIT_HEAD_AFTER"
+                actualize_status_file "$EXPERIMENT_DIR/status.md" "$(git branch --show-current)" "$GIT_HEAD_AFTER" ""
             fi
+        else
+            actualize_status_file "$EXPERIMENT_DIR/status.md" "$(git branch --show-current)" "$GIT_HEAD_AFTER" "Session made no new commit; runner validation did not need to run."
         fi
     fi
 

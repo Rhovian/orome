@@ -223,6 +223,7 @@ bool format_decode_row_f32(TensorRef *ref, uint32_t row_idx, float *out) {
 
 #define FORMAT_ROWS_PER_TG 16
 #define FORMAT_TWO_ROW_MULTIPLIER 2
+#define FORMAT_Q8_0_SINGLE_TILE_MAX_INPUT 8192
 
 static inline uint format_effective_rows_per_tg(QuantFormat fmt) {
     switch (fmt) {
@@ -248,6 +249,11 @@ void format_dispatch_matvec(
         return;
     }
     id<MTLComputePipelineState> pipe = ref->pipeline;
+    if (ref->format == QFMT_GGUF_Q8_0
+            && ref->in_dim <= FORMAT_Q8_0_SINGLE_TILE_MAX_INPUT
+            && ctx->matvec_q8_0_singletile) {
+        pipe = ctx->matvec_q8_0_singletile;
+    }
     if (!pipe) {
         // Try to resolve pipeline at dispatch time (in case it was NULL at cache build time)
         pipe = format_pipeline_for(ctx, ref->format);

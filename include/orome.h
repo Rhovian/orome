@@ -149,6 +149,7 @@ typedef struct {
     id<MTLComputePipelineState> matvec_q4k;
     id<MTLComputePipelineState> matvec_q5k;
     id<MTLComputePipelineState> matvec_q8_0;
+    id<MTLComputePipelineState> matvec_q8_0_singletile;
     id<MTLComputePipelineState> matvec_q6k;
     id<MTLComputePipelineState> batch_expert_mv_q4k_dyn;
     id<MTLComputePipelineState> batch_expert_gate_up_swiglu_q4k_dyn;

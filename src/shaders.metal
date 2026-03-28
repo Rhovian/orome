@@ -5,9 +5,9 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// Max input dimension for matvec shared buffer.
-// Must fit the largest current in_dim: 8192.
-// Using half precision to stay within 32KB threadgroup memory limit.
+// Shared x staging tile for quantized matvec kernels.
+// Large dense projections stream x in chunks so input dim no longer needs
+// to fit entirely in threadgroup memory.
 #define MATVEC_X_SHARED_SIZE 8192
 
 // ============================================================================
@@ -1312,8 +1312,6 @@ kernel void dequant_matvec_q4k(
     bool valid1 = row1 < out_dim;
 
     threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    for (uint i = lid; i < in_dim; i += tg_size) { x_shared[i] = half(x[i]); }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!valid0) return;
 
     uint num_superblocks = in_dim / 256;
@@ -1325,38 +1323,50 @@ kernel void dequant_matvec_q4k(
     float acc1 = 0.0f;
     uint g = simd_lane / 8;
     uint l_start = (simd_lane % 8) * 4;
-    for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
-        device const uint8_t* sb0 = row0_data + sb_idx * 144;
-        float sc_lo, sc_hi, mn_lo, mn_hi;
-        uint w_base = sb_idx * 256 + g * 64;
-        float d0    = float(as_type<half>(ushort(ushort(sb0[0]) | (ushort(sb0[1]) << 8))));
-        float dmin0 = float(as_type<half>(ushort(ushort(sb0[2]) | (ushort(sb0[3]) << 8))));
-        unpack_q4k_scale_min_pair(sb0 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
-        device const uint8_t* qs0 = sb0 + 16 + g * 32;
-        float sc0_lo = d0 * sc_lo, mn0_lo = dmin0 * mn_lo;
-        float sc0_hi = d0 * sc_hi, mn0_hi = dmin0 * mn_hi;
-        for (uint j = 0; j < 4; j++) {
-            uint l = l_start + j;
-            uint8_t byte = qs0[l];
-            acc0 += (sc0_lo * float(byte & 0xF) - mn0_lo) * float(x_shared[w_base + l]);
-            acc0 += (sc0_hi * float(byte >> 4) - mn0_hi) * float(x_shared[w_base + 32 + l]);
+    for (uint tile_base = 0; tile_base < in_dim; tile_base += MATVEC_X_SHARED_SIZE) {
+        uint tile_elems = min((uint)MATVEC_X_SHARED_SIZE, in_dim - tile_base);
+        for (uint i = lid; i < tile_elems; i += tg_size) {
+            x_shared[i] = half(x[tile_base + i]);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (valid1) {
-            device const uint8_t* sb1 = row1_data + sb_idx * 144;
-            float d1    = float(as_type<half>(ushort(ushort(sb1[0]) | (ushort(sb1[1]) << 8))));
-            float dmin1 = float(as_type<half>(ushort(ushort(sb1[2]) | (ushort(sb1[3]) << 8))));
-            unpack_q4k_scale_min_pair(sb1 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
-            device const uint8_t* qs1 = sb1 + 16 + g * 32;
-            float sc1_lo = d1 * sc_lo, mn1_lo = dmin1 * mn_lo;
-            float sc1_hi = d1 * sc_hi, mn1_hi = dmin1 * mn_hi;
+        uint tile_sb_base = tile_base / 256;
+        uint tile_num_superblocks = tile_elems / 256;
+        for (uint sb_rel = 0; sb_rel < tile_num_superblocks; sb_rel++) {
+            uint sb_idx = tile_sb_base + sb_rel;
+            device const uint8_t* sb0 = row0_data + sb_idx * 144;
+            float sc_lo, sc_hi, mn_lo, mn_hi;
+            uint w_base = sb_rel * 256 + g * 64;
+            float d0    = float(as_type<half>(ushort(ushort(sb0[0]) | (ushort(sb0[1]) << 8))));
+            float dmin0 = float(as_type<half>(ushort(ushort(sb0[2]) | (ushort(sb0[3]) << 8))));
+            unpack_q4k_scale_min_pair(sb0 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
+            device const uint8_t* qs0 = sb0 + 16 + g * 32;
+            float sc0_lo = d0 * sc_lo, mn0_lo = dmin0 * mn_lo;
+            float sc0_hi = d0 * sc_hi, mn0_hi = dmin0 * mn_hi;
             for (uint j = 0; j < 4; j++) {
                 uint l = l_start + j;
-                uint8_t byte = qs1[l];
-                acc1 += (sc1_lo * float(byte & 0xF) - mn1_lo) * float(x_shared[w_base + l]);
-                acc1 += (sc1_hi * float(byte >> 4) - mn1_hi) * float(x_shared[w_base + 32 + l]);
+                uint8_t byte = qs0[l];
+                acc0 += (sc0_lo * float(byte & 0xF) - mn0_lo) * float(x_shared[w_base + l]);
+                acc0 += (sc0_hi * float(byte >> 4) - mn0_hi) * float(x_shared[w_base + 32 + l]);
+            }
+
+            if (valid1) {
+                device const uint8_t* sb1 = row1_data + sb_idx * 144;
+                float d1    = float(as_type<half>(ushort(ushort(sb1[0]) | (ushort(sb1[1]) << 8))));
+                float dmin1 = float(as_type<half>(ushort(ushort(sb1[2]) | (ushort(sb1[3]) << 8))));
+                unpack_q4k_scale_min_pair(sb1 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
+                device const uint8_t* qs1 = sb1 + 16 + g * 32;
+                float sc1_lo = d1 * sc_lo, mn1_lo = dmin1 * mn_lo;
+                float sc1_hi = d1 * sc_hi, mn1_hi = dmin1 * mn_hi;
+                for (uint j = 0; j < 4; j++) {
+                    uint l = l_start + j;
+                    uint8_t byte = qs1[l];
+                    acc1 += (sc1_lo * float(byte & 0xF) - mn1_lo) * float(x_shared[w_base + l]);
+                    acc1 += (sc1_hi * float(byte >> 4) - mn1_hi) * float(x_shared[w_base + 32 + l]);
+                }
             }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     float sum0 = simd_sum(acc0);
@@ -1395,10 +1405,6 @@ kernel void dequant_matvec_q8_0(
     bool valid1 = row1 < out_dim;
 
     threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!valid0) return;
 
     // Q8_0: 32 weights per block, 34 bytes per block
@@ -1411,6 +1417,84 @@ kernel void dequant_matvec_q8_0(
     float acc0 = 0.0f;
     float acc1 = 0.0f;
 
+    for (uint tile_base = 0; tile_base < in_dim; tile_base += MATVEC_X_SHARED_SIZE) {
+        uint tile_elems = min((uint)MATVEC_X_SHARED_SIZE, in_dim - tile_base);
+        for (uint i = lid; i < tile_elems; i += tg_size) {
+            x_shared[i] = half(x[tile_base + i]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        uint tile_block_base = tile_base / 32;
+        uint tile_num_blocks = tile_elems / 32;
+        for (uint blk_rel = simd_lane; blk_rel < tile_num_blocks; blk_rel += 32) {
+            uint blk = tile_block_base + blk_rel;
+            uint x_base = blk_rel * 32;
+
+            device const uint8_t* block0 = row0_data + blk * 34;
+            float d0 = float(as_type<half>(ushort(ushort(block0[0]) | (ushort(block0[1]) << 8))));
+            device const int8_t* qs0 = (device const int8_t*)(block0 + 2);
+
+            float local0 = 0.0f;
+            for (uint j = 0; j < 32; j++) {
+                local0 += float(qs0[j]) * float(x_shared[x_base + j]);
+            }
+            acc0 += d0 * local0;
+
+            if (valid1) {
+                device const uint8_t* block1 = row1_data + blk * 34;
+                float d1 = float(as_type<half>(ushort(ushort(block1[0]) | (ushort(block1[1]) << 8))));
+                device const int8_t* qs1 = (device const int8_t*)(block1 + 2);
+
+                float local1 = 0.0f;
+                for (uint j = 0; j < 32; j++) {
+                    local1 += float(qs1[j]) * float(x_shared[x_base + j]);
+                }
+                acc1 += d1 * local1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float sum0 = simd_sum(acc0);
+    float sum1 = simd_sum(acc1);
+    if (simd_lane == 0) {
+        out[row0] = sum0;
+        if (valid1) out[row1] = sum1;
+    }
+}
+
+kernel void dequant_matvec_q8_0_singletile(
+    device const uint8_t*  data       [[buffer(0)]],
+    device const float*    x          [[buffer(1)]],
+    device float*          out        [[buffer(2)]],
+    constant uint&         out_dim    [[buffer(3)]],
+    constant uint&         in_dim     [[buffer(4)]],
+    uint tgid   [[threadgroup_position_in_grid]],
+    uint lid    [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row0 = tgid * (ROWS_PER_TG * 2) + simd_group * 2;
+    uint row1 = row0 + 1;
+    bool valid0 = row0 < out_dim;
+    bool valid1 = row1 < out_dim;
+
+    threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
+    if (!valid0) return;
+
+    uint num_blocks = in_dim / 32;
+    uint bytes_per_row = num_blocks * 34;
+    device const uint8_t* row0_data = data + row0 * bytes_per_row;
+    device const uint8_t* row1_data = valid1 ? data + row1 * bytes_per_row : row0_data;
+
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = half(x[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     for (uint blk = simd_lane; blk < num_blocks; blk += 32) {
         uint x_base = blk * 32;
 
@@ -1478,10 +1562,6 @@ kernel void dequant_matvec_q5k(
     bool valid1 = row1 < out_dim;
 
     threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!valid0) return;
 
     uint num_superblocks = in_dim / 256;
@@ -1495,44 +1575,56 @@ kernel void dequant_matvec_q5k(
     uint l_start = (simd_lane % 8) * 4;
     uint8_t hm_lo = 1u << (g * 2);
     uint8_t hm_hi = 1u << (g * 2 + 1);
-    for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
-        device const uint8_t* sb0 = row0_data + sb_idx * 176;
-        float d0    = float(as_type<half>(ushort(ushort(sb0[0]) | (ushort(sb0[1]) << 8))));
-        float dmin0 = float(as_type<half>(ushort(ushort(sb0[2]) | (ushort(sb0[3]) << 8))));
-        float sc_lo, sc_hi, mn_lo, mn_hi;
-        unpack_q4k_scale_min_pair(sb0 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
-        device const uint8_t* qh0 = sb0 + 16;
-        device const uint8_t* ql0 = sb0 + 48 + g * 32;
-        uint w_base = sb_idx * 256 + g * 64;
-        float q_sc0_lo = d0 * sc_lo, q_mn0_lo = dmin0 * mn_lo;
-        float q_sc0_hi = d0 * sc_hi, q_mn0_hi = dmin0 * mn_hi;
-        for (uint j = 0; j < 4; j++) {
-            uint l = l_start + j;
-            uint8_t byte_val = ql0[l];
-            uint8_t q5_lo = (byte_val & 0xF) | ((qh0[l] & hm_lo) ? 16 : 0);
-            uint8_t q5_hi = (byte_val >> 4) | ((qh0[l] & hm_hi) ? 16 : 0);
-            acc0 += (q_sc0_lo * float(q5_lo) - q_mn0_lo) * float(x_shared[w_base + l]);
-            acc0 += (q_sc0_hi * float(q5_hi) - q_mn0_hi) * float(x_shared[w_base + 32 + l]);
+    for (uint tile_base = 0; tile_base < in_dim; tile_base += MATVEC_X_SHARED_SIZE) {
+        uint tile_elems = min((uint)MATVEC_X_SHARED_SIZE, in_dim - tile_base);
+        for (uint i = lid; i < tile_elems; i += tg_size) {
+            x_shared[i] = half(x[tile_base + i]);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (valid1) {
-            device const uint8_t* sb1 = row1_data + sb_idx * 176;
-            float d1    = float(as_type<half>(ushort(ushort(sb1[0]) | (ushort(sb1[1]) << 8))));
-            float dmin1 = float(as_type<half>(ushort(ushort(sb1[2]) | (ushort(sb1[3]) << 8))));
-            unpack_q4k_scale_min_pair(sb1 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
-            device const uint8_t* qh1 = sb1 + 16;
-            device const uint8_t* ql1 = sb1 + 48 + g * 32;
-            float q_sc1_lo = d1 * sc_lo, q_mn1_lo = dmin1 * mn_lo;
-            float q_sc1_hi = d1 * sc_hi, q_mn1_hi = dmin1 * mn_hi;
+        uint tile_sb_base = tile_base / 256;
+        uint tile_num_superblocks = tile_elems / 256;
+        for (uint sb_rel = 0; sb_rel < tile_num_superblocks; sb_rel++) {
+            uint sb_idx = tile_sb_base + sb_rel;
+            device const uint8_t* sb0 = row0_data + sb_idx * 176;
+            float d0    = float(as_type<half>(ushort(ushort(sb0[0]) | (ushort(sb0[1]) << 8))));
+            float dmin0 = float(as_type<half>(ushort(ushort(sb0[2]) | (ushort(sb0[3]) << 8))));
+            float sc_lo, sc_hi, mn_lo, mn_hi;
+            unpack_q4k_scale_min_pair(sb0 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
+            device const uint8_t* qh0 = sb0 + 16;
+            device const uint8_t* ql0 = sb0 + 48 + g * 32;
+            uint w_base = sb_rel * 256 + g * 64;
+            float q_sc0_lo = d0 * sc_lo, q_mn0_lo = dmin0 * mn_lo;
+            float q_sc0_hi = d0 * sc_hi, q_mn0_hi = dmin0 * mn_hi;
             for (uint j = 0; j < 4; j++) {
                 uint l = l_start + j;
-                uint8_t byte_val = ql1[l];
-                uint8_t q5_lo = (byte_val & 0xF) | ((qh1[l] & hm_lo) ? 16 : 0);
-                uint8_t q5_hi = (byte_val >> 4) | ((qh1[l] & hm_hi) ? 16 : 0);
-                acc1 += (q_sc1_lo * float(q5_lo) - q_mn1_lo) * float(x_shared[w_base + l]);
-                acc1 += (q_sc1_hi * float(q5_hi) - q_mn1_hi) * float(x_shared[w_base + 32 + l]);
+                uint8_t byte_val = ql0[l];
+                uint8_t q5_lo = (byte_val & 0xF) | ((qh0[l] & hm_lo) ? 16 : 0);
+                uint8_t q5_hi = (byte_val >> 4) | ((qh0[l] & hm_hi) ? 16 : 0);
+                acc0 += (q_sc0_lo * float(q5_lo) - q_mn0_lo) * float(x_shared[w_base + l]);
+                acc0 += (q_sc0_hi * float(q5_hi) - q_mn0_hi) * float(x_shared[w_base + 32 + l]);
+            }
+
+            if (valid1) {
+                device const uint8_t* sb1 = row1_data + sb_idx * 176;
+                float d1    = float(as_type<half>(ushort(ushort(sb1[0]) | (ushort(sb1[1]) << 8))));
+                float dmin1 = float(as_type<half>(ushort(ushort(sb1[2]) | (ushort(sb1[3]) << 8))));
+                unpack_q4k_scale_min_pair(sb1 + 4, g, &sc_lo, &sc_hi, &mn_lo, &mn_hi);
+                device const uint8_t* qh1 = sb1 + 16;
+                device const uint8_t* ql1 = sb1 + 48 + g * 32;
+                float q_sc1_lo = d1 * sc_lo, q_mn1_lo = dmin1 * mn_lo;
+                float q_sc1_hi = d1 * sc_hi, q_mn1_hi = dmin1 * mn_hi;
+                for (uint j = 0; j < 4; j++) {
+                    uint l = l_start + j;
+                    uint8_t byte_val = ql1[l];
+                    uint8_t q5_lo = (byte_val & 0xF) | ((qh1[l] & hm_lo) ? 16 : 0);
+                    uint8_t q5_hi = (byte_val >> 4) | ((qh1[l] & hm_hi) ? 16 : 0);
+                    acc1 += (q_sc1_lo * float(q5_lo) - q_mn1_lo) * float(x_shared[w_base + l]);
+                    acc1 += (q_sc1_hi * float(q5_hi) - q_mn1_hi) * float(x_shared[w_base + 32 + l]);
+                }
             }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     float sum0 = simd_sum(acc0);
@@ -1574,10 +1666,6 @@ kernel void dequant_matvec_q6k(
     bool valid1 = row1 < out_dim;
 
     threadgroup half x_shared[MATVEC_X_SHARED_SIZE];
-    for (uint i = lid; i < in_dim; i += tg_size) {
-        x_shared[i] = half(x[i]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!valid0) return;
 
     uint num_superblocks = in_dim / 256;
@@ -1590,56 +1678,68 @@ kernel void dequant_matvec_q6k(
     // Distribute l values across SIMD lanes — each lane handles one l (0..31)
     // per block, giving 4 weights per block × 2 blocks = 8 weights per superblock
     uint l = simd_lane;
-    for (uint sb_idx = 0; sb_idx < num_superblocks; sb_idx++) {
-        uint x_base = sb_idx * 256;
-        uint is = l / 16;
-
-        device const uint8_t* sb0 = row0_data + sb_idx * 210;
-        device const uint8_t* ql0_base = sb0;
-        device const uint8_t* qh0_base = sb0 + 128;
-        device const int8_t* sc0_base = (device const int8_t*)(sb0 + 192);
-        float d0 = float(as_type<half>(ushort(ushort(sb0[208]) | (ushort(sb0[209]) << 8))));
-        for (uint blk = 0; blk < 2; blk++) {
-            device const uint8_t* ql0 = ql0_base + blk * 64;
-            device const uint8_t* qh0 = qh0_base + blk * 32;
-            device const int8_t* sc0 = sc0_base + blk * 8;
-            uint y_off = x_base + blk * 128;
-
-            int q1 = (int)((ql0[l]      & 0xF) | (((qh0[l] >> 0) & 3) << 4)) - 32;
-            int q2 = (int)((ql0[l + 32] & 0xF) | (((qh0[l] >> 2) & 3) << 4)) - 32;
-            int q3 = (int)((ql0[l]      >> 4)  | (((qh0[l] >> 4) & 3) << 4)) - 32;
-            int q4 = (int)((ql0[l + 32] >> 4)  | (((qh0[l] >> 6) & 3) << 4)) - 32;
-
-            acc0 += d0 * (float)sc0[is + 0] * (float)q1 * float(x_shared[y_off + l]);
-            acc0 += d0 * (float)sc0[is + 2] * (float)q2 * float(x_shared[y_off + l + 32]);
-            acc0 += d0 * (float)sc0[is + 4] * (float)q3 * float(x_shared[y_off + l + 64]);
-            acc0 += d0 * (float)sc0[is + 6] * (float)q4 * float(x_shared[y_off + l + 96]);
+    for (uint tile_base = 0; tile_base < in_dim; tile_base += MATVEC_X_SHARED_SIZE) {
+        uint tile_elems = min((uint)MATVEC_X_SHARED_SIZE, in_dim - tile_base);
+        for (uint i = lid; i < tile_elems; i += tg_size) {
+            x_shared[i] = half(x[tile_base + i]);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (valid1) {
-            device const uint8_t* sb1 = row1_data + sb_idx * 210;
-            device const uint8_t* ql1_base = sb1;
-            device const uint8_t* qh1_base = sb1 + 128;
-            device const int8_t* sc1_base = (device const int8_t*)(sb1 + 192);
-            float d1 = float(as_type<half>(ushort(ushort(sb1[208]) | (ushort(sb1[209]) << 8))));
+        uint tile_sb_base = tile_base / 256;
+        uint tile_num_superblocks = tile_elems / 256;
+        for (uint sb_rel = 0; sb_rel < tile_num_superblocks; sb_rel++) {
+            uint sb_idx = tile_sb_base + sb_rel;
+            uint x_base = sb_rel * 256;
+            uint is = l / 16;
 
+            device const uint8_t* sb0 = row0_data + sb_idx * 210;
+            device const uint8_t* ql0_base = sb0;
+            device const uint8_t* qh0_base = sb0 + 128;
+            device const int8_t* sc0_base = (device const int8_t*)(sb0 + 192);
+            float d0 = float(as_type<half>(ushort(ushort(sb0[208]) | (ushort(sb0[209]) << 8))));
             for (uint blk = 0; blk < 2; blk++) {
-                device const uint8_t* ql1 = ql1_base + blk * 64;
-                device const uint8_t* qh1 = qh1_base + blk * 32;
-                device const int8_t* sc1 = sc1_base + blk * 8;
+                device const uint8_t* ql0 = ql0_base + blk * 64;
+                device const uint8_t* qh0 = qh0_base + blk * 32;
+                device const int8_t* sc0 = sc0_base + blk * 8;
                 uint y_off = x_base + blk * 128;
 
-                int q1 = (int)((ql1[l]      & 0xF) | (((qh1[l] >> 0) & 3) << 4)) - 32;
-                int q2 = (int)((ql1[l + 32] & 0xF) | (((qh1[l] >> 2) & 3) << 4)) - 32;
-                int q3 = (int)((ql1[l]      >> 4)  | (((qh1[l] >> 4) & 3) << 4)) - 32;
-                int q4 = (int)((ql1[l + 32] >> 4)  | (((qh1[l] >> 6) & 3) << 4)) - 32;
+                int q1 = (int)((ql0[l]      & 0xF) | (((qh0[l] >> 0) & 3) << 4)) - 32;
+                int q2 = (int)((ql0[l + 32] & 0xF) | (((qh0[l] >> 2) & 3) << 4)) - 32;
+                int q3 = (int)((ql0[l]      >> 4)  | (((qh0[l] >> 4) & 3) << 4)) - 32;
+                int q4 = (int)((ql0[l + 32] >> 4)  | (((qh0[l] >> 6) & 3) << 4)) - 32;
 
-                acc1 += d1 * (float)sc1[is + 0] * (float)q1 * float(x_shared[y_off + l]);
-                acc1 += d1 * (float)sc1[is + 2] * (float)q2 * float(x_shared[y_off + l + 32]);
-                acc1 += d1 * (float)sc1[is + 4] * (float)q3 * float(x_shared[y_off + l + 64]);
-                acc1 += d1 * (float)sc1[is + 6] * (float)q4 * float(x_shared[y_off + l + 96]);
+                acc0 += d0 * (float)sc0[is + 0] * (float)q1 * float(x_shared[y_off + l]);
+                acc0 += d0 * (float)sc0[is + 2] * (float)q2 * float(x_shared[y_off + l + 32]);
+                acc0 += d0 * (float)sc0[is + 4] * (float)q3 * float(x_shared[y_off + l + 64]);
+                acc0 += d0 * (float)sc0[is + 6] * (float)q4 * float(x_shared[y_off + l + 96]);
+            }
+
+            if (valid1) {
+                device const uint8_t* sb1 = row1_data + sb_idx * 210;
+                device const uint8_t* ql1_base = sb1;
+                device const uint8_t* qh1_base = sb1 + 128;
+                device const int8_t* sc1_base = (device const int8_t*)(sb1 + 192);
+                float d1 = float(as_type<half>(ushort(ushort(sb1[208]) | (ushort(sb1[209]) << 8))));
+
+                for (uint blk = 0; blk < 2; blk++) {
+                    device const uint8_t* ql1 = ql1_base + blk * 64;
+                    device const uint8_t* qh1 = qh1_base + blk * 32;
+                    device const int8_t* sc1 = sc1_base + blk * 8;
+                    uint y_off = x_base + blk * 128;
+
+                    int q1 = (int)((ql1[l]      & 0xF) | (((qh1[l] >> 0) & 3) << 4)) - 32;
+                    int q2 = (int)((ql1[l + 32] & 0xF) | (((qh1[l] >> 2) & 3) << 4)) - 32;
+                    int q3 = (int)((ql1[l]      >> 4)  | (((qh1[l] >> 4) & 3) << 4)) - 32;
+                    int q4 = (int)((ql1[l + 32] >> 4)  | (((qh1[l] >> 6) & 3) << 4)) - 32;
+
+                    acc1 += d1 * (float)sc1[is + 0] * (float)q1 * float(x_shared[y_off + l]);
+                    acc1 += d1 * (float)sc1[is + 2] * (float)q2 * float(x_shared[y_off + l + 32]);
+                    acc1 += d1 * (float)sc1[is + 4] * (float)q3 * float(x_shared[y_off + l + 64]);
+                    acc1 += d1 * (float)sc1[is + 6] * (float)q4 * float(x_shared[y_off + l + 96]);
+                }
             }
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     float sum0 = simd_sum(acc0);

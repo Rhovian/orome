@@ -1,0 +1,12 @@
+[metal] Device: Apple M2 Max
+[metal] Loaded precompiled metallib: 0 ms
+[metal] Buffers allocated for qwen35 (64 layers, 5120 hidden)
+[tokenizer] Loaded from GGUF metadata: /Users/j/Code/lllm/models/Qwen3.5-27B-Q4_K_M.gguf
+[main] Engine ready: qwen35, 64 layers, dense FFN
+[main] Prompt: "Hello" (1 tokens)
+TTFT: 1744.8 ms
+, I have a question about the following:
+I have a 1000000000000000000000000000000000000000000000�00000�0�0�0�0�0�0�0�0�</think>
+
+It looks like you were about to ask a question, but the message ended
+Generation: 10.449 s (9.57 tok/s)
