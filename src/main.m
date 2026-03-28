@@ -16,6 +16,59 @@
 
 #include "orome.h"
 
+// UTF-8 output buffer: accumulates decoded token bytes and flushes only
+// complete UTF-8 sequences. This prevents partial multi-byte characters
+// (split across BPE tokens) from producing invalid UTF-8 on stdout.
+typedef struct {
+    char buf[16];   // pending incomplete bytes (max UTF-8 char is 4 bytes)
+    int  len;       // number of pending bytes
+} Utf8Buf;
+
+// Return the expected byte length of a UTF-8 sequence starting with byte c,
+// or 0 if c is a continuation byte (0x80..0xBF) or invalid.
+static int utf8_char_len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 0;  // continuation or invalid
+}
+
+static void utf8_buf_write(Utf8Buf *u, const char *data, int data_len) {
+    // Append new data to pending buffer
+    for (int i = 0; i < data_len && u->len < (int)sizeof(u->buf); i++)
+        u->buf[u->len++] = data[i];
+    // Flush as many complete UTF-8 characters as possible
+    int start = 0;
+    int pos = 0;
+    while (pos < u->len) {
+        int clen = utf8_char_len((unsigned char)u->buf[pos]);
+        if (clen == 0) {
+            // Stray continuation byte — flush valid bytes before it, then emit FFFD
+            if (pos > start) fwrite(u->buf + start, 1, pos - start, stdout);
+            fwrite("\xEF\xBF\xBD", 1, 3, stdout);
+            pos++;
+            start = pos;
+            continue;
+        }
+        if (pos + clen > u->len) break;  // incomplete — wait for more
+        pos += clen;
+    }
+    // Flush complete characters from [start..pos)
+    if (pos > start) fwrite(u->buf + start, 1, pos - start, stdout);
+    // Keep incomplete trailing bytes
+    int remaining = u->len - pos;
+    if (remaining > 0 && pos > 0) memmove(u->buf, u->buf + pos, remaining);
+    u->len = remaining;
+}
+
+static void utf8_buf_flush(Utf8Buf *u) {
+    // Flush any remaining incomplete bytes as replacement characters
+    for (int i = 0; i < u->len; i++)
+        fwrite("\xEF\xBF\xBD", 1, 3, stdout);
+    u->len = 0;
+}
+
 static void add_unique_token(int *tokens, int max_tokens, int *count, int token_id) {
     if (!tokens || !count || token_id < 0 || *count >= max_tokens) return;
     for (int i = 0; i < *count; i++) {
@@ -688,11 +741,12 @@ int main(int argc, char **argv) {
             // Generate
             double gen_start = now_ms();
             int generated = 0;
+            Utf8Buf ubuf = { .len = 0 };
             for (int i = 0; i < max_tokens; i++) {
                 if (is_eos_token(&cfg, next_token)) break;
 
                 const char *text = tokenizer_decode(next_token);
-                printf("%s", text);
+                utf8_buf_write(&ubuf, text, (int)strlen(text));
                 fflush(stdout);
 
                 double tok_start = timing ? now_ms() : 0;
@@ -703,6 +757,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "[tok %d] %.1f ms\n", generated, now_ms() - tok_start);
                 }
             }
+            utf8_buf_flush(&ubuf);
             printf("\n");
 
             double gen_ms = now_ms() - gen_start;
