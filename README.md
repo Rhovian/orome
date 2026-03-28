@@ -37,6 +37,32 @@ Reproduce:
 python3 tools/compare_orome_llama.py --models 9B 27B 35B --tokens 100 --trials 5 --json
 ```
 
+## Greedy Completion Quality vs llama.cpp
+
+The repo also includes a completion-quality comparison harness in
+`tools/compare_orome_llama_quality.py`. This is a narrower check than the
+throughput table above: it compares greedy raw-completion outputs on a small
+prompt suite and applies the same anti-garble checks used by the benchmark
+harness, plus simple expected-content checks per prompt.
+
+Method:
+- Mac Studio M2 Max, same GGUF files
+- greedy completion, one engine at a time
+- prompts: `capital`, `opposite`, `sky`
+- Orome `3632102`, llama.cpp `c46758d`
+
+| Model | Orome | llama.cpp | Notes |
+| --- | --- | --- | --- |
+| Qwen3.5-9B-Q8_0 | 3/3 pass | 3/3 pass | both coherent on the default suite |
+| Qwen3.5-27B-Q4_K_M | 0/3 pass | 2/3 pass | Orome answers correctly, then collapses into punctuation spam; llama.cpp had one raw `<think>` artifact |
+| Qwen3.5-35B-A3B-Q4_K_S | 3/3 pass | 3/3 pass | both coherent on the default suite |
+
+Reproduce:
+
+```bash
+python3 tools/compare_orome_llama_quality.py --models 9B 27B 35B --json
+```
+
 ## Quick Start
 
 ```bash
