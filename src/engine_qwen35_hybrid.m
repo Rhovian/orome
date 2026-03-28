@@ -22,7 +22,7 @@ typedef enum {
     HYBRID_Q4_ALL        = 0x3Fu,
 } HybridQ4Mask;
 
-#define HYBRID_Q4_DEFAULT_MASK HYBRID_Q4_NONE
+#define HYBRID_Q4_DEFAULT_MASK (HYBRID_Q4_OTHER | HYBRID_Q4_FULL_O | HYBRID_Q4_LINEAR_O)
 
 static uint32_t hybrid_q4_mask(void) {
     static bool initialized = false;
@@ -32,8 +32,8 @@ static uint32_t hybrid_q4_mask(void) {
 
     const char *env = getenv("OROME_HYBRID_Q4");
     if (!env || !*env) return mask;
-    if (strcmp(env, "all") == 0) return HYBRID_Q4_ALL;
-    if (strcmp(env, "none") == 0) return HYBRID_Q4_NONE;
+    if (strcmp(env, "all") == 0) { mask = HYBRID_Q4_ALL; return mask; }
+    if (strcmp(env, "none") == 0) { mask = HYBRID_Q4_NONE; return mask; }
 
     mask = HYBRID_Q4_NONE;
     char buf[256];
