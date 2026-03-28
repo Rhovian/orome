@@ -418,7 +418,8 @@ int engine_step(Engine *eng, int token_id) {
             int value_dim = cfg->linear_value_dim;
 
             bool skip_copy_norm =
-                (cfg->ffn_type == FFN_MOE && layer > 0 && ctx->moe_combine_copy_sq);
+                (layer > 0 && ctx->norm_apply_partial
+                 && (cfg->ffn_type == FFN_MOE ? ctx->moe_combine_copy_sq != nil : true));
             id<MTLComputeCommandEncoder> enc = fwd_enc;
             if (!skip_copy_norm) {
                 [enc setComputePipelineState:ctx->copy_buffer];
@@ -432,7 +433,7 @@ int engine_step(Engine *eng, int token_id) {
 
             // --- Phase A: Input norm → buf_input ---
             if (skip_copy_norm) {
-                // Use partial sums from previous layer's moe_combine_copy_sq
+                // Use partial sums from previous layer's residual_add_sq
                 uint num_tgs = ((uint)H + 255) / 256;
                 [enc setComputePipelineState:ctx->norm_apply_partial];
                 [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
@@ -555,9 +556,11 @@ int engine_step(Engine *eng, int token_id) {
                 ctx->buf_linear_q, 0, ctx->buf_h_mid, 0);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             // --- Phase I+J: Fused residual add + sum_sq → buf_moe_hidden ---
+            // When skip_copy_norm, buf_moe_hidden IS the residual (in-place add safe)
             { uint num_tgs = ((uint)H + 255) / 256;
+            id<MTLBuffer> residual_buf = skip_copy_norm ? ctx->buf_moe_hidden : ctx->buf_residual;
             [enc setComputePipelineState:ctx->residual_add_sq];
-            [enc setBuffer:ctx->buf_residual offset:0 atIndex:0];
+            [enc setBuffer:residual_buf offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_h_mid offset:0 atIndex:1];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:2];
             [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:3];
@@ -648,7 +651,8 @@ int engine_step(Engine *eng, int token_id) {
             int seq_len = pos + 1;
 
             bool skip_copy_norm =
-                (cfg->ffn_type == FFN_MOE && layer > 0 && ctx->moe_combine_copy_sq);
+                (layer > 0 && ctx->norm_apply_partial
+                 && (cfg->ffn_type == FFN_MOE ? ctx->moe_combine_copy_sq != nil : true));
             id<MTLComputeCommandEncoder> enc = fwd_enc;
             if (!skip_copy_norm) {
                 [enc setComputePipelineState:ctx->copy_buffer];
@@ -662,7 +666,7 @@ int engine_step(Engine *eng, int token_id) {
 
             // --- Phase A: Input norm → buf_input ---
             if (skip_copy_norm) {
-                // Use partial sums from previous layer's moe_combine_copy_sq
+                // Use partial sums from previous layer's residual_add_sq
                 uint num_tgs = ((uint)H + 255) / 256;
                 [enc setComputePipelineState:ctx->norm_apply_partial];
                 [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];
@@ -824,9 +828,11 @@ int engine_step(Engine *eng, int token_id) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase J+K: Fused residual add + sum_sq → buf_moe_hidden ---
+            // When skip_copy_norm, buf_moe_hidden IS the residual (in-place add safe)
             { uint num_tgs = ((uint)H + 255) / 256;
+            id<MTLBuffer> residual_buf = skip_copy_norm ? ctx->buf_moe_hidden : ctx->buf_residual;
             [enc setComputePipelineState:ctx->residual_add_sq];
-            [enc setBuffer:ctx->buf_residual offset:0 atIndex:0];
+            [enc setBuffer:residual_buf offset:0 atIndex:0];
             [enc setBuffer:ctx->buf_h_mid offset:0 atIndex:1];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:2];
             [enc setBuffer:ctx->buf_sum_sq offset:0 atIndex:3];
@@ -911,7 +917,9 @@ int engine_step(Engine *eng, int token_id) {
         id<MTLComputeCommandEncoder> enc = fwd_enc;
 
         // RMS norm: buf_moe_hidden → buf_input
-        if (ctx->moe_combine_copy_sq) {
+        // Last layer's residual_add_sq (dense) or moe_combine_copy_sq (MoE)
+        // already computed partial sum_sq — use the faster partial norm path.
+        if (ctx->norm_apply_partial && cfg->num_layers > 0) {
             uint num_tgs = ((uint)H + 255) / 256;
             [enc setComputePipelineState:ctx->norm_apply_partial];
             [enc setBuffer:ctx->buf_moe_hidden offset:0 atIndex:0];

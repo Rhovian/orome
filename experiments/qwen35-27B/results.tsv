@@ -1,2 +1,6 @@
 commit	tok_sec	ttft_ms	proj_avg_ms	status	description
 0c6c89b	9.55	1786.0	0.0	baseline	HEAD baseline (pre-optimization)
+f4f5815	9.72	1772.3	0.0	keep	fuse dense gate+up+SwiGLU into single dispatch
+f4f5815	9.70	1749.0	0.0	baseline	session baseline re-measurement
+f4f5815	8.35	1790.0	0.0	discard	2-row fused gate+up+swiglu Q4K (register pressure regression)
+f4f5815	9.73	1762.0	0.0	keep	skip copy+norm for dense layers (reuse residual_add_sq partial sums)
