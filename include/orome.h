@@ -110,8 +110,12 @@ void model_config_init_derived(ModelConfig *cfg);
 static inline bool model_uses_qwen35_dense_hybrid(const ModelConfig *cfg) {
     if (!cfg) return false;
     return cfg->ffn_type == FFN_DENSE &&
-           cfg->num_linear_layers > 0 &&
-           cfg->num_full_attn_layers > 0;
+           cfg->num_layers == 64 &&
+           cfg->hidden_dim == 5120 &&
+           cfg->num_full_attn_layers == 16 &&
+           cfg->num_linear_layers == 48 &&
+           cfg->linear_num_k_heads == 16 &&
+           cfg->linear_num_v_heads == 48;
 }
 
 // ============================================================================
