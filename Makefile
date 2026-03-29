@@ -5,18 +5,18 @@ LDFLAGS =
 
 # Multi-file build
 OROME_TARGET = orome
-OROME_SRCS = inference/src/main.m inference/src/engine.m inference/src/metal.m \
-             inference/src/kernels.m inference/src/tokenizer.m inference/src/server.m \
-             inference/src/gguf.m inference/src/format.m \
-             inference/src/engine_qwen35_hybrid.m
+OROME_SRCS = inference/cli/main.m inference/core/engine.m inference/core/metal.m \
+             inference/core/kernels.m inference/core/tokenizer.m inference/server/server.m \
+             inference/core/gguf.m inference/core/format.m \
+             inference/core/engine_qwen35_hybrid.m
 OROME_OBJS = $(OROME_SRCS:.m=.o)
 
 # Metal shaders
 METALC = xcrun -sdk macosx metal
 METALLIB_TOOL = xcrun -sdk macosx metallib
-SHADER_SRC = inference/src/shaders.metal
-SHADER_AIR = inference/src/shaders.air
-SHADER_LIB = inference/src/shaders.metallib
+SHADER_SRC = inference/shaders/shaders.metal
+SHADER_AIR = inference/shaders/shaders.air
+SHADER_LIB = inference/shaders/shaders.metallib
 
 .PHONY: all clean bench
 
