@@ -128,6 +128,10 @@ echo "============================================"
 echo "" | tee -a "$ERROR_LOG"
 echo "=== Runner started $(date '+%Y-%m-%d %H:%M:%S') model=$MODEL ===" >> "$ERROR_LOG"
 
+tracked_worktree_dirty() {
+    ! git diff --quiet || ! git diff --cached --quiet
+}
+
 # Ensure we're on the right branch
 if git rev-parse --git-dir > /dev/null 2>&1; then
     BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
@@ -136,6 +140,11 @@ if git rev-parse --git-dir > /dev/null 2>&1; then
         git checkout -b "$BRANCH_NAME" 2>/dev/null || git checkout "$BRANCH_NAME"
     fi
     echo "[runner] On branch: $(git branch --show-current)"
+fi
+
+if tracked_worktree_dirty; then
+    echo "[runner] FATAL: tracked worktree is dirty before starting. Commit, stash, or revert tracked changes first." | tee -a "$ERROR_LOG"
+    exit 1
 fi
 
 # Safety check: verify the codebase builds before starting
@@ -315,6 +324,27 @@ validate_cross_check_suite() {
 }
 
 validate_cross_check_suite
+
+session_log_failure_reason() {
+    local log_file="$1"
+
+    if rg -q '"subtype":"error_max_turns"' "$log_file"; then
+        echo "agent hit max turns"
+        return 0
+    fi
+
+    if rg -q '"is_error":true' "$log_file"; then
+        echo "agent reported an error"
+        return 0
+    fi
+
+    if rg -q '"type":"error"' "$log_file"; then
+        echo "agent emitted an error event"
+        return 0
+    fi
+
+    return 1
+}
 
 sanitize_summary_field() {
     printf '%s' "$1" | tr '\t\r\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
@@ -940,8 +970,19 @@ $LLAMA_PROMPT_SECTION"
 
     EXIT_CODE=${PIPESTATUS[0]}
     GIT_HEAD_AFTER=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+    SESSION_FAILURE_REASON=""
+    if [[ "$EXIT_CODE" -eq 0 ]]; then
+        if SESSION_FAILURE_REASON="$(session_log_failure_reason "$SESSION_LOG")"; then
+            EXIT_CODE=86
+        else
+            SESSION_FAILURE_REASON=""
+        fi
+    fi
     echo ""
     echo "[runner] Session $SESSION_NUM finished (exit code: $EXIT_CODE) at $(date '+%H:%M:%S')"
+    if [[ -n "$SESSION_FAILURE_REASON" ]]; then
+        echo "[runner] Session log indicates failure: $SESSION_FAILURE_REASON"
+    fi
 
     # Log errors and track consecutive failures
     if [[ "$EXIT_CODE" -ne 0 ]]; then
@@ -954,17 +995,17 @@ $LLAMA_PROMPT_SECTION"
             echo "  Log: $SESSION_LOG"
             echo "  Git before: $GIT_HEAD_BEFORE"
             echo "  Git after:  $GIT_HEAD_AFTER"
+            [[ -n "$SESSION_FAILURE_REASON" ]] && echo "  Failure reason: $SESSION_FAILURE_REASON"
             echo "  Tail of session log:"
             tail -20 "$SESSION_LOG" 2>/dev/null | sed 's/^/    /'
             echo "---"
         } >> "$ERROR_LOG"
         echo "[runner] ERROR logged to $ERROR_LOG (consecutive: $CONSECUTIVE_FAILURES/$MAX_CONSECUTIVE_FAILURES)"
 
-        # Safety: verify the build still works after a failed session
-        if ! make 2>/dev/null; then
-            echo "[runner] WARNING: Build broken after failed session. Reverting to $GIT_HEAD_BEFORE" | tee -a "$ERROR_LOG"
-            git checkout -- src/ include/ Makefile shaders.metal 2>/dev/null || true
-            echo "  Reverted source files to clean state" >> "$ERROR_LOG"
+        if [[ "$GIT_HEAD_BEFORE" != "$GIT_HEAD_AFTER" ]] || tracked_worktree_dirty; then
+            echo "[runner] Reverting failed session to $GIT_HEAD_BEFORE" | tee -a "$ERROR_LOG"
+            git reset --hard "$GIT_HEAD_BEFORE" 2>/dev/null || true
+            actualize_status_file "$EXPERIMENT_DIR/status.md" "$(git branch --show-current)" "$GIT_HEAD_BEFORE" "Session failed and runner reverted session changes."
         fi
 
         # Circuit breaker
@@ -1016,7 +1057,13 @@ $LLAMA_PROMPT_SECTION"
                 actualize_status_file "$EXPERIMENT_DIR/status.md" "$(git branch --show-current)" "$GIT_HEAD_AFTER" ""
             fi
         else
-            actualize_status_file "$EXPERIMENT_DIR/status.md" "$(git branch --show-current)" "$GIT_HEAD_AFTER" "Session made no new commit; runner validation did not need to run."
+            if tracked_worktree_dirty; then
+                echo "[runner] Session made no new commit but left tracked changes. Reverting to $GIT_HEAD_BEFORE."
+                git reset --hard "$GIT_HEAD_BEFORE" 2>/dev/null || true
+                actualize_status_file "$EXPERIMENT_DIR/status.md" "$(git branch --show-current)" "$GIT_HEAD_BEFORE" "Session made no new commit; runner reverted leftover tracked changes."
+            else
+                actualize_status_file "$EXPERIMENT_DIR/status.md" "$(git branch --show-current)" "$GIT_HEAD_AFTER" "Session made no new commit; runner validation did not need to run."
+            fi
         fi
     fi
 
