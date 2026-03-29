@@ -11,11 +11,11 @@ Method:
 - llama.cpp via `llama-completion` with greedy settings and `--no-warmup`
 - Orome `bf77939`, llama.cpp `c46758d`
 
-| Model | Orome tok/s | llama.cpp tok/s | Winner |
-| --- | ---: | ---: | --- |
-| Qwen3.5-9B-Q8_0 | 35.32 | 31.22 | Orome |
-| Qwen3.5-27B-Q4_K_M | 17.59 | 14.77 | Orome |
-| Qwen3.5-35B-A3B-Q4_K_S | 65.15 | 51.34 | Orome |
+| Model | Orome tok/s | llama.cpp tok/s |
+| --- | ---: | ---: |
+| Qwen3.5-9B-Q8_0 | 35.32 | 31.22 |
+| Qwen3.5-27B-Q4_K_M | 17.59 | 14.77 |
+| Qwen3.5-35B-A3B-Q4_K_S | 65.15 | 51.34 |
 
 Reproduce:
 

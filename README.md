@@ -42,53 +42,18 @@ The current engine is GGUF-only. The model fits in unified memory, so the hot pa
 ## Architecture
 
 ```text
-include/orome.h        — Shared types, ModelConfig, TensorRef, Engine interfaces
-src/
-  main.m               — CLI parsing, GGUF loading, engine startup
-  engine.m             — Forward-pass orchestration
-  metal.m              — Metal GPU context & dispatch
-  format.m             — GGUF tensor cache build and format dispatch
-  gguf.m               — GGUF parser and metadata extraction
-  kernels.m            — Timing and sampling helpers
-  tokenizer.m          — BPE encode/decode
-  server.m             — HTTP/SSE server (OpenAI-compatible)
-  shaders.metal        — Metal GPU kernels
-tools/                 — Benchmarking, plotting, chat client
+inference/
+  include/orome.h      — Types, ModelConfig, TensorRef, Engine interfaces
+  src/                  — Objective-C engine, Metal shaders, GGUF loader, HTTP server
+  vendor/              — Third-party (linenoise, tokenizer)
+tools/                 — Benchmarking, comparison, chat client, stress test
+scripts/               — Experiment runner
+docs/                  — Detailed comparison data, model notes, research
+experiments/           — Per-model optimization logs and configs
 ```
 
-The engine is parameterized by `ModelConfig` and GGUF metadata rather than hardcoded dimensions.
+## Docs
 
-## Qwen3.5 Dense Notes
-
-Orome now distinguishes MoE vs dense FFN models from GGUF tensor names. The 35B-A3B path remains routed-MoE; Qwen3.5-9B and Qwen3.5-27B use the dense SwiGLU FFN path.
-
-If your GGUF download does not include Orome's legacy `vocab.bin`, generate one from the official tokenizer assets:
-
-```bash
-python3 tools/build_vocab_bin.py /path/to/qwen-tokenizer-dir
-```
-
-Place the resulting `vocab.bin` next to the GGUF file or in the tokenizer asset directory that Orome can read.
-
-## Research Notes
-
-- **[experiments/qwen35-9B/program.md](experiments/qwen35-9B/program.md)** — autonomous optimization brief for the 9B dense GGUF path.
-- **[experiments/qwen35-27B/program.md](experiments/qwen35-27B/program.md)** — autonomous optimization brief for the 27B dense GGUF path.
-- **[experiments/qwen35-35B/program.md](experiments/qwen35-35B/program.md)** — current autonomous optimization brief for the GGUF-era codebase.
-
-## Autonomous Research
-
-```bash
-./run_experiments.sh qwen35-9B --agent codex --sessions 3
-./run_experiments.sh qwen35-27B --agent codex --sessions 3
-./run_experiments.sh qwen35-35B --sessions 3
-./run_experiments.sh qwen35-35B --agent codex --sessions 3
-```
-
-Launches Claude Code or Codex sessions that autonomously run experiments: modify source, build, benchmark, log results, commit or revert. Each session reads `status.md` for handoff, follows `program.md` for protocol, and appends to `results.tsv`.
-
-The benchmark harness now includes a chat-quality canary, and the runner reverts
-session commits if either throughput or visible output quality regresses. Each
-experiment target must define a `cross_check.json`, and the runner uses those
-configs to run a self-check plus the other supported models as cross-model
-regression gates before it keeps a session's commits.
+- [Qwen3.5 family notes](docs/qwen-family.md)
+- [llama.cpp comparison details](docs/llama-comparison.md)
+- [Research & experiments](docs/research.md)

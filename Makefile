@@ -1,27 +1,28 @@
 CC = clang
-CFLAGS = -O2 -Wall -Wextra -fobjc-arc -Iinclude -Ivendor
+CFLAGS = -O2 -Wall -Wextra -fobjc-arc -Iinference/include -Iinference/vendor
 FRAMEWORKS = -framework Metal -framework Foundation
 LDFLAGS =
 
 # Multi-file build
 OROME_TARGET = orome
-OROME_SRCS = src/main.m src/engine.m src/metal.m \
-             src/kernels.m src/tokenizer.m src/server.m src/gguf.m src/format.m \
-             src/engine_qwen35_hybrid.m
+OROME_SRCS = inference/src/main.m inference/src/engine.m inference/src/metal.m \
+             inference/src/kernels.m inference/src/tokenizer.m inference/src/server.m \
+             inference/src/gguf.m inference/src/format.m \
+             inference/src/engine_qwen35_hybrid.m
 OROME_OBJS = $(OROME_SRCS:.m=.o)
 
 # Metal shaders
 METALC = xcrun -sdk macosx metal
 METALLIB_TOOL = xcrun -sdk macosx metallib
-SHADER_SRC = src/shaders.metal
-SHADER_AIR = src/shaders.air
-SHADER_LIB = src/shaders.metallib
+SHADER_SRC = inference/src/shaders.metal
+SHADER_AIR = inference/src/shaders.air
+SHADER_LIB = inference/src/shaders.metallib
 
 .PHONY: all clean bench
 
 all: $(SHADER_LIB) $(OROME_TARGET)
 
-%.o: %.m include/orome.h
+%.o: %.m inference/include/orome.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(OROME_TARGET): $(OROME_OBJS)

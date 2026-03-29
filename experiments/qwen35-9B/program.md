@@ -57,12 +57,12 @@ The command above exits non-zero if the quality canary fails. Treat that as a co
 The current codebase is organized around GGUF + format abstraction:
 
 - `include/orome.h`
-- `src/main.m`
-- `src/engine.m`
-- `src/metal.m`
-- `src/format.m`
-- `src/gguf.m`
-- `src/shaders.metal`
+- `inference/src/main.m`
+- `inference/src/engine.m`
+- `inference/src/metal.m`
+- `inference/src/format.m`
+- `inference/src/gguf.m`
+- `inference/src/shaders.metal`
 
 Important rules for this dense campaign:
 
@@ -74,17 +74,17 @@ Important rules for this dense campaign:
 
 Primary hot-path files:
 
-- `src/engine.m`
-- `src/shaders.metal`
-- `src/metal.m`
-- `src/format.m`
+- `inference/src/engine.m`
+- `inference/src/shaders.metal`
+- `inference/src/metal.m`
+- `inference/src/format.m`
 - `include/orome.h`
 - `Makefile`
 
 Secondary files if needed for a specific optimization:
 
-- `src/main.m`
-- `src/gguf.m`
+- `inference/src/main.m`
+- `inference/src/gguf.m`
 
 ## What You Should Not Modify During Experiment Runs
 

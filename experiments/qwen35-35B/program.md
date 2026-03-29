@@ -150,17 +150,17 @@ Good first candidates:
 
 Primary hot-path files:
 
-- `src/engine.m`
-- `src/shaders.metal`
-- `src/metal.m`
-- `src/format.m`
+- `inference/src/engine.m`
+- `inference/src/shaders.metal`
+- `inference/src/metal.m`
+- `inference/src/format.m`
 - `include/orome.h`
 - `Makefile`
 
 Secondary files if needed for a specific optimization:
 
-- `src/main.m`
-- `src/gguf.m`
+- `inference/src/main.m`
+- `inference/src/gguf.m`
 
 ## What You Should Not Modify During Experiment Runs
 
