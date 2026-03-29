@@ -41,7 +41,7 @@ clean:
 	rm -f $(OROME_TARGET) $(OROME_OBJS) $(SHADER_AIR) $(SHADER_LIB)
 
 bench: $(OROME_TARGET)
-	python3 tools/benchmark.py --trials 1 --json
+	python3 inference/tools/benchmark.py --trials 1 --json
 
 MODEL ?= /Users/j/Code/lllm/models/Qwen3.5-35B-A3B-Q4_K_S.gguf
 PORT ?= 8080
@@ -50,4 +50,4 @@ serve: $(OROME_TARGET)
 	./$(OROME_TARGET) --model $(MODEL) --serve $(PORT)
 
 chat:
-	@python3 tools/chat.py --port $(PORT)
+	@python3 inference/tools/chat.py --port $(PORT)

@@ -4,9 +4,9 @@ Orome uses autonomous research sessions to optimize inference throughput and qua
 
 ## Experiment Targets
 
-- **[experiments/qwen35-9B/program.md](../experiments/qwen35-9B/program.md)** — 9B dense GGUF optimization
-- **[experiments/qwen35-27B/program.md](../experiments/qwen35-27B/program.md)** — 27B dense GGUF optimization
-- **[experiments/qwen35-35B/program.md](../experiments/qwen35-35B/program.md)** — 35B MoE GGUF optimization
+- **[experiments/qwen35-9B/program.md](../inference/experiments/qwen35-9B/program.md)** — 9B dense GGUF optimization
+- **[experiments/qwen35-27B/program.md](../inference/experiments/qwen35-27B/program.md)** — 27B dense GGUF optimization
+- **[experiments/qwen35-35B/program.md](../inference/experiments/qwen35-35B/program.md)** — 35B MoE GGUF optimization
 
 ## Running Experiments
 

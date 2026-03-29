@@ -34,7 +34,8 @@ set -euo pipefail
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$SCRIPT_DIR"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_DIR"
 
 # ---- Parse arguments ----
 MODEL="${1:-}"
@@ -42,17 +43,17 @@ if [[ -z "$MODEL" ]]; then
     echo "Usage: $0 <model> [--agent claude|codex] [--sessions N]"
     echo ""
     echo "Available models:"
-    for d in experiments/*/; do
+    for d in inference/experiments/*/; do
         [[ -f "$d/program.md" ]] && echo "  $(basename "$d")"
     done
     exit 1
 fi
 
-EXPERIMENT_DIR="$SCRIPT_DIR/experiments/$MODEL"
+EXPERIMENT_DIR="$REPO_DIR/inference/experiments/$MODEL"
 if [[ ! -d "$EXPERIMENT_DIR" ]]; then
     echo "ERROR: No experiment directory at $EXPERIMENT_DIR"
     echo "Available models:"
-    for d in experiments/*/; do
+    for d in inference/experiments/*/; do
         [[ -f "$d/program.md" ]] && echo "  $(basename "$d")"
     done
     exit 1
@@ -293,7 +294,7 @@ validate_cross_check_suite() {
     local count=0
     local d name cc reason
 
-    for d in experiments/*/; do
+    for d in inference/experiments/*/; do
         [[ -f "$d/program.md" ]] || continue
         count=$((count + 1))
         name="$(basename "$d")"
@@ -312,7 +313,7 @@ validate_cross_check_suite() {
     done
 
     if [[ "$count" -eq 0 ]]; then
-        echo "[runner] FATAL: no experiment targets found under experiments/" | tee -a "$ERROR_LOG"
+        echo "[runner] FATAL: no experiment targets found under inference/experiments/" | tee -a "$ERROR_LOG"
         exit 1
     fi
 
@@ -479,7 +480,7 @@ if [[ ! -f "$SELF_CHECK" ]]; then
 fi
 
 CROSS_CHECKS=()
-for d in experiments/*/; do
+for d in inference/experiments/*/; do
     other="$(basename "$d")"
     [[ "$other" == "$MODEL" ]] && continue
     cc="$d/cross_check.json"
@@ -928,7 +929,7 @@ $(cat "$EXPERIMENT_DIR/results.tsv")
 
 ## Historical Context
 
-Older 35B packed-format results live in \`experiments/$MODEL/results.historical.tsv\`.
+Older 35B packed-format results live in \`inference/experiments/$MODEL/results.historical.tsv\`.
 Use them for hypotheses and prior art, not as the live GGUF baseline."
     fi
 
@@ -939,10 +940,10 @@ Use them for hypotheses and prior art, not as the live GGUF baseline."
 
 ## Experiment Paths
 
-- Results: \`experiments/$MODEL/results.tsv\`
-- Historical results: \`experiments/$MODEL/results.historical.tsv\`
-- Status: \`experiments/$MODEL/status.md\`
-- Bench errors: \`experiments/$MODEL/bench_err.txt\`
+- Results: \`inference/experiments/$MODEL/results.tsv\`
+- Historical results: \`inference/experiments/$MODEL/results.historical.tsv\`
+- Status: \`inference/experiments/$MODEL/status.md\`
+- Bench errors: \`inference/experiments/$MODEL/bench_err.txt\`
 
 ## Runner Post-Processing
 

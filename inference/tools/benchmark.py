@@ -481,7 +481,7 @@ def main():
     parser.add_argument("--quality-case-min-passes", type=int, default=DEFAULT_QUALITY_CASE_MIN_PASSES, help="Minimum number of passing quality cases required")
     args = parser.parse_args()
 
-    cwd = Path(__file__).resolve().parent.parent  # tools/ -> project root
+    cwd = Path(__file__).resolve().parent.parent.parent  # tools/ -> inference/ -> project root
     infer_path = (cwd / args.infer).resolve() if not Path(args.infer).is_absolute() else Path(args.infer)
     if not infer_path.exists():
         print(f"ERROR: infer binary not found at {infer_path}", file=sys.stderr)

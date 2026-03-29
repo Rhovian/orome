@@ -46,7 +46,7 @@ DEFAULT_CASES = [
 
 
 def repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent
+    return Path(__file__).resolve().parent.parent.parent
 
 
 def model_presets(root: Path) -> dict[str, dict[str, object]]:

@@ -1,0 +1,21 @@
+commit	tok_sec	ttft_ms	proj_avg_ms	status	description
+e14e08b	35.91	920.7	0.0	baseline	HEAD baseline after required clean build; quality canary pass
+e14e08b+dirty	35.89	913.5	0.0	discard	Dense FFN gate/up reused existing fused shared gate+up+SwiGLU kernels for Q4_K/Q8_0; canary pass, tok/s slightly worse
+333d6ea	35.94	920.5	0.0	keep	Tile base quantized matvec kernels over x in 8192-element chunks to avoid dense-path threadgroup staging overflow; canary pass
+333d6ea+dirty	35.90	923.2	0.0	discard	Vectorized tiled Q8_0 inner loop with 4-wide dot products; canary pass, but slower than tiled baseline
+7f8e7fa	35.77	917.5	0.0	baseline	HEAD baseline after clean build on runner status commit; quality canary pass
+7f8e7fa+dirty	35.81	929.0	0.0	discard	Reduced quantized matvec shared x tile to 4096; canary pass, slightly above fresh HEAD baseline but slower than retained 35.94 tok/s
+7f8e7fa+dirty	35.41	903.2	0.0	discard	Reduced base GGUF quantized matvec threadgroups to 256 threads / 16 rows; canary pass, clearly slower
+7f8e7fa+dirty	35.16	949.0	0.0	discard	Increased quantized matvec shared x tile to 12288 so 9B FFN-wide projections fit in one tile; canary pass, slower
+7f8e7fa+dirty	35.62	945.7	0.0	discard	Tried wider quantized matvec dispatch for small-input wide-output shapes like lm_head; canary pass, still slower than baseline
+7f8e7fa+dirty	35.25	1016.9	0.0	discard	Added a greedy-only Q8_0 lm_head plus argmax fast path while preserving full-logits server behavior; canary pass, but slower
+7f8e7fa+dirty	35.29	960.2	0.0	discard	Set quantized matvec shared x tile to 6144 as a midpoint sweep; canary pass, slower than baseline
+7f8e7fa+dirty	35.93	904.7	0.0	discard	Skipped the final inter-tile barrier in tiled quantized matvec kernels; canary pass, nearly matched the retained best but finished 0.01 tok/s lower
+7f8e7fa+dirty	35.88	929.2	0.0	discard	Set quantized matvec shared x tile to 9216 as a tighter sweep above 8192; canary pass, slower than retained best
+0c6c89b	35.97	914.0	0.0	keep	Added a Q8_0 single-tile matvec kernel and dispatch path for in_dim <= 8192; canary pass, new best
+0c6c89b+dirty	35.02	928.9	0.0	discard	Raised the Q8_0 single-tile matvec threadgroup to 1024 threads so one staged x tile covers 64 output rows; canary pass, clearly slower
+0c6c89b+dirty	34.83	899.5	0.0	discard	Expanded the Q8_0 single-tile kernel so each simdgroup handled four output rows at 512 threads; canary pass, slower
+0c6c89b+dirty	26.33	922.2	0.0	discard	Changed the Q8_0 single-tile kernel to stage x in threadgroup float instead of half; canary pass, major regression
+0c6c89b+dirty	35.88	904.5	0.0	discard	Added a generic Q8_0 two-tile matvec specialization for inputs up to 16384 to remove tile-loop overhead on dense down projections; canary pass, slightly slower
+0c6c89b+dirty	35.37	843.0	0.0	discard	Added a dense-only Q8_0 single-tile fused gate+up+SwiGLU kernel using the retained two-row geometry; canary pass, but sustained tok/s regressed despite lower TTFT
+0c6c89b+dirty	35.79	832.6	0.0	discard	Added a narrow Q8_0 two-tile 8192+4096 matvec specialization to trim dense-down loop and barrier overhead; canary pass, better TTFT but slower throughput

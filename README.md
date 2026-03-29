@@ -7,7 +7,7 @@ Inference engine for Apple Silicon, currently focused on GGUF Qwen3.5 models.
 ## Current Focus
 
 - Supported autoresearch models: `Qwen3.5-9B-Q8_0.gguf`, `Qwen3.5-27B-Q4_K_M.gguf`, `Qwen3.5-35B-A3B-Q4_K_S.gguf`
-- Experiment logs: `experiments/qwen35-9B/`, `experiments/qwen35-27B/`, `experiments/qwen35-35B/`
+- Experiment logs: `inference/experiments/`
 
 ## vs llama.cpp
 
@@ -46,10 +46,10 @@ inference/
   include/orome.h      — Types, ModelConfig, TensorRef, Engine interfaces
   src/                  — Objective-C engine, Metal shaders, GGUF loader, HTTP server
   vendor/              — Third-party (linenoise, tokenizer)
-tools/                 — Benchmarking, comparison, chat client, stress test
+  tools/               — Benchmarking, comparison, chat client, stress test
+  experiments/         — Per-model optimization logs and configs
 scripts/               — Experiment runner
 docs/                  — Detailed comparison data, model notes, research
-experiments/           — Per-model optimization logs and configs
 ```
 
 ## Docs

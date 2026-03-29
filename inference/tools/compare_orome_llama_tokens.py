@@ -25,7 +25,7 @@ TOKEN_LINE_RE = re.compile(r"^\s*(-?\d+)\s+->\s+'(.*)'(?: \(utf-8 decode failure
 
 
 def repo_root() -> Path:
-    return Path(__file__).resolve().parent.parent
+    return Path(__file__).resolve().parent.parent.parent
 
 
 def model_presets(root: Path) -> dict[str, dict[str, object]]:
