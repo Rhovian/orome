@@ -23,18 +23,44 @@ Method:
 - 100 generated tokens, context size `256`, 5-trial median
 - Orome via `tools/benchmark.py --skip-quality-check`
 - llama.cpp via `llama-completion` with greedy settings and `--no-warmup`
-- Orome `ceb9d82`, llama.cpp `c46758d`
+- Orome `bf77939`, llama.cpp `c46758d`
 
 | Model | Orome tok/s | llama.cpp tok/s | Winner |
 | --- | ---: | ---: | --- |
 | Qwen3.5-9B-Q8_0 | 35.32 | 31.22 | Orome |
-| Qwen3.5-27B-Q4_K_M | 9.61 | 14.38 | llama.cpp |
+| Qwen3.5-27B-Q4_K_M | 17.59 | 14.77 | Orome |
 | Qwen3.5-35B-A3B-Q4_K_S | 65.15 | 51.34 | Orome |
 
 Reproduce:
 
 ```bash
 python3 tools/compare_orome_llama.py --models 9B 27B 35B --tokens 100 --trials 5 --json
+```
+
+## Greedy Completion Quality vs llama.cpp
+
+The repo also includes a completion-quality comparison harness in
+`tools/compare_orome_llama_quality.py`. This is a narrower check than the
+throughput table above: it compares greedy raw-completion outputs on a small
+prompt suite and applies the same anti-garble checks used by the benchmark
+harness, plus simple expected-content checks per prompt.
+
+Method:
+- Mac Studio M2 Max, same GGUF files
+- greedy completion, one engine at a time
+- prompts: `capital`, `opposite`, `sky`
+- Orome `bf77939`, llama.cpp `c46758d`
+
+| Model | Orome | llama.cpp | Notes |
+| --- | --- | --- | --- |
+| Qwen3.5-9B-Q8_0 | 3/3 pass | 3/3 pass | both coherent on the default suite |
+| Qwen3.5-27B-Q4_K_M | 3/3 pass | 3/3 pass | both coherent on the default suite |
+| Qwen3.5-35B-A3B-Q4_K_S | 3/3 pass | 3/3 pass | both coherent on the default suite |
+
+Reproduce:
+
+```bash
+python3 tools/compare_orome_llama_quality.py --models 9B 27B 35B --json
 ```
 
 ## Quick Start

@@ -128,6 +128,10 @@ echo "============================================"
 echo "" | tee -a "$ERROR_LOG"
 echo "=== Runner started $(date '+%Y-%m-%d %H:%M:%S') model=$MODEL ===" >> "$ERROR_LOG"
 
+tracked_worktree_dirty() {
+    ! git diff --quiet || ! git diff --cached --quiet
+}
+
 # Ensure we're on the right branch
 if git rev-parse --git-dir > /dev/null 2>&1; then
     BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
@@ -136,6 +140,11 @@ if git rev-parse --git-dir > /dev/null 2>&1; then
         git checkout -b "$BRANCH_NAME" 2>/dev/null || git checkout "$BRANCH_NAME"
     fi
     echo "[runner] On branch: $(git branch --show-current)"
+fi
+
+if tracked_worktree_dirty; then
+    echo "[runner] FATAL: tracked worktree is dirty before starting. Commit, stash, or revert tracked changes first." | tee -a "$ERROR_LOG"
+    exit 1
 fi
 
 # Safety check: verify the codebase builds before starting
@@ -151,6 +160,7 @@ validate_cross_check_config() {
     python3 - "$cc" <<'PY'
 import json
 import sys
+from pathlib import Path
 
 path = sys.argv[1]
 
@@ -165,6 +175,116 @@ if missing:
 if d.get("quality_check", True) is False:
     print("quality_check is disabled")
     sys.exit(1)
+
+llama = d.get("llama_compare")
+if llama is not None:
+    if not isinstance(llama, dict):
+        print("llama_compare must be an object")
+        sys.exit(1)
+    if llama.get("enabled", False):
+        model_alias = str(llama.get("model_alias", "")).strip()
+        if not model_alias:
+            print("llama_compare.enabled requires model_alias")
+            sys.exit(1)
+        repo = str(llama.get("repo", "")).strip()
+        if not repo:
+            print("llama_compare.enabled requires repo")
+            sys.exit(1)
+        if not Path(repo).exists():
+            print(f"llama_compare repo not found: {repo}")
+            sys.exit(1)
+
+        throughput = llama.get("throughput", {})
+        if throughput is None:
+            throughput = {}
+        if not isinstance(throughput, dict):
+            print("llama_compare.throughput must be an object")
+            sys.exit(1)
+        if int(throughput.get("tokens", 100)) <= 0:
+            print("llama_compare.throughput.tokens must be > 0")
+            sys.exit(1)
+        if int(throughput.get("trials", 1)) <= 0:
+            print("llama_compare.throughput.trials must be > 0")
+            sys.exit(1)
+        if int(throughput.get("warmup_runs", 0)) < 0:
+            print("llama_compare.throughput.warmup_runs must be >= 0")
+            sys.exit(1)
+        if float(throughput.get("cooldown_sec", 0.0)) < 0:
+            print("llama_compare.throughput.cooldown_sec must be >= 0")
+            sys.exit(1)
+
+        quality = llama.get("quality", {})
+        if quality is None:
+            quality = {}
+        if not isinstance(quality, dict):
+            print("llama_compare.quality must be an object")
+            sys.exit(1)
+        if int(quality.get("runs", 1)) <= 0:
+            print("llama_compare.quality.runs must be > 0")
+            sys.exit(1)
+        if int(quality.get("min_orome_passes", 1)) < 0:
+            print("llama_compare.quality.min_orome_passes must be >= 0")
+            sys.exit(1)
+        if int(quality.get("min_runs_passing", 1)) <= 0:
+            print("llama_compare.quality.min_runs_passing must be > 0")
+            sys.exit(1)
+
+        source_hints = llama.get("source_hints", [])
+        if source_hints is None:
+            source_hints = []
+        if not isinstance(source_hints, list):
+            print("llama_compare.source_hints must be an array")
+            sys.exit(1)
+
+        cases_file = str(quality.get("cases_file", "")).strip()
+        if cases_file and not Path(cases_file).exists():
+            print(f"llama_compare.quality.cases_file not found: {cases_file}")
+            sys.exit(1)
+PY
+}
+
+llama_compare_enabled() {
+    local cc="$1"
+    python3 - "$cc" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+
+cfg = d.get("llama_compare") or {}
+print("yes" if cfg.get("enabled", False) else "no")
+PY
+}
+
+build_llama_reference_prompt_section() {
+    local cc="$1"
+    python3 - "$cc" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+
+cfg = d.get("llama_compare") or {}
+if not cfg.get("enabled", False):
+    raise SystemExit(0)
+
+repo = Path(str(cfg.get("repo", ""))).resolve()
+alias = str(cfg.get("model_alias", "")).strip()
+hints = cfg.get("source_hints") or []
+
+print("## Local Reference Implementation")
+print()
+print("- Use local `llama.cpp` as the parity target for this campaign.")
+print(f"- Local repo: `{repo}`")
+print(f"- Throughput compare: `python3 tools/compare_orome_llama.py --models {alias} --json`")
+print(f"- Quality compare: `python3 tools/compare_orome_llama_quality.py --models {alias} --json`")
+if hints:
+    print("- Relevant local llama.cpp files:")
+    for hint in hints:
+        print(f"  - `{repo / hint}`")
 PY
 }
 
@@ -204,6 +324,27 @@ validate_cross_check_suite() {
 }
 
 validate_cross_check_suite
+
+session_log_failure_reason() {
+    local log_file="$1"
+
+    if rg -q '"subtype":"error_max_turns"' "$log_file"; then
+        echo "agent hit max turns"
+        return 0
+    fi
+
+    if rg -q '"is_error":true' "$log_file"; then
+        echo "agent reported an error"
+        return 0
+    fi
+
+    if rg -q '"type":"error"' "$log_file"; then
+        echo "agent emitted an error event"
+        return 0
+    fi
+
+    return 1
+}
 
 sanitize_summary_field() {
     printf '%s' "$1" | tr '\t\r\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
@@ -348,6 +489,15 @@ if [[ -n "$SELF_CHECK" ]]; then
     echo "[runner] Self-check configured: $SELF_CHECK"
 else
     echo "[runner] No self-check configured"
+fi
+LLAMA_COMPARE_CHECK=""
+if [[ -n "$SELF_CHECK" && "$(llama_compare_enabled "$SELF_CHECK")" == "yes" ]]; then
+    LLAMA_COMPARE_CHECK="$SELF_CHECK"
+fi
+if [[ -n "$LLAMA_COMPARE_CHECK" ]]; then
+    echo "[runner] llama.cpp parity checks configured: $LLAMA_COMPARE_CHECK"
+else
+    echo "[runner] No llama.cpp parity checks configured"
 fi
 if [[ ${#CROSS_CHECKS[@]} -gt 0 ]]; then
     echo "[runner] Cross-model regression checks: ${CROSS_CHECKS[*]}"
@@ -506,6 +656,191 @@ run_self_check() {
     run_check_config "$SELF_CHECK" "self-check"
 }
 
+run_llama_compare_check() {
+    local cc="$1"
+    local values=()
+    mapfile -t values < <(python3 - "$cc" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+
+cfg = d.get("llama_compare") or {}
+if not cfg.get("enabled", False):
+    raise SystemExit(0)
+
+throughput = cfg.get("throughput") or {}
+quality = cfg.get("quality") or {}
+
+print(str(cfg.get("model_alias", "")).strip())
+print(str(cfg.get("repo", "")).strip())
+print(int(throughput.get("tokens", 100)))
+print(int(throughput.get("trials", 1)))
+print(int(throughput.get("warmup_runs", 0)))
+print(float(throughput.get("cooldown_sec", 0.0)))
+print(str(throughput.get("min_ratio_orome_over_llama", "")).strip())
+print(int(quality.get("runs", 1)))
+print(int(quality.get("min_orome_passes", 1)))
+print(int(quality.get("min_runs_passing", 1)))
+print(str(quality.get("cases_file", "")).strip())
+PY
+)
+
+    [[ ${#values[@]} -gt 0 ]] || return 0
+
+    local model_alias="${values[0]}"
+    local llama_repo="${values[1]}"
+    local throughput_tokens="${values[2]}"
+    local throughput_trials="${values[3]}"
+    local throughput_warmup="${values[4]}"
+    local throughput_cooldown="${values[5]}"
+    local throughput_min_ratio="${values[6]}"
+    local quality_runs="${values[7]}"
+    local quality_min_orome_passes="${values[8]}"
+    local quality_min_runs_passing="${values[9]}"
+    local quality_cases_file="${values[10]}"
+
+    local any_fail=0
+    local tmp_json tmp_err rc parsed orome_tok llama_tok ratio desc reason
+
+    echo "[llama-compare] Running throughput parity check..."
+    tmp_json=$(mktemp)
+    tmp_err=$(mktemp)
+    rc=0
+    python3 tools/compare_orome_llama.py \
+        --models "$model_alias" \
+        --tokens "$throughput_tokens" \
+        --trials "$throughput_trials" \
+        --warmup-runs "$throughput_warmup" \
+        --cooldown-sec "$throughput_cooldown" \
+        --llama-repo "$llama_repo" \
+        --json \
+        >"$tmp_json" 2>"$tmp_err" || rc=$?
+
+    if [[ "$rc" -ne 0 || ! -s "$tmp_json" ]]; then
+        echo "[llama-compare] FAIL: throughput compare could not complete"
+        [[ -s "$tmp_err" ]] && echo "  stderr: $(tail -3 "$tmp_err" | tr '\n' ' ')"
+        record_check_summary "llama-throughput" "FAIL" "llama.cpp throughput parity" "" "" "" "compare command failed"
+        any_fail=1
+    else
+        parsed=$(python3 - "$tmp_json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+r = d["results"][0]
+print(r["orome"]["tok_sec"])
+print(r["llama"]["tok_sec"])
+print(r.get("ratio_orome_over_llama", ""))
+PY
+)
+        orome_tok=$(printf '%s\n' "$parsed" | sed -n '1p')
+        llama_tok=$(printf '%s\n' "$parsed" | sed -n '2p')
+        ratio=$(printf '%s\n' "$parsed" | sed -n '3p')
+        desc="Orome ${orome_tok} tok/s vs llama.cpp ${llama_tok} tok/s (ratio ${ratio})"
+
+        local throughput_ok="yes"
+        if [[ -n "$throughput_min_ratio" ]]; then
+            throughput_ok=$(python3 - "$ratio" "$throughput_min_ratio" <<'PY'
+import sys
+ratio = float(sys.argv[1] or 0.0)
+floor = float(sys.argv[2])
+print("yes" if ratio >= floor else "no")
+PY
+)
+            desc="${desc}, min ratio ${throughput_min_ratio}"
+        fi
+
+        if [[ "$throughput_ok" == "yes" ]]; then
+            echo "[llama-compare] PASS: $desc"
+            record_check_summary "llama-throughput" "PASS" "$desc" "" "" "" ""
+        else
+            echo "[llama-compare] FAIL: $desc"
+            reason="ratio ${ratio} < ${throughput_min_ratio}"
+            record_check_summary "llama-throughput" "FAIL" "llama.cpp throughput parity" "" "" "" "$reason"
+            any_fail=1
+        fi
+    fi
+    rm -f "$tmp_json" "$tmp_err"
+
+    echo "[llama-compare] Running quality parity check..."
+    local pass_runs=0
+    local run_idx=0
+    local orome_scores=()
+    local llama_scores=()
+    for ((run_idx=1; run_idx<=quality_runs; run_idx++)); do
+        tmp_json=$(mktemp)
+        tmp_err=$(mktemp)
+        rc=0
+        if [[ -n "$quality_cases_file" ]]; then
+            python3 tools/compare_orome_llama_quality.py \
+                --models "$model_alias" \
+                --llama-repo "$llama_repo" \
+                --cases-file "$quality_cases_file" \
+                --json \
+                >"$tmp_json" 2>"$tmp_err" || rc=$?
+        else
+            python3 tools/compare_orome_llama_quality.py \
+                --models "$model_alias" \
+                --llama-repo "$llama_repo" \
+                --json \
+                >"$tmp_json" 2>"$tmp_err" || rc=$?
+        fi
+
+        if [[ "$rc" -ne 0 || ! -s "$tmp_json" ]]; then
+            echo "[llama-compare] FAIL: quality compare run ${run_idx} could not complete"
+            [[ -s "$tmp_err" ]] && echo "  stderr: $(tail -3 "$tmp_err" | tr '\n' ' ')"
+            record_check_summary "llama-quality" "FAIL" "llama.cpp quality parity" "" "" "" "quality compare command failed"
+            rm -f "$tmp_json" "$tmp_err"
+            return 1
+        fi
+
+        parsed=$(python3 - "$tmp_json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+r = d["results"][0]
+print(r["orome_passes"])
+print(r["llama_passes"])
+print(r["case_count"])
+PY
+)
+        local orome_passes llama_passes case_count
+        orome_passes=$(printf '%s\n' "$parsed" | sed -n '1p')
+        llama_passes=$(printf '%s\n' "$parsed" | sed -n '2p')
+        case_count=$(printf '%s\n' "$parsed" | sed -n '3p')
+        orome_scores+=("${orome_passes}/${case_count}")
+        llama_scores+=("${llama_passes}/${case_count}")
+        local quality_run_ok
+        quality_run_ok=$(python3 - "$orome_passes" "$quality_min_orome_passes" <<'PY'
+import sys
+print("yes" if int(sys.argv[1]) >= int(sys.argv[2]) else "no")
+PY
+)
+        if [[ "$quality_run_ok" == "yes" ]]; then
+            pass_runs=$((pass_runs + 1))
+        fi
+        rm -f "$tmp_json" "$tmp_err"
+    done
+
+    desc="Orome per-run cases: $(IFS=', '; echo "${orome_scores[*]}"); llama.cpp per-run cases: $(IFS=', '; echo "${llama_scores[*]}")"
+    if [[ "$pass_runs" -ge "$quality_min_runs_passing" ]]; then
+        echo "[llama-compare] PASS: ${pass_runs}/${quality_runs} runs met the quality floor; ${desc}"
+        record_check_summary "llama-quality" "PASS" "${pass_runs}/${quality_runs} runs met the quality floor; ${desc}" "" "" "" ""
+    else
+        echo "[llama-compare] FAIL: ${pass_runs}/${quality_runs} runs met the quality floor (need ${quality_min_runs_passing}); ${desc}"
+        reason="${pass_runs}/${quality_runs} runs met the quality floor (need ${quality_min_runs_passing})"
+        record_check_summary "llama-quality" "FAIL" "llama.cpp quality parity" "" "" "" "${reason}; ${desc}"
+        any_fail=1
+    fi
+
+    return "$any_fail"
+}
+
 run_cross_checks() {
     # Run each cross-model check. Returns 0 if all pass, 1 if any regress.
     local any_fail=0
@@ -615,6 +950,17 @@ Use them for hypotheses and prior art, not as the live GGUF baseline."
 - The runner also refreshes a \`## Runner Validation\` section in \`status.md\` with authoritative self-check and cross-check outcomes.
 - Do not guess whether runner-managed validation did or did not run; leave that section to the runner."
 
+    if [[ -n "$LLAMA_COMPARE_CHECK" ]]; then
+        LLAMA_PROMPT_SECTION="$(build_llama_reference_prompt_section "$LLAMA_COMPARE_CHECK")"
+        if [[ -n "$LLAMA_PROMPT_SECTION" ]]; then
+            PROMPT="$PROMPT
+
+---
+
+$LLAMA_PROMPT_SECTION"
+        fi
+    fi
+
     # Snapshot the codebase state before the session (for recovery)
     GIT_HEAD_BEFORE=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
     reset_check_summaries
@@ -624,8 +970,19 @@ Use them for hypotheses and prior art, not as the live GGUF baseline."
 
     EXIT_CODE=${PIPESTATUS[0]}
     GIT_HEAD_AFTER=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+    SESSION_FAILURE_REASON=""
+    if [[ "$EXIT_CODE" -eq 0 ]]; then
+        if SESSION_FAILURE_REASON="$(session_log_failure_reason "$SESSION_LOG")"; then
+            EXIT_CODE=86
+        else
+            SESSION_FAILURE_REASON=""
+        fi
+    fi
     echo ""
     echo "[runner] Session $SESSION_NUM finished (exit code: $EXIT_CODE) at $(date '+%H:%M:%S')"
+    if [[ -n "$SESSION_FAILURE_REASON" ]]; then
+        echo "[runner] Session log indicates failure: $SESSION_FAILURE_REASON"
+    fi
 
     # Log errors and track consecutive failures
     if [[ "$EXIT_CODE" -ne 0 ]]; then
@@ -638,17 +995,17 @@ Use them for hypotheses and prior art, not as the live GGUF baseline."
             echo "  Log: $SESSION_LOG"
             echo "  Git before: $GIT_HEAD_BEFORE"
             echo "  Git after:  $GIT_HEAD_AFTER"
+            [[ -n "$SESSION_FAILURE_REASON" ]] && echo "  Failure reason: $SESSION_FAILURE_REASON"
             echo "  Tail of session log:"
             tail -20 "$SESSION_LOG" 2>/dev/null | sed 's/^/    /'
             echo "---"
         } >> "$ERROR_LOG"
         echo "[runner] ERROR logged to $ERROR_LOG (consecutive: $CONSECUTIVE_FAILURES/$MAX_CONSECUTIVE_FAILURES)"
 
-        # Safety: verify the build still works after a failed session
-        if ! make 2>/dev/null; then
-            echo "[runner] WARNING: Build broken after failed session. Reverting to $GIT_HEAD_BEFORE" | tee -a "$ERROR_LOG"
-            git checkout -- src/ include/ Makefile shaders.metal 2>/dev/null || true
-            echo "  Reverted source files to clean state" >> "$ERROR_LOG"
+        if [[ "$GIT_HEAD_BEFORE" != "$GIT_HEAD_AFTER" ]] || tracked_worktree_dirty; then
+            echo "[runner] Reverting failed session to $GIT_HEAD_BEFORE" | tee -a "$ERROR_LOG"
+            git reset --hard "$GIT_HEAD_BEFORE" 2>/dev/null || true
+            actualize_status_file "$EXPERIMENT_DIR/status.md" "$(git branch --show-current)" "$GIT_HEAD_BEFORE" "Session failed and runner reverted session changes."
         fi
 
         # Circuit breaker
@@ -666,6 +1023,12 @@ Use them for hypotheses and prior art, not as the live GGUF baseline."
             if [[ -n "$SELF_CHECK" ]]; then
                 echo "[runner] Running self-check..."
                 if ! run_self_check; then
+                    regression_fail=1
+                fi
+            fi
+            if [[ "$regression_fail" -eq 0 && -n "$LLAMA_COMPARE_CHECK" ]]; then
+                echo "[runner] Running llama.cpp parity checks..."
+                if ! run_llama_compare_check "$LLAMA_COMPARE_CHECK"; then
                     regression_fail=1
                 fi
             fi
@@ -694,7 +1057,13 @@ Use them for hypotheses and prior art, not as the live GGUF baseline."
                 actualize_status_file "$EXPERIMENT_DIR/status.md" "$(git branch --show-current)" "$GIT_HEAD_AFTER" ""
             fi
         else
-            actualize_status_file "$EXPERIMENT_DIR/status.md" "$(git branch --show-current)" "$GIT_HEAD_AFTER" "Session made no new commit; runner validation did not need to run."
+            if tracked_worktree_dirty; then
+                echo "[runner] Session made no new commit but left tracked changes. Reverting to $GIT_HEAD_BEFORE."
+                git reset --hard "$GIT_HEAD_BEFORE" 2>/dev/null || true
+                actualize_status_file "$EXPERIMENT_DIR/status.md" "$(git branch --show-current)" "$GIT_HEAD_BEFORE" "Session made no new commit; runner reverted leftover tracked changes."
+            else
+                actualize_status_file "$EXPERIMENT_DIR/status.md" "$(git branch --show-current)" "$GIT_HEAD_AFTER" "Session made no new commit; runner validation did not need to run."
+            fi
         fi
     fi
 

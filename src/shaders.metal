@@ -103,6 +103,7 @@ kernel void residual_add_sum_sq(
     float val = 0.0f;
     if (tid < dim) {
         val = a[tid] + b[tid];
+        val = clamp(val, -65504.0f, 65504.0f);
         out[tid] = val;
     }
 
@@ -239,6 +240,8 @@ kernel void attn_softmax_batched(
         global_max = simd_max(shared_max[simd_lane]);
     }
     threadgroup float broadcast_max;
+    if (lid == 0) broadcast_max = -1e30f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0) broadcast_max = global_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     global_max = broadcast_max;
@@ -260,6 +263,8 @@ kernel void attn_softmax_batched(
         global_sum = simd_sum(shared_sum[simd_lane]);
     }
     threadgroup float broadcast_sum;
+    if (lid == 0) broadcast_sum = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (lid == 0) broadcast_sum = global_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     global_sum = broadcast_sum;
@@ -389,6 +394,11 @@ kernel void gated_delta_net_step(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     threadgroup float q_broadcast;
     threadgroup float k_broadcast;
+    if (vi == 0) {
+        q_broadcast = 0.0f;
+        k_broadcast = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (simd_group == 0) {
         float qv = (simd_lane < 4) ? q_sums[simd_lane] : 0;
         float q_total = simd_sum(qv);
@@ -427,6 +437,131 @@ kernel void gated_delta_net_step(
         out_val += s * q_shared[ki];
     }
     output[v_base + vi] = out_val;
+}
+
+// L2-normalize Q and K vectors in-place for llama-style fused GDN.
+// Both outputs are unit-length; Q scaling by 1/sqrt(key_dim) happens in the
+// delta-net kernel itself.
+kernel void l2_norm_qk_unit(
+    device float *q,              // [num_k_heads * key_dim] in/out
+    device float *k,              // [num_k_heads * key_dim] in/out
+    constant uint &key_dim,
+    constant float &inv_scale,    // = 1/sqrt(key_dim)
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint base = head * key_dim;
+
+    float qval = (tid < key_dim) ? q[base + tid] : 0;
+    float q_sq = qval * qval;
+    float q_simd = simd_sum(q_sq);
+    threadgroup float q_shared[4];
+    if (simd_lane == 0) q_shared[simd_group] = q_simd;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_total = 0;
+    if (simd_group == 0) {
+        float v = (simd_lane < 4) ? q_shared[simd_lane] : 0;
+        q_total = simd_sum(v);
+    }
+    threadgroup float q_broadcast;
+    if (tid == 0) q_broadcast = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) q_broadcast = q_total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float q_inv_l2 = rsqrt(q_broadcast + 1e-6f);
+    if (tid < key_dim) {
+        q[base + tid] = qval * q_inv_l2;
+    }
+
+    float kval = (tid < key_dim) ? k[base + tid] : 0;
+    float k_sq = kval * kval;
+    float k_simd = simd_sum(k_sq);
+    threadgroup float k_shared[4];
+    if (simd_lane == 0) k_shared[simd_group] = k_simd;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float k_total = 0;
+    if (simd_group == 0) {
+        float v = (simd_lane < 4) ? k_shared[simd_lane] : 0;
+        k_total = simd_sum(v);
+    }
+    threadgroup float k_broadcast;
+    if (tid == 0) k_broadcast = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) k_broadcast = k_total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float k_inv_l2 = rsqrt(k_broadcast + 1e-6f);
+    if (tid < key_dim) {
+        k[base + tid] = kval * k_inv_l2;
+    }
+}
+
+// Llama-style fused autoregressive Gated Delta Net for the 27B hybrid backend.
+// Expects Q/K already L2-normalized; applies the final 1/sqrt(key_dim) scale to
+// the output inside the kernel, matching ggml's fused GDN contract.
+kernel void gated_delta_net_step_llama_f32(
+    device float *state,             // [n_v_heads * 128 * 128] persistent F32 state
+    device const float *q,           // [num_k_heads * 128], unit L2
+    device const float *k,           // [num_k_heads * 128], unit L2
+    device const float *v,           // [n_v_heads * 128]
+    device const float *g_decay,     // [n_v_heads], exp(-A * softplus)
+    device const float *beta_gate,   // [n_v_heads], sigmoid(beta)
+    device float *output,            // [n_v_heads * 128]
+    constant uint &num_k_heads,
+    constant float &q_scale,         // 1/sqrt(key_dim)
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    uint3 tpitg [[thread_position_in_threadgroup]]
+) {
+    uint tx = tpitg.x;               // 0..31
+    uint ty = tpitg.y;               // 0..3
+
+    uint head_id = tgpig.y;
+    uint vi = tgpig.x * 4 + ty;
+    if (vi >= 128) return;
+
+    uint kh = head_id % num_k_heads;
+    uint state_base = head_id * 128 * 128 + vi * 128;
+    uint qk_base = kh * 128;
+    uint v_base = head_id * 128;
+
+    float ls0 = state[state_base + tx * 4 + 0];
+    float ls1 = state[state_base + tx * 4 + 1];
+    float ls2 = state[state_base + tx * 4 + 2];
+    float ls3 = state[state_base + tx * 4 + 3];
+
+    float g = g_decay[head_id];
+    float beta = beta_gate[head_id];
+
+    float s_k = 0.0f;
+    ls0 *= g; s_k += ls0 * k[qk_base + tx * 4 + 0];
+    ls1 *= g; s_k += ls1 * k[qk_base + tx * 4 + 1];
+    ls2 *= g; s_k += ls2 * k[qk_base + tx * 4 + 2];
+    ls3 *= g; s_k += ls3 * k[qk_base + tx * 4 + 3];
+    s_k = simd_sum(s_k);
+
+    float d = (v[v_base + vi] - s_k) * beta;
+
+    float y = 0.0f;
+    float k0 = k[qk_base + tx * 4 + 0];
+    float k1 = k[qk_base + tx * 4 + 1];
+    float k2 = k[qk_base + tx * 4 + 2];
+    float k3 = k[qk_base + tx * 4 + 3];
+
+    ls0 += k0 * d; y += ls0 * q[qk_base + tx * 4 + 0];
+    ls1 += k1 * d; y += ls1 * q[qk_base + tx * 4 + 1];
+    ls2 += k2 * d; y += ls2 * q[qk_base + tx * 4 + 2];
+    ls3 += k3 * d; y += ls3 * q[qk_base + tx * 4 + 3];
+    y = simd_sum(y);
+
+    if (tx == 0) {
+        output[v_base + vi] = y * q_scale;
+    }
+
+    state[state_base + tx * 4 + 0] = ls0;
+    state[state_base + tx * 4 + 1] = ls1;
+    state[state_base + tx * 4 + 2] = ls2;
+    state[state_base + tx * 4 + 3] = ls3;
 }
 
 
@@ -504,6 +639,8 @@ kernel void rms_norm_qk(
         q_total = simd_sum(v);
     }
     threadgroup float q_broadcast;
+    if (tid == 0) q_broadcast = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) q_broadcast = q_total;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float q_inv_rms = rsqrt(q_broadcast / float(key_dim) + 1e-6f);
@@ -524,6 +661,8 @@ kernel void rms_norm_qk(
         k_total = simd_sum(v);
     }
     threadgroup float k_broadcast;
+    if (tid == 0) k_broadcast = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) k_broadcast = k_total;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float k_inv_rms = rsqrt(k_broadcast / float(key_dim) + 1e-6f);
@@ -590,6 +729,8 @@ kernel void gated_rms_norm(
     }
     // Broadcast to all simdgroups via threadgroup memory
     threadgroup float total_broadcast;
+    if (tid == 0) total_broadcast = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) total_broadcast = total;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float inv_rms = rsqrt(total_broadcast / float(value_dim) + eps);
@@ -1377,6 +1518,102 @@ kernel void dequant_matvec_q4k(
     }
 }
 
+kernel void dequant_matvec_q4k_llama(
+    device const uint8_t* data       [[buffer(0)]],
+    device const float*   x          [[buffer(1)]],
+    device float*         out        [[buffer(2)]],
+    constant uint&        out_dim    [[buffer(3)]],
+    constant uint&        in_dim     [[buffer(4)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short NSG = 2;
+    constexpr short NR0 = 2;
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short ix = short(tiisg / 8);
+    const short it = short(tiisg % 8);
+    const short iq = short(it / 4);
+    const short ir = short(it % 4);
+
+    const int nb = int(in_dim / 256);
+    const int first_row = int((tgpig.x * NSG + sgitg) * NR0);
+    if (first_row >= int(out_dim)) return;
+
+    const int row_count = min(int(NR0), int(out_dim) - first_row);
+    const uint row_bytes = uint(nb * 144);
+    device const float * y = x;
+
+    float yl[16];
+    float yh[16];
+    float sumf[NR0] = {0.f, 0.f};
+
+    device const float * y4 = y + ix * 256 + 64 * iq + 8 * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *) sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i + 0];   sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i + 32];  sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+
+        for (int row = 0; row < row_count; ++row) {
+            device const uint8_t * sb = data + uint(first_row + row) * row_bytes + uint(ib) * 144u;
+            device const uint16_t * sc = (device const uint16_t *) (sb + 4) + iq;
+            device const uint16_t * q1 = (device const uint16_t *) (sb + 16) + 16 * iq + 4 * ir;
+            device const half     * dh = (device const half *) sb;
+
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t * q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xF000);
+            }
+
+            sumf[row] += float(dh[0]) * (
+                (acc1[0] + (1.f / 256.f) * acc1[1]) * float(sc8[0]) +
+                (acc1[2] + (1.f / 256.f) * acc1[3]) * float(sc8[1]) * (1.f / 16.f) +
+                (acc2[0] + (1.f / 256.f) * acc2[1]) * float(sc8[4]) +
+                (acc2[2] + (1.f / 256.f) * acc2[3]) * float(sc8[5]) * (1.f / 16.f)) -
+                float(dh[1]) * (
+                    sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                    sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+        }
+
+        y4 += 4 * 256;
+    }
+
+    for (int row = 0; row < row_count; ++row) {
+        float total = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            out[first_row + row] = total;
+        }
+    }
+}
+
 // ============================================================================
 // GGUF Q8_0 dequant matvec
 //
@@ -1749,6 +1986,188 @@ kernel void dequant_matvec_q6k(
         if (valid1) out[row1] = sum1;
     }
 }
+
+// llama.cpp-style variants used only by the isolated dense-hybrid backend.
+kernel void dequant_matvec_q5k_llama(
+    device const uint8_t* data       [[buffer(0)]],
+    device const float*   x          [[buffer(1)]],
+    device float*         out        [[buffer(2)]],
+    constant uint&        out_dim    [[buffer(3)]],
+    constant uint&        in_dim     [[buffer(4)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short NSG = 2;
+    constexpr short NR0 = 1;
+
+    const int nb = int(in_dim / 256);
+    const int first_row = int((tgpig.x * NSG + sgitg) * NR0);
+    if (first_row >= int(out_dim)) return;
+
+    const uint row_bytes = uint(nb * 176);
+    device const uint8_t * row_data = data + uint(first_row) * row_bytes;
+
+    float sumf = 0.0f;
+    float yl[16], yh[16];
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short tid = short(tiisg / 4);
+    const short ix  = short(tiisg % 4);
+    const short iq  = short(tid / 4);
+    const short ir  = short(tid % 4);
+
+    const short l0 = short(8 * ir);
+    const short q_offset = short(32 * iq + l0);
+    const short y_offset = short(64 * iq + l0);
+
+    const uint8_t hm1 = uint8_t(1u << (2 * iq));
+    const uint8_t hm2 = uint8_t(hm1 << 1);
+    const uint8_t hm3 = uint8_t(hm1 << 4);
+    const uint8_t hm4 = uint8_t(hm2 << 4);
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *) sc16;
+
+    device const float * y1 = x + ix * 256 + y_offset;
+
+    for (int i = ix; i < nb; i += 4) {
+        device const uint8_t * sb = row_data + uint(i) * 176u;
+        device const uint8_t * q1 = sb + 48 + q_offset;
+        device const uint8_t * qh = sb + 16 + l0;
+        device const half    * dh = (device const half *) sb;
+        device const uint16_t * a = (device const uint16_t *) (sb + 4) + iq;
+
+        device const float * y2 = y1 + 128;
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (short l = 0; l < 8; ++l) {
+            yl[l + 0] = y1[l + 0];  sumy[0] += yl[l + 0];
+            yl[l + 8] = y1[l + 32]; sumy[1] += yl[l + 8];
+            yh[l + 0] = y2[l + 0];  sumy[2] += yh[l + 0];
+            yh[l + 8] = y2[l + 32]; sumy[3] += yh[l + 8];
+        }
+
+        sc16[0] = a[0] & kmask1;
+        sc16[1] = a[2] & kmask1;
+        sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+        sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+
+        device const uint8_t * q2 = q1 + 64;
+        float4 acc1 = {0.f};
+        float4 acc2 = {0.f};
+        for (short l = 0; l < 8; ++l) {
+            uint8_t h = qh[l];
+            acc1[0] += yl[l + 0] * float(q1[l] & 0x0F);
+            acc1[1] += yl[l + 8] * float(q1[l] & 0xF0);
+            acc1[2] += yh[l + 0] * float(q2[l] & 0x0F);
+            acc1[3] += yh[l + 8] * float(q2[l] & 0xF0);
+            acc2[0] += (h & hm1) ? yl[l + 0] : 0.f;
+            acc2[1] += (h & hm2) ? yl[l + 8] : 0.f;
+            acc2[2] += (h & hm3) ? yh[l + 0] : 0.f;
+            acc2[3] += (h & hm4) ? yh[l + 8] : 0.f;
+        }
+
+        sumf += float(dh[0]) * (
+                    float(sc8[0]) * (acc1[0]        + 16.f * acc2[0]) +
+                    float(sc8[1]) * (acc1[1] / 16.f + 16.f * acc2[1]) +
+                    float(sc8[4]) * (acc1[2]        + 16.f * acc2[2]) +
+                    float(sc8[5]) * (acc1[3] / 16.f + 16.f * acc2[3])) -
+                float(dh[1]) * (
+                    sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                    sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+
+        y1 += 4 * 256;
+    }
+
+    float total = simd_sum(sumf);
+    if (tiisg == 0) {
+        out[first_row] = total;
+    }
+}
+
+kernel void dequant_matvec_q6k_llama(
+    device const uint8_t* data       [[buffer(0)]],
+    device const float*   x          [[buffer(1)]],
+    device float*         out        [[buffer(2)]],
+    constant uint&        out_dim    [[buffer(3)]],
+    constant uint&        in_dim     [[buffer(4)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short NSG = 2;
+    constexpr short NR0 = 2;
+    constexpr uint8_t kmask1 = 0x03;
+    constexpr uint8_t kmask2 = 0x0C;
+    constexpr uint8_t kmask3 = 0x30;
+    constexpr uint8_t kmask4 = 0xC0;
+
+    const int nb = int(in_dim / 256);
+    const int first_row = int((tgpig.x * NSG + sgitg) * NR0);
+    if (first_row >= int(out_dim)) return;
+
+    const int row_count = min(int(NR0), int(out_dim) - first_row);
+    const uint row_bytes = uint(nb * 210);
+    const device float * yy = x;
+
+    float sumf[NR0] = {0.f, 0.f};
+    float yl[16];
+
+    const short tid = short(tiisg / 2);
+    const short ix  = short(tiisg % 2);
+    const short ip  = short(tid / 8);
+    const short il  = short(tid % 8);
+    const short l0  = short(4 * il);
+    const short is  = short(8 * ip + l0 / 16);
+
+    const short y_offset   = short(128 * ip + l0);
+    const short q_offset_l = short(64 * ip + l0);
+    const short q_offset_h = short(32 * ip + l0);
+
+    for (int i = ix; i < nb; i += 2) {
+        device const float * y = yy + i * 256 + y_offset;
+        for (short l = 0; l < 4; ++l) {
+            yl[4 * l + 0] = y[l + 0];
+            yl[4 * l + 1] = y[l + 32];
+            yl[4 * l + 2] = y[l + 64];
+            yl[4 * l + 3] = y[l + 96];
+        }
+
+        for (int row = 0; row < row_count; ++row) {
+            device const uint8_t * sb = data + uint(first_row + row) * row_bytes + uint(i) * 210u;
+            device const uint8_t * q1 = sb + q_offset_l;
+            device const uint8_t * q2 = q1 + 32;
+            device const uint8_t * qh = sb + 128 + q_offset_h;
+            device const int8_t  * sc = (device const int8_t *) (sb + 192) + is;
+            device const half    * dh = (device const half *) (sb + 208);
+
+            float4 sums = {0.f, 0.f, 0.f, 0.f};
+            for (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4 * l + 0] * float((int8_t)(((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32));
+                sums[1] += yl[4 * l + 1] * float((int8_t)(((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32));
+                sums[2] += yl[4 * l + 2] * float((int8_t)(((q1[l] >> 4)  | ((qh[l] & kmask3) << 0)) - 32));
+                sums[3] += yl[4 * l + 3] * float((int8_t)(((q2[l] >> 4)  | ((qh[l] & kmask4) >> 2)) - 32));
+            }
+
+            sumf[row] += float(dh[0]) * (
+                sums[0] * float(sc[0]) +
+                sums[1] * float(sc[2]) +
+                sums[2] * float(sc[4]) +
+                sums[3] * float(sc[6]));
+        }
+    }
+
+    for (int row = 0; row < row_count; ++row) {
+        float total = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            out[first_row + row] = total;
+        }
+    }
+}
+
 kernel void batch_expert_mv_q4k_dyn(
     device const uint8_t*       layer_data      [[buffer(0)]],
     device const float*         x               [[buffer(1)]],
@@ -2022,6 +2441,145 @@ kernel void shared_gate_up_swiglu_q8_0(
     if (simd_lane == 0) {
         float silu_gate = gate_sum / (1.0f + exp(-gate_sum));
         out[row] = silu_gate * up_sum;
+    }
+}
+
+// ============================================================================
+// Llama-style fused gate+up+swiglu Q4_K (register-only, no shared memory)
+// ============================================================================
+
+kernel void fused_gate_up_swiglu_q4k_llama(
+    device const uint8_t*       gate_data       [[buffer(0)]],
+    device const uint8_t*       up_data         [[buffer(1)]],
+    device const float*         x               [[buffer(2)]],
+    device float*               out             [[buffer(3)]],
+    constant uint&              out_dim         [[buffer(4)]],
+    constant uint&              in_dim          [[buffer(5)]],
+    uint3  tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
+) {
+    constexpr short NSG = 2;
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+
+    const short ix = short(tiisg / 8);
+    const short it = short(tiisg % 8);
+    const short iq = short(it / 4);
+    const short ir = short(it % 4);
+
+    const int nb = int(in_dim / 256);
+    const int row = int(tgpig.x * NSG + sgitg);
+    if (row >= int(out_dim)) return;
+
+    const uint row_bytes = uint(nb * 144);
+    device const float * y = x;
+
+    float yl[16];
+    float yh[16];
+    float gate_sum = 0.f;
+    float up_sum = 0.f;
+
+    device const float * y4 = y + ix * 256 + 64 * iq + 8 * ir;
+
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *) sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i + 0];   sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i + 32];  sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+
+        // Gate row
+        {
+            device const uint8_t * sb = gate_data + uint(row) * row_bytes + uint(ib) * 144u;
+            device const uint16_t * sc = (device const uint16_t *) (sb + 4) + iq;
+            device const uint16_t * q1 = (device const uint16_t *) (sb + 16) + 16 * iq + 4 * ir;
+            device const half     * dh = (device const half *) sb;
+
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t * q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xF000);
+            }
+
+            gate_sum += float(dh[0]) * (
+                (acc1[0] + (1.f / 256.f) * acc1[1]) * float(sc8[0]) +
+                (acc1[2] + (1.f / 256.f) * acc1[3]) * float(sc8[1]) * (1.f / 16.f) +
+                (acc2[0] + (1.f / 256.f) * acc2[1]) * float(sc8[4]) +
+                (acc2[2] + (1.f / 256.f) * acc2[3]) * float(sc8[5]) * (1.f / 16.f)) -
+                float(dh[1]) * (
+                    sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                    sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+        }
+
+        // Up row (reuse yl, yh, sumy)
+        {
+            device const uint8_t * sb = up_data + uint(row) * row_bytes + uint(ib) * 144u;
+            device const uint16_t * sc = (device const uint16_t *) (sb + 4) + iq;
+            device const uint16_t * q1 = (device const uint16_t *) (sb + 16) + 16 * iq + 4 * ir;
+            device const half     * dh = (device const half *) sb;
+
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+
+            device const uint16_t * q2 = q1 + 32;
+
+            float4 acc1 = {0.f, 0.f, 0.f, 0.f};
+            float4 acc2 = {0.f, 0.f, 0.f, 0.f};
+
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2 * i + 0] * float(q1[i] & 0x000F);
+                acc1[1] += yl[2 * i + 1] * float(q1[i] & 0x0F00);
+                acc1[2] += yl[2 * i + 8] * float(q1[i] & 0x00F0);
+                acc1[3] += yl[2 * i + 9] * float(q1[i] & 0xF000);
+                acc2[0] += yh[2 * i + 0] * float(q2[i] & 0x000F);
+                acc2[1] += yh[2 * i + 1] * float(q2[i] & 0x0F00);
+                acc2[2] += yh[2 * i + 8] * float(q2[i] & 0x00F0);
+                acc2[3] += yh[2 * i + 9] * float(q2[i] & 0xF000);
+            }
+
+            up_sum += float(dh[0]) * (
+                (acc1[0] + (1.f / 256.f) * acc1[1]) * float(sc8[0]) +
+                (acc1[2] + (1.f / 256.f) * acc1[3]) * float(sc8[1]) * (1.f / 16.f) +
+                (acc2[0] + (1.f / 256.f) * acc2[1]) * float(sc8[4]) +
+                (acc2[2] + (1.f / 256.f) * acc2[3]) * float(sc8[5]) * (1.f / 16.f)) -
+                float(dh[1]) * (
+                    sumy[0] * float(sc8[2]) + sumy[1] * float(sc8[3]) +
+                    sumy[2] * float(sc8[6]) + sumy[3] * float(sc8[7]));
+        }
+
+        y4 += 4 * 256;
+    }
+
+    float gate_total = simd_sum(gate_sum);
+    float up_total = simd_sum(up_sum);
+    if (tiisg == 0) {
+        float silu_gate = gate_total / (1.0f + exp(-gate_total));
+        out[row] = silu_gate * up_total;
     }
 }
 

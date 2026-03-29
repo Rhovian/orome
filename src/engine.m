@@ -11,6 +11,25 @@
 
 #include "orome.h"
 
+#ifndef ENGINE_LINEAR_DELTA_NET_DISPATCH
+#define ENGINE_LINEAR_DELTA_NET_DISPATCH(enc, ctx, cfg, linear_idx, total_key, n_v_heads, num_k_heads, key_dim, value_dim) do { \
+    float inv_s = 1.0f / sqrtf((float)(key_dim)); \
+    uint _num_k_heads = (uint)(num_k_heads); \
+    [enc setComputePipelineState:(ctx)->delta_net]; \
+    [enc setBuffer:(ctx)->buf_linear_state[(linear_idx)] offset:0 atIndex:0]; \
+    [enc setBuffer:(ctx)->buf_conv_output offset:0 atIndex:1]; \
+    [enc setBuffer:(ctx)->buf_conv_output offset:(total_key) * sizeof(float) atIndex:2]; \
+    [enc setBuffer:(ctx)->buf_conv_output offset:2 * (total_key) * sizeof(float) atIndex:3]; \
+    [enc setBuffer:(ctx)->buf_linear_decay offset:0 atIndex:4]; \
+    [enc setBuffer:(ctx)->buf_linear_beta offset:0 atIndex:5]; \
+    [enc setBuffer:(ctx)->buf_linear_v offset:0 atIndex:6]; \
+    [enc setBytes:&_num_k_heads length:sizeof(uint) atIndex:7]; \
+    [enc setBytes:&inv_s length:sizeof(float) atIndex:8]; \
+    [enc dispatchThreadgroups:MTLSizeMake((n_v_heads), 1, 1) \
+        threadsPerThreadgroup:MTLSizeMake((value_dim), 1, 1)]; \
+} while (0)
+#endif
+
 static void thermal_k_reset(ThermalKState *t) {
     t->proj_ema_ms = 0.0;
     t->generated = 0;
@@ -79,6 +98,21 @@ void engine_reset(Engine *eng) {
     // Reset profile accumulators
     t_attn_total = 0; t_ffn_total = 0; t_lmhead_total = 0;
     profile_count = 0;
+    // Reset linear attention state (delta-net recurrence + conv1d history)
+    MetalCtx *ctx = eng->ctx;
+    ModelConfig *cfg = eng->cfg;
+    int n_lin = cfg->num_linear_layers;
+    bool use_f32_state = model_uses_qwen35_dense_hybrid(cfg);
+    size_t delta_size = (size_t)cfg->linear_num_v_heads * cfg->linear_value_dim
+                        * cfg->linear_key_dim
+                        * (use_f32_state ? sizeof(float) : sizeof(uint16_t));
+    size_t conv_size = (size_t)(cfg->conv_kernel_size - 1) * cfg->linear_conv_dim * sizeof(float);
+    for (int i = 0; i < n_lin; i++) {
+        if (ctx->buf_linear_state[i])
+            memset([ctx->buf_linear_state[i] contents], 0, delta_size);
+        if (ctx->buf_conv_state[i])
+            memset([ctx->buf_conv_state[i] contents], 0, conv_size);
+    }
 }
 
 // ============================================================================
@@ -312,19 +346,13 @@ static void encode_dense_ffn(id<MTLComputeCommandEncoder> enc,
     int M = cfg->moe_intermediate;
 
     // Try fused gate+up+swiglu path (avoids intermediate buffers + 2 dispatches)
-    id<MTLComputePipelineState> fused_pipe = nil;
+    // Prefer llama-style register-only kernel when available (no shared memory)
     if (lt->dense_gate.format == QFMT_GGUF_Q4_K
-            && lt->dense_up.format == QFMT_GGUF_Q4_K) {
-        fused_pipe = ctx->shared_gate_up_swiglu_q4k;
-    } else if (lt->dense_gate.format == QFMT_GGUF_Q8_0
-                   && lt->dense_up.format == QFMT_GGUF_Q8_0) {
-        fused_pipe = ctx->shared_gate_up_swiglu_q8_0;
-    }
-
-    if (fused_pipe) {
+            && lt->dense_up.format == QFMT_GGUF_Q4_K
+            && ctx->fused_gate_up_swiglu_q4k_llama) {
         uint od = (uint)M, id_ = (uint)lt->dense_gate.in_dim;
-        NSUInteger num_tgs = (od + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
-        [enc setComputePipelineState:fused_pipe];
+        NSUInteger num_tgs = (od + 1) / 2;  // NSG=2, 1 row per simdgroup
+        [enc setComputePipelineState:ctx->fused_gate_up_swiglu_q4k_llama];
         [enc setBuffer:lt->dense_gate.buffer offset:lt->dense_gate.offset atIndex:0];
         [enc setBuffer:lt->dense_up.buffer offset:lt->dense_up.offset atIndex:1];
         [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
@@ -332,23 +360,47 @@ static void encode_dense_ffn(id<MTLComputeCommandEncoder> enc,
         [enc setBytes:&od length:sizeof(uint) atIndex:4];
         [enc setBytes:&id_ length:sizeof(uint) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(ENGINE_ROWS_PER_TG * 32, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(32, 2, 1)];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
     } else {
-        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_gate,
-            ctx->buf_input, 0, ctx->buf_shared_gate, 0);
-        format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_up,
-            ctx->buf_input, 0, ctx->buf_shared_up, 0);
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        id<MTLComputePipelineState> fused_pipe = nil;
+        if (lt->dense_gate.format == QFMT_GGUF_Q4_K
+                && lt->dense_up.format == QFMT_GGUF_Q4_K) {
+            fused_pipe = ctx->shared_gate_up_swiglu_q4k;
+        } else if (lt->dense_gate.format == QFMT_GGUF_Q8_0
+                       && lt->dense_up.format == QFMT_GGUF_Q8_0) {
+            fused_pipe = ctx->shared_gate_up_swiglu_q8_0;
+        }
 
-        [enc setComputePipelineState:ctx->swiglu];
-        [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
-        [enc setBuffer:ctx->buf_shared_up offset:0 atIndex:1];
-        [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:2];
-        { uint dim_val = (uint)M; [enc setBytes:&dim_val length:sizeof(uint) atIndex:3]; }
-        [enc dispatchThreadgroups:MTLSizeMake(((uint)M + 255) / 256, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        if (fused_pipe) {
+            uint od = (uint)M, id_ = (uint)lt->dense_gate.in_dim;
+            NSUInteger num_tgs = (od + ENGINE_ROWS_PER_TG - 1) / ENGINE_ROWS_PER_TG;
+            [enc setComputePipelineState:fused_pipe];
+            [enc setBuffer:lt->dense_gate.buffer offset:lt->dense_gate.offset atIndex:0];
+            [enc setBuffer:lt->dense_up.buffer offset:lt->dense_up.offset atIndex:1];
+            [enc setBuffer:ctx->buf_input offset:0 atIndex:2];
+            [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:3];
+            [enc setBytes:&od length:sizeof(uint) atIndex:4];
+            [enc setBytes:&id_ length:sizeof(uint) atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(ENGINE_ROWS_PER_TG * 32, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        } else {
+            format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_gate,
+                ctx->buf_input, 0, ctx->buf_shared_gate, 0);
+            format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_up,
+                ctx->buf_input, 0, ctx->buf_shared_up, 0);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            [enc setComputePipelineState:ctx->swiglu];
+            [enc setBuffer:ctx->buf_shared_gate offset:0 atIndex:0];
+            [enc setBuffer:ctx->buf_shared_up offset:0 atIndex:1];
+            [enc setBuffer:ctx->buf_shared_act offset:0 atIndex:2];
+            { uint dim_val = (uint)M; [enc setBytes:&dim_val length:sizeof(uint) atIndex:3]; }
+            [enc dispatchThreadgroups:MTLSizeMake(((uint)M + 255) / 256, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
     }
 
     format_dispatch_matvec(enc, ctx, (TensorRef *)&lt->dense_down,
@@ -400,6 +452,31 @@ int engine_step(Engine *eng, int token_id) {
     // Single command buffer for all layers — eliminates per-layer CB overhead
     id<MTLCommandBuffer> fwd_cmd = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> fwd_enc = [fwd_cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+
+#define DUMP_LAYER_STATS(layer_idx) do { \
+    if (eng->dump_hidden_stats) { \
+        [fwd_enc endEncoding]; \
+        [fwd_cmd commit]; \
+        [fwd_cmd waitUntilCompleted]; \
+        const float *_h = (const float *)[ctx->buf_moe_hidden contents]; \
+        float _max_abs = 0, _sum = 0, _sum_sq = 0; \
+        int _nan_count = 0; \
+        for (int _i = 0; _i < H; _i++) { \
+            float _v = _h[_i]; \
+            if (__builtin_isnan(_v) || __builtin_isinf(_v)) { _nan_count++; continue; } \
+            float _a = _v < 0 ? -_v : _v; \
+            if (_a > _max_abs) _max_abs = _a; \
+            _sum += _v; _sum_sq += _v * _v; \
+        } \
+        float _mean = _sum / H; \
+        float _std = sqrtf(_sum_sq / H - _mean * _mean); \
+        const char *_tn = cfg->layer_types[(layer_idx)] == ATTN_LINEAR ? "lin" : "full"; \
+        fprintf(stderr, "[dump] pos=%d layer=%d type=%s max=%.4g mean=%.4g std=%.4g nan=%d\n", \
+                pos, (layer_idx), _tn, _max_abs, _mean, _std, _nan_count); \
+        fwd_cmd = [ctx->queue commandBuffer]; \
+        fwd_enc = [fwd_cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]; \
+    } \
+} while(0)
 
     for (int layer = 0; layer < cfg->num_layers; layer++) {
         int n_experts = cfg->num_experts;
@@ -516,23 +593,13 @@ int engine_step(Engine *eng, int token_id) {
 
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            // --- Phase D+F: GatedDeltaNet with fused QK RMS norm ---
-            // QK norm is now computed inline within delta_net's shared memory loading.
-            // Q/K from buf_conv_output (raw, pre-norm), V at offset 2*total_key
-            { uint num_k_heads = (uint)cfg->linear_num_k_heads;
-              float inv_s = 1.0f / sqrtf((float)key_dim);
-            [enc setComputePipelineState:ctx->delta_net];
-            [enc setBuffer:ctx->buf_linear_state[linear_idx] offset:0 atIndex:0];
-            [enc setBuffer:ctx->buf_conv_output offset:0 atIndex:1];  // q (raw)
-            [enc setBuffer:ctx->buf_conv_output offset:total_key * sizeof(float) atIndex:2]; // k (raw)
-            [enc setBuffer:ctx->buf_conv_output offset:2 * total_key * sizeof(float) atIndex:3]; // v
-            [enc setBuffer:ctx->buf_linear_decay offset:0 atIndex:4];
-            [enc setBuffer:ctx->buf_linear_beta offset:0 atIndex:5];
-            [enc setBuffer:ctx->buf_linear_v offset:0 atIndex:6];  // output
-            [enc setBytes:&num_k_heads length:sizeof(uint) atIndex:7];
-            [enc setBytes:&inv_s length:sizeof(float) atIndex:8];
-            [enc dispatchThreadgroups:MTLSizeMake(n_v_heads, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(value_dim, 1, 1)]; }
+            // --- Phase D+F: GatedDeltaNet ---
+            // Shared path fuses QK RMS norm into delta_net; hybrid backends can
+            // override this dispatch to match a different runtime contract.
+            ENGINE_LINEAR_DELTA_NET_DISPATCH(enc, ctx, cfg, linear_idx,
+                                             total_key, n_v_heads,
+                                             cfg->linear_num_k_heads,
+                                             key_dim, value_dim);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             // --- Phase G: Gated RMS norm ---
@@ -633,6 +700,7 @@ int engine_step(Engine *eng, int token_id) {
                 t_attn_total += t1 - t0;
             }
 
+            DUMP_LAYER_STATS(layer);
             linear_idx++;
             continue;
         }
@@ -905,11 +973,13 @@ int engine_step(Engine *eng, int token_id) {
                 t_attn_total += t1 - t0;
             }
 
+            DUMP_LAYER_STATS(layer);
             full_idx++;
             continue;
         }
 
     }
+#undef DUMP_LAYER_STATS
 
     // Sync GPU + final norm + LM head
     t0 = now_ms();

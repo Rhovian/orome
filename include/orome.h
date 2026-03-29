@@ -107,6 +107,17 @@ typedef struct {
 // Compute derived fields and expert layouts from the core fields.
 void model_config_init_derived(ModelConfig *cfg);
 
+static inline bool model_uses_qwen35_dense_hybrid(const ModelConfig *cfg) {
+    if (!cfg) return false;
+    return cfg->ffn_type == FFN_DENSE &&
+           cfg->num_layers == 64 &&
+           cfg->hidden_dim == 5120 &&
+           cfg->num_full_attn_layers == 16 &&
+           cfg->num_linear_layers == 48 &&
+           cfg->linear_num_k_heads == 16 &&
+           cfg->linear_num_v_heads == 48;
+}
+
 // ============================================================================
 // Metal GPU context
 // ============================================================================
@@ -147,14 +158,18 @@ typedef struct {
     id<MTLComputePipelineState> matvec_f32;
     id<MTLComputePipelineState> matvec_f32_pair;
     id<MTLComputePipelineState> matvec_q4k;
+    id<MTLComputePipelineState> matvec_q4k_llama;
     id<MTLComputePipelineState> matvec_q5k;
+    id<MTLComputePipelineState> matvec_q5k_llama;
     id<MTLComputePipelineState> matvec_q8_0;
     id<MTLComputePipelineState> matvec_q8_0_singletile;
     id<MTLComputePipelineState> matvec_q6k;
+    id<MTLComputePipelineState> matvec_q6k_llama;
     id<MTLComputePipelineState> batch_expert_mv_q4k_dyn;
     id<MTLComputePipelineState> batch_expert_gate_up_swiglu_q4k_dyn;
     id<MTLComputePipelineState> shared_gate_up_swiglu_q4k;
     id<MTLComputePipelineState> shared_gate_up_swiglu_q8_0;
+    id<MTLComputePipelineState> fused_gate_up_swiglu_q4k_llama;
     id<MTLComputePipelineState> batch_expert_down_q4k_dyn;
     id<MTLComputePipelineState> batch_expert_down_q5k_dyn;
 
@@ -346,6 +361,9 @@ typedef struct {
     // GGUF format support
     GGUFFile *gf;
     ExpertLayerRef *expert_layer_cache;  // [num_layers], pre-resolved from FormatProvider
+
+    // Debug: per-layer hidden state stats dump
+    bool dump_hidden_stats;
 } Engine;
 
 Engine *engine_create(ModelConfig *cfg, MetalCtx *ctx, int active_experts);
@@ -354,6 +372,7 @@ void    engine_reset(Engine *eng);  // clear caches, reset pos
 
 // Run one token through the model. Returns the next token ID.
 int engine_step(Engine *eng, int token_id);
+int engine_step_qwen35_dense_hybrid(Engine *eng, int token_id);
 
 // ============================================================================
 // Tokenizer

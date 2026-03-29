@@ -1,15 +1,61 @@
 {
   "model": "/Users/j/Code/lllm/models/Qwen3.5-27B-Q4_K_M.gguf",
   "prompt": "Hello",
-  "min_tok_sec": 9.0,
+  "min_tok_sec": 17.5,
   "tokens": 5,
   "k": 0,
   "description": "27B dense GGUF smoke regression check",
   "quality_check": true,
   "quality_system": "",
-  "quality_prompt": "Hello",
-  "quality_must_contain": [],
-  "quality_max_tokens": 64,
-  "quality_temperature": 0.2,
-  "quality_timeout_sec": 30.0
+  "quality_cases": [
+    {
+      "name": "capital",
+      "prompt": "The capital of France is",
+      "must_contain": ["paris"],
+      "tokens": 8,
+      "temperature": 0.2
+    },
+    {
+      "name": "opposite",
+      "prompt": "The opposite of hot is",
+      "must_contain": ["cold"],
+      "tokens": 8,
+      "temperature": 0.2
+    },
+    {
+      "name": "sky",
+      "prompt": "The sky is",
+      "must_contain": ["blue"],
+      "tokens": 16,
+      "temperature": 0.2
+    }
+  ],
+  "quality_timeout_sec": 30.0,
+  "quality_runs": 1,
+  "quality_min_passes": 1,
+  "quality_case_min_passes": 2,
+  "llama_compare": {
+    "enabled": true,
+    "model_alias": "27B",
+    "repo": "/Users/j/Code/lllm/llama.cpp",
+    "source_hints": [
+      "src/models/qwen35.cpp",
+      "src/models/delta-net-base.cpp",
+      "src/llama-context.cpp",
+      "ggml/src/ggml-metal/ggml-metal.metal",
+      "ggml/src/ggml-metal/ggml-metal-device.cpp"
+    ],
+    "throughput": {
+      "tokens": 100,
+      "trials": 3,
+      "warmup_runs": 0,
+      "cooldown_sec": 0.0,
+      "min_ratio_orome_over_llama": 1.0
+    },
+    "quality": {
+      "runs": 3,
+      "min_orome_passes": 2,
+      "min_runs_passing": 2
+    }
+  }
 }

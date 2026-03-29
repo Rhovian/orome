@@ -69,6 +69,12 @@ static void utf8_buf_flush(Utf8Buf *u) {
     u->len = 0;
 }
 
+static inline int model_step(Engine *eng, int token_id) {
+    return model_uses_qwen35_dense_hybrid(eng->cfg)
+        ? engine_step_qwen35_dense_hybrid(eng, token_id)
+        : engine_step(eng, token_id);
+}
+
 static void add_unique_token(int *tokens, int max_tokens, int *count, int token_id) {
     if (!tokens || !count || token_id < 0 || *count >= max_tokens) return;
     for (int i = 0; i < *count; i++) {
@@ -377,10 +383,12 @@ int main(int argc, char **argv) {
             {"timing",  no_argument,       0, 'T'},
             {"gguf-info", no_argument,     0, 'I'},
             {"layers",   required_argument, 0, 'L'},
+            {"dump-stats", no_argument,    0, 'D'},
             {"help",    no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
         int gguf_info = 0;
+        int dump_stats = 0;
 
         int c;
         while ((c = getopt_long(argc, argv, "m:p:t:k:K:P:G:S:TI:L:h", long_options, NULL)) != -1) {
@@ -396,6 +404,7 @@ int main(int argc, char **argv) {
                 case 'S': serve_port = atoi(optarg); break;
                 case 'T': timing = 1; break;
                 case 'I': gguf_info = 1; break;
+                case 'D': dump_stats = 1; break;
 
                 case 'h': print_usage(argv[0]); return 0;
                 default:  print_usage(argv[0]); return 1;
@@ -658,6 +667,7 @@ int main(int argc, char **argv) {
             eng = engine_create(&cfg, ctx,
                                 active_k > 0 ? active_k : 0);
             eng->gf = gf;
+            eng->dump_hidden_stats = dump_stats;
 
             // Build format-agnostic tensor cache from GGUF
             eng->tensor_cache = build_tensor_cache_gguf(gf, fp->model_buf,
@@ -733,7 +743,7 @@ int main(int argc, char **argv) {
             double t_start = now_ms();
             int next_token = 0;
             for (int i = 0; i < pt->count; i++) {
-                next_token = engine_step(eng, pt->ids[i]);
+                next_token = model_step(eng, pt->ids[i]);
             }
             double ttft = now_ms() - t_start;
             printf("TTFT: %.1f ms\n", ttft);
@@ -750,7 +760,7 @@ int main(int argc, char **argv) {
                 fflush(stdout);
 
                 double tok_start = timing ? now_ms() : 0;
-                next_token = engine_step(eng, next_token);
+                next_token = model_step(eng, next_token);
                 generated++;
 
                 if (timing) {

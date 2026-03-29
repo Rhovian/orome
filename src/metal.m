@@ -96,6 +96,8 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     }
 
     // Create pipelines
+    bool use_hybrid_llama_delta = model_uses_qwen35_dense_hybrid(cfg);
+
     ctx->norm_sum_sq      = make_pipeline(ctx, @"rms_norm_sum_sq");
     ctx->norm_apply       = make_pipeline(ctx, @"rms_norm_apply_bf16");
     ctx->attn_scores      = make_pipeline(ctx, @"attn_scores_batched");
@@ -103,8 +105,10 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->attn_values      = make_pipeline(ctx, @"attn_values_batched");
     ctx->sigmoid_gate     = make_pipeline(ctx, @"sigmoid_gate");
     ctx->swiglu           = make_pipeline(ctx, @"swiglu_fused");
-    ctx->delta_net        = make_pipeline(ctx, @"gated_delta_net_step");
-    ctx->rms_norm_qk      = make_pipeline(ctx, @"rms_norm_qk");
+    ctx->delta_net        = make_pipeline(ctx,
+        use_hybrid_llama_delta ? @"gated_delta_net_step_llama_f32" : @"gated_delta_net_step");
+    ctx->rms_norm_qk      = make_pipeline(ctx,
+        use_hybrid_llama_delta ? @"l2_norm_qk_unit" : @"rms_norm_qk");
     ctx->gated_rms_norm   = make_pipeline(ctx, @"gated_rms_norm");
     ctx->batch_swiglu     = make_pipeline(ctx, @"batch_swiglu");
     ctx->rms_norm_qk_w    = make_pipeline(ctx, @"rms_norm_qk_weighted");
@@ -127,14 +131,18 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->batch_expert_gate_up_swiglu_q4k_dyn = make_pipeline(ctx, @"batch_expert_gate_up_swiglu_q4k_dyn");
     ctx->shared_gate_up_swiglu_q4k = make_pipeline(ctx, @"shared_gate_up_swiglu_q4k");
     ctx->shared_gate_up_swiglu_q8_0 = make_pipeline(ctx, @"shared_gate_up_swiglu_q8_0");
+    ctx->fused_gate_up_swiglu_q4k_llama = make_pipeline(ctx, @"fused_gate_up_swiglu_q4k_llama");
     ctx->batch_expert_down_q4k_dyn = make_pipeline(ctx, @"batch_expert_down_q4k_dyn");
     ctx->batch_expert_down_q5k_dyn = make_pipeline(ctx, @"batch_expert_down_q5k_dyn");
     ctx->conv1d_f32 = make_pipeline(ctx, @"conv1d_step_f32");
     ctx->decay_beta_f32 = make_pipeline(ctx, @"compute_decay_beta_f32");
     ctx->matvec_f32 = make_pipeline(ctx, @"matvec_f32");
     ctx->matvec_f32_pair = make_pipeline(ctx, @"matvec_f32_pair");
+    ctx->matvec_q4k_llama = make_pipeline(ctx, @"dequant_matvec_q4k_llama");
     ctx->matvec_q5k = make_pipeline(ctx, @"dequant_matvec_q5k");
+    ctx->matvec_q5k_llama = make_pipeline(ctx, @"dequant_matvec_q5k_llama");
     ctx->matvec_q6k = make_pipeline(ctx, @"dequant_matvec_q6k");
+    ctx->matvec_q6k_llama = make_pipeline(ctx, @"dequant_matvec_q6k_llama");
 
     if (!ctx->matvec_q4k || !ctx->norm_sum_sq || !ctx->norm_apply) {
         fprintf(stderr, "ERROR: Required Metal pipelines missing\n");
@@ -182,7 +190,8 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     ctx->buf_linear_state = (__strong id<MTLBuffer> *)calloc(n_lin, sizeof(id<MTLBuffer>));
     ctx->buf_conv_state = (__strong id<MTLBuffer> *)calloc(n_lin, sizeof(id<MTLBuffer>));
     size_t delta_size = (size_t)cfg->linear_num_v_heads * cfg->linear_value_dim
-                        * cfg->linear_key_dim * sizeof(uint16_t);  // half state
+                        * cfg->linear_key_dim
+                        * (use_hybrid_llama_delta ? sizeof(float) : sizeof(uint16_t));
     size_t conv_size = (size_t)(cfg->conv_kernel_size - 1) * cfg->linear_conv_dim * sizeof(float);
     for (int i = 0; i < n_lin; i++) {
         ctx->buf_linear_state[i] = [ctx->device newBufferWithLength:delta_size
