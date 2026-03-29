@@ -66,6 +66,18 @@ This means the optimization priority is now:
 2. Improve repeated quality behavior on the semantic suite
 3. Only then chase additional tok/s
 
+For the next batch of work, be explicit about what NOT to do:
+
+- Do not spend sessions broadly expanding `Q4_K` coverage just because earlier wins came from that line of work.
+- Do not treat “more llama-style quant kernels” as a default hypothesis.
+- Only touch `Q4_K` kernel coverage if the hypothesis is directly tied to reducing think leakage, punctuation collapse, or quality variance.
+
+The preferred hypothesis classes right now are:
+
+1. suppress raw `<think>` leakage in Orome outputs
+2. reduce punctuation-collapse / repeated-`!` variance
+3. preserve the current `~17.8 tok/s` band and local `llama.cpp` lead while improving repeated quality
+
 ## Local llama.cpp Reference
 
 Use the local reference repo at:
@@ -104,6 +116,7 @@ Important rules for this dense campaign:
 - Keep logic generic and driven by `ModelConfig` + GGUF metadata.
 - Do not reintroduce hardcoded 27B-shaped tensor assumptions into shared paths.
 - Dense-path wins must preserve 9B dense correctness and 35B MoE performance.
+- For this phase, prefer hypotheses about output behavior and runtime semantics over broader quant-kernel enablement.
 
 ## What You CAN Modify
 
@@ -133,6 +146,10 @@ Each experiment must be atomic.
 
 1. Re-benchmark current HEAD if the baseline is unclear.
 2. State one concrete hypothesis.
+   The hypothesis should directly target one of:
+   - raw `<think>` leakage
+   - punctuation collapse / repeated-character spam
+   - quality variance between repeated runs
 3. Modify only the files required for that idea.
 4. Build with:
 
