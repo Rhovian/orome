@@ -1,18 +1,18 @@
 # Build artifacts
 orome
 packed_experts
-src/*.o
-src/*.air
-src/*.metallib
+inference/src/*.o
+inference/src/*.air
+inference/src/*.metallib
 *.dSYM/
 
 # Experiment state (not committed — each session appends)
-experiments/*/results.tsv
-experiments/*/status.md
-experiments/*/logs/
-experiments/*/errors.log
-experiments/*/bench_err.txt
-experiments/*/*.txt
+inference/experiments/*/results.tsv
+inference/experiments/*/status.md
+inference/experiments/*/logs/
+inference/experiments/*/errors.log
+inference/experiments/*/bench_err.txt
+inference/experiments/*/*.txt
 *.log
 
 # Model weights (too large for git)
