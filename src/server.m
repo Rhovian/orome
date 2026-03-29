@@ -190,12 +190,9 @@ static bool append_generation_prefix(PromptBuilder *pb, const ModelConfig *cfg) 
     }
     if (!prompt_builder_append_text(pb, "assistant\n")) return false;
     if (cfg->chat_prefill_think &&
-        cfg->think_start_token >= 0 &&
-        cfg->think_end_token >= 0) {
+        cfg->think_start_token >= 0) {
         if (!prompt_builder_append_token(pb, cfg->think_start_token)) return false;
-        if (!prompt_builder_append_text(pb, "\n\n")) return false;
-        if (!prompt_builder_append_token(pb, cfg->think_end_token)) return false;
-        if (!prompt_builder_append_text(pb, "\n\n")) return false;
+        if (!prompt_builder_append_text(pb, "\n")) return false;
     }
     return true;
 }

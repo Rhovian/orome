@@ -98,6 +98,21 @@ void engine_reset(Engine *eng) {
     // Reset profile accumulators
     t_attn_total = 0; t_ffn_total = 0; t_lmhead_total = 0;
     profile_count = 0;
+    // Reset linear attention state (delta-net recurrence + conv1d history)
+    MetalCtx *ctx = eng->ctx;
+    ModelConfig *cfg = eng->cfg;
+    int n_lin = cfg->num_linear_layers;
+    bool use_f32_state = model_uses_qwen35_dense_hybrid(cfg);
+    size_t delta_size = (size_t)cfg->linear_num_v_heads * cfg->linear_value_dim
+                        * cfg->linear_key_dim
+                        * (use_f32_state ? sizeof(float) : sizeof(uint16_t));
+    size_t conv_size = (size_t)(cfg->conv_kernel_size - 1) * cfg->linear_conv_dim * sizeof(float);
+    for (int i = 0; i < n_lin; i++) {
+        if (ctx->buf_linear_state[i])
+            memset([ctx->buf_linear_state[i] contents], 0, delta_size);
+        if (ctx->buf_conv_state[i])
+            memset([ctx->buf_conv_state[i] contents], 0, conv_size);
+    }
 }
 
 // ============================================================================

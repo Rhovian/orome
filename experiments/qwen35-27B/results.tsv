@@ -13,3 +13,6 @@ f4f5815	9.73	1762.0	0.0	keep	skip copy+norm for dense layers (reuse residual_add
 979f235	13.06	1852.0	0.0	keep	enable llama Q4K kernel for lm_head + attn O-proj (fix mask bug + enable OTHER|FULL_O|LINEAR_O)
 83ad18a	17.27	1793.0	0.0	keep	llama-style fused gate+up+swiglu Q4K kernel (register-only, no shared memory)
 9a136c0	17.80	1820.0	0.0	keep	enable FULL_Q for llama Q4K dispatch (gated Q projection, 16 full-attn layers)
+9a136c0	17.45	1898.0	0.0	baseline	session baseline re-measurement (quality 2/3)
+9a136c0	18.61	1870.0	0.0	discard	enable LINEAR_Z for llama Q4K (catastrophic punctuation collapse, 0/3 quality)
+9a136c0	17.56	1908.0	0.0	discard	numerically stable softplus in decay_beta (no quality improvement, 2/3)

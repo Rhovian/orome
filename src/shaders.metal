@@ -103,6 +103,7 @@ kernel void residual_add_sum_sq(
     float val = 0.0f;
     if (tid < dim) {
         val = a[tid] + b[tid];
+        val = clamp(val, -65504.0f, 65504.0f);
         out[tid] = val;
     }
 

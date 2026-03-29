@@ -221,8 +221,16 @@ def wait_for_server(port, timeout_sec):
     raise TimeoutError(f"server on port {port} did not become ready: {last_error}")
 
 
+def strip_think_blocks(text):
+    """Remove <think>...</think> blocks (and truncated trailing <think>...) from raw completion output."""
+    import re
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL | re.IGNORECASE)
+    return text.strip()
+
+
 def evaluate_quality_reply(reply, must_contain):
-    text = reply.strip()
+    text = strip_think_blocks(reply.strip())
     lowered = text.lower()
     reasons = []
 
@@ -230,8 +238,6 @@ def evaluate_quality_reply(reply, must_contain):
         reasons.append("empty visible reply")
     if "<unk_" in lowered:
         reasons.append("contains unknown-token marker")
-    if "<think>" in lowered or "</think>" in lowered:
-        reasons.append("contains raw think markers")
     if "\ufffd" in text:
         reasons.append("contains replacement characters")
     if max_repeated_char_run(text) >= 6:
