@@ -30,11 +30,28 @@ This is the single chokepoint where the hidden state is written after every
 layer. Verified: 0 NaN across 500+ conversations. This is a band-aid — it
 silently truncates values that overflow, which may subtly affect output quality.
 
+### Per-layer dump findings
+A `--dump-stats` mode was added that flushes GPU after each layer and logs
+max/mean/std of `buf_moe_hidden`. One run showed:
+- pos=0: all 64 layers clean, max values grow naturally (18 → 145)
+- pos=1, layers 0-47: clean, max values in normal range (~64)
+- pos=1, layer 48: instant all-NaN (5120/5120 elements)
+
+This shows the NaN is NOT gradual accumulation — it's a single-layer single-step
+failure. Layer 47's output is reasonable (max=64), layer 48 produces total NaN.
+However, the bug is intermittent: a second run with the same prompt showed zero
+NaN. The dump mode cannot reliably capture the failure state.
+
 ### What's needed to find the true root cause
-Numerical comparison: feed identical token sequences to both orome and llama.cpp,
-dump intermediate values at each stage of a linear attention layer, and find the
-first point where values diverge significantly. The divergence must exist since
-llama.cpp handles it fine while orome overflows.
+The NaN originates from a single computation step within one linear attention
+layer, from clean inputs. llama.cpp processes the same model without overflow.
+The exact numerical divergence between the two engines has not been identified.
+Possible next steps:
+- Compare dequantized weight values between orome and llama.cpp for a specific
+  layer to verify they match
+- Add in-kernel NaN detection (immune to timing changes) that logs which specific
+  sub-operation (conv1d, QK norm, decay, delta-net step, gated RMS norm, O-proj)
+  first produces NaN within the failing layer
 
 ### Exhaustively ruled out as root cause
 - GPU concurrency / memory barriers (MTLDispatchTypeSerial still crashes)

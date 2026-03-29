@@ -361,6 +361,9 @@ typedef struct {
     // GGUF format support
     GGUFFile *gf;
     ExpertLayerRef *expert_layer_cache;  // [num_layers], pre-resolved from FormatProvider
+
+    // Debug: per-layer hidden state stats dump
+    bool dump_hidden_stats;
 } Engine;
 
 Engine *engine_create(ModelConfig *cfg, MetalCtx *ctx, int active_experts);

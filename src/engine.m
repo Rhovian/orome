@@ -453,6 +453,31 @@ int engine_step(Engine *eng, int token_id) {
     id<MTLCommandBuffer> fwd_cmd = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> fwd_enc = [fwd_cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
 
+#define DUMP_LAYER_STATS(layer_idx) do { \
+    if (eng->dump_hidden_stats) { \
+        [fwd_enc endEncoding]; \
+        [fwd_cmd commit]; \
+        [fwd_cmd waitUntilCompleted]; \
+        const float *_h = (const float *)[ctx->buf_moe_hidden contents]; \
+        float _max_abs = 0, _sum = 0, _sum_sq = 0; \
+        int _nan_count = 0; \
+        for (int _i = 0; _i < H; _i++) { \
+            float _v = _h[_i]; \
+            if (__builtin_isnan(_v) || __builtin_isinf(_v)) { _nan_count++; continue; } \
+            float _a = _v < 0 ? -_v : _v; \
+            if (_a > _max_abs) _max_abs = _a; \
+            _sum += _v; _sum_sq += _v * _v; \
+        } \
+        float _mean = _sum / H; \
+        float _std = sqrtf(_sum_sq / H - _mean * _mean); \
+        const char *_tn = cfg->layer_types[(layer_idx)] == ATTN_LINEAR ? "lin" : "full"; \
+        fprintf(stderr, "[dump] pos=%d layer=%d type=%s max=%.4g mean=%.4g std=%.4g nan=%d\n", \
+                pos, (layer_idx), _tn, _max_abs, _mean, _std, _nan_count); \
+        fwd_cmd = [ctx->queue commandBuffer]; \
+        fwd_enc = [fwd_cmd computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent]; \
+    } \
+} while(0)
+
     for (int layer = 0; layer < cfg->num_layers; layer++) {
         int n_experts = cfg->num_experts;
         int effective_k = thermal_k_effective(&eng->thermal, eng->active_experts);
@@ -675,6 +700,7 @@ int engine_step(Engine *eng, int token_id) {
                 t_attn_total += t1 - t0;
             }
 
+            DUMP_LAYER_STATS(layer);
             linear_idx++;
             continue;
         }
@@ -947,11 +973,13 @@ int engine_step(Engine *eng, int token_id) {
                 t_attn_total += t1 - t0;
             }
 
+            DUMP_LAYER_STATS(layer);
             full_idx++;
             continue;
         }
 
     }
+#undef DUMP_LAYER_STATS
 
     // Sync GPU + final norm + LM head
     t0 = now_ms();
