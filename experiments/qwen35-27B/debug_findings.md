@@ -1,135 +1,42 @@
-# Qwen3.5-27B Quality Bug Investigation — 2026-03-29
+# 27B NaN Overflow — Open Investigation
 
-## Bug 1: NaN Collapse (repeated character spam)
+## Problem
+Orome intermittently produces NaN in the hidden state during inference on
+Qwen3.5-27B-Q4_K_M.gguf. This causes repeated `!` character output (token 0).
+llama.cpp does NOT overflow on the same model and weights.
 
-### Symptom
-Model intermittently produces repeated `!` characters (token ID 0) during chat.
-The entire logit buffer becomes NaN, causing `cpu_sample_topk` to return token 0
-by default (first index wins when all values are below the -1e30 sentinel).
+## What we know
+- NaN originates in **linear attention (delta-net) layers**, in the attention
+  output, not FFN
+- It's a **single-step catastrophic failure** — not gradual accumulation. One
+  layer's output jumps from clean (max ~64) to all-NaN instantly
+- The failing layer varies per run (observed: 0, 17, 20, 26, 33, 42, 48, 50,
+  52, 54, 58). Always a linear attention layer
+- Occurs between positions 30-544, typically within one conversation
+- In-kernel detection shows the delta-net output and state go bad at the same
+  head simultaneously (usually head 32, mapping to k-head 0)
+- The bug is intermittent and input-dependent
 
-### Root Cause (narrowed)
-Numerical overflow in **linear attention (delta-net) layer intermediates**
-propagates through the residual stream. The NaN originates in the
-ATTN-RESIDUAL-ADD phase of a linear attention layer (observed across many
-different layers: 0, 17, 20, 26, 33, 42, 48, 50, 52, 54, 58 — varies per run).
-The overflow is input-dependent and occurs within a single conversation,
-typically between positions 30-420.
+## What we ruled out
+GPU concurrency, `-ffast-math`, think prefill mode, llama vs standard Q4K
+kernels, delta-net state clamping, SwiGLU/gated-RMS-norm output clamping,
+softplus decay floor, bad GGUF weights, cross-conversation state leakage,
+buffer sizes, tensor layouts, conv1d weight order, tensor types, Q scaling
+placement, decay computation math.
 
-**Critical finding: llama.cpp does NOT overflow on the same model/weights.**
-265+ requests with zero NaN on the same Qwen3.5-27B-Q4_K_M.gguf. This confirms
-the bug is in orome's computation, not the model or quantization. The exact
-numerical divergence between the two engines has not yet been identified — the
-math appears identical on paper.
+## Current mitigation
+Clamp at ±65504 in `residual_add_sum_sq` (the hidden state chokepoint after
+every layer). Verified: 0 collapses across 500+ stress test conversations,
+no throughput or quality impact.
 
-### Mitigation (verified)
-Clamp `buf_moe_hidden` at ±65504 in `residual_add_sum_sq` (shaders.metal):
-```metal
-val = clamp(val, -65504.0f, 65504.0f);
-```
-This is the single chokepoint where the hidden state is written after every
-layer. Verified: 0 NaN across 500+ conversations. This is a band-aid — it
-silently truncates values that overflow, which may subtly affect output quality.
+## Next steps to find root cause
+- Numerical dump comparison: feed identical tokens to orome and llama.cpp, dump
+  per-layer hidden states, find first point of divergence
+- The math appears identical on paper but values must diverge somewhere since
+  llama.cpp handles the same model without overflow
 
-### Per-layer dump findings
-A `--dump-stats` mode was added that flushes GPU after each layer and logs
-max/mean/std of `buf_moe_hidden`. One run showed:
-- pos=0: all 64 layers clean, max values grow naturally (18 → 145)
-- pos=1, layers 0-47: clean, max values in normal range (~64)
-- pos=1, layer 48: instant all-NaN (5120/5120 elements)
-
-This shows the NaN is NOT gradual accumulation — it's a single-layer single-step
-failure. Layer 47's output is reasonable (max=64), layer 48 produces total NaN.
-However, the bug is intermittent: a second run with the same prompt showed zero
-NaN. The dump mode cannot reliably capture the failure state.
-
-### What's needed to find the true root cause
-The NaN originates from a single computation step within one linear attention
-layer, from clean inputs. llama.cpp processes the same model without overflow.
-The exact numerical divergence between the two engines has not been identified.
-Possible next steps:
-- Compare dequantized weight values between orome and llama.cpp for a specific
-  layer to verify they match
-- Add in-kernel NaN detection (immune to timing changes) that logs which specific
-  sub-operation (conv1d, QK norm, decay, delta-net step, gated RMS norm, O-proj)
-  first produces NaN within the failing layer
-
-### Exhaustively ruled out as root cause
-- GPU concurrency / memory barriers (MTLDispatchTypeSerial still crashes)
-- `-ffast-math` shader flag (removed, still crashes)
-- Think prefill mode (enabled open `<think>`, still crashes)
-- llama-style Q4K kernel (OROME_HYBRID_Q4=none still crashes)
-- Standard orome Q4K kernel (same result)
-- Delta-net state accumulation / clamping (state clamp at 1e6 didn't fix)
-- SwiGLU output overflow (clamped all SwiGLU, still crashes)
-- Gated RMS norm output overflow (clamped, still crashes)
-- softplus decay floor (ensured g < 1, still crashes)
-- Bad GGUF weights (scanned layer 63 gate/up/down blocks, zero bad)
-- Cross-conversation state leakage (fixed state reset, still crashes within one conversation)
-- Buffer sizes (all verified against llama.cpp dimensions)
-- Tensor layouts / conv1d weight order (verified matches llama.cpp)
-- Tensor types (F32 vs BF16 verified correct for each tensor)
-- Q scaling placement (verified: both L2-norm then post-scale output)
-- Decay computation (exp(ssm_a * softplus(alpha + dt_bias)) — identical)
-
-### Key debugging insights
-
-1. **`-ffast-math` breaks `isnan()` in Metal shaders.** Our GPU NaN check kernel
-   used `isnan()` which was silently optimized away. This led us to incorrectly
-   blame layer 63 (full attention) for hours when the real source was earlier
-   linear attention layers. Fix: bit-level NaN check:
-   `(bits & 0x7F800000) == 0x7F800000 && (bits & 0x007FFFFF) != 0`
-
-2. **`engine_reset` was not clearing linear attention state.** The delta-net
-   recurrence state and conv1d history persisted across requests. Fixed by adding
-   memset of `buf_linear_state` and `buf_conv_state` in `engine_reset`. This is a
-   correctness fix independent of the overflow bug.
-
-3. **The residual add is the single chokepoint.** Every layer writes its output
-   through `residual_add_sum_sq` into `buf_moe_hidden`. Clamping here catches
-   overflow from any source — delta-net state, gated RMS norm, SwiGLU, O-proj —
-   without needing to identify which specific kernel overflows.
-
----
-
-## Bug 2: Think-Token Loop (empty response)
-
-### Symptom
-Model produces empty visible response. Server generates `</think>\n\n` in an
-infinite loop, never producing actual content. The SSE think-token filter strips
-all of this, resulting in an empty stream to the client.
-
-### Status
-Not yet investigated. Observed during stress testing. Low frequency (~1 in 200).
-Separate from the NaN bug — no NaN present in these occurrences.
-
----
-
-## Bug 3: Quality Gate Blind Spots (original issue)
-
-### Fix Applied
-`benchmark.py` — `strip_think_blocks()` function removes `<think>...</think>`
-and truncated `<think>...` blocks from raw completion output before quality
-evaluation. The "contains raw think markers" penalty was removed. This fixes
-both the benchmark quality gate and the comparison tool (which imports
-`evaluate_quality_reply`).
-
----
-
-## Changes Made
-
-### Production fixes:
-- `src/shaders.metal` — residual_add_sum_sq clamp at ±65504
-- `src/shaders.metal` — nan_check_kernel with bit-level NaN detection
-- `src/engine.m` — engine_reset clears linear attention state and conv1d state
-- `src/server.m` — generation prefix opens `<think>` tag instead of closed block
-- `include/orome.h` — buf_nan_flag buffer and nan_check pipeline on MetalCtx
-- `src/metal.m` — buf_nan_flag allocation and nan_check pipeline creation
-- `tools/benchmark.py` — strip_think_blocks, fixed evaluate_quality_reply
-- `tools/stress_chat.py` — new stress test tool for chat quality
-
-### Debug instrumentation (to clean up before commit):
-- `src/engine.m` — DISPATCH_NAN_CHECK macro, per-phase NaN checks (markers
-  1000+ O-proj, 2000+ SwiGLU, 3000+ down-proj, 5000+ FFN-input, 7000+
-  attn-residual), weight scan on first step, nan-probe/emb-nan logging
-- `src/server.m` — sample_next_debug, debug_log_top5, debug_sampling flag,
-  per-token debug logging, NaN-after-model_step check
+## Key debugging notes
+- `-ffast-math` breaks `isnan()` in Metal shaders. Use bit-level check:
+  `(bits & 0x7F800000) == 0x7F800000 && (bits & 0x007FFFFF) != 0`
+- `--dump-stats` mode serializes GPU execution per-layer which can mask the bug
+- In-kernel NaN checks (bit-level, atomic flags) work without altering timing
