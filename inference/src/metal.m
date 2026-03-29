@@ -59,7 +59,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     NSError *error = nil;
     double t0 = now_ms();
 
-    NSString *metallib_path = @"src/shaders.metallib";
+    NSString *metallib_path = @"inference/src/shaders.metallib";
     if ([[NSFileManager defaultManager] fileExistsAtPath:metallib_path]) {
         NSURL *url = [NSURL fileURLWithPath:metallib_path];
         ctx->library = [ctx->device newLibraryWithURL:url error:&error];
@@ -72,7 +72,7 @@ MetalCtx *metal_setup(const ModelConfig *cfg) {
     }
 
     if (!ctx->library) {
-        NSString *src = [NSString stringWithContentsOfFile:@"src/shaders.metal"
+        NSString *src = [NSString stringWithContentsOfFile:@"inference/src/shaders.metal"
                                                  encoding:NSUTF8StringEncoding
                                                     error:&error];
         if (!src) {

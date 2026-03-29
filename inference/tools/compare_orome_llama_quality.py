@@ -181,7 +181,7 @@ def check_for_active_processes() -> list[str]:
             continue
         if any(token in cmd for token in (
             "/orome",
-            " tools/benchmark.py",
+            " inference/tools/benchmark.py",
             "llama-completion",
             "llama-cli",
             "llama-simple",

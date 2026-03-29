@@ -81,8 +81,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cooldown-sec", type=float, default=0.0, help="Sleep between timed trials")
     parser.add_argument(
         "--orome-benchmark",
-        default=str(root / "tools" / "benchmark.py"),
-        help="Path to tools/benchmark.py",
+        default=str(root / "inference" / "tools" / "benchmark.py"),
+        help="Path to inference/tools/benchmark.py",
     )
     parser.add_argument(
         "--orome-binary",
@@ -169,7 +169,7 @@ def check_for_active_processes() -> list[str]:
             continue
         if any(token in cmd for token in (
             "/orome",
-            " tools/benchmark.py",
+            " inference/tools/benchmark.py",
             "llama-completion",
             "llama-cli",
             "llama-simple",
