@@ -41,6 +41,10 @@ tracing_plan.md
 profile_out.txt
 profile_stderr.txt
 
+# Rust
+target/
+harness/target/
+
 # Plan (private working document)
 PLAN.md
 

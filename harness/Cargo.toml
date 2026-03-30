@@ -1,0 +1,19 @@
+[package]
+name = "orome-harness"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1.89"
+axum = "0.8.8"
+futures = "0.3.32"
+reqwest = "0.13.2"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+tokio = { version = "1.50.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+uuid = { version = "1.23.0", features = ["v4"] }
+
+[dev-dependencies]
