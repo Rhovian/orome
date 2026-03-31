@@ -1,3 +1,6 @@
+pub mod claude;
+pub mod codex;
+pub mod orome;
 pub mod types;
 
 use std::pin::Pin;

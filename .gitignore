@@ -45,6 +45,9 @@ profile_stderr.txt
 target/
 harness/target/
 
+# Orome runtime
+.orome/
+
 # Plan (private working document)
 PLAN.md
 

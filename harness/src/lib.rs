@@ -1,6 +1,9 @@
 pub mod bus;
+pub mod cli;
 pub mod config;
+pub mod dispatch;
 pub mod plan;
+pub mod prompts;
 pub mod providers;
 pub mod roles;
 pub mod scheduler;
