@@ -1,0 +1,41 @@
+# orome.yaml — Harness boot manifest
+#
+# Declares what's available. Does not declare what to do with it.
+# Role assignments come from the plan, not from here.
+
+providers:
+  orome-local:
+    kind: local
+    server_url: http://localhost:8080
+    # Models are hardcoded — we built the server, we know what it serves.
+    models:
+      qwen3.5-35b-a3b:
+        weight_memory_gb: 19
+        tokens_per_sec: 68
+        architecture: moe     # 256 experts, K=8, 3B active
+      qwen3.5-27b:
+        weight_memory_gb: 16
+        tokens_per_sec: 18
+        architecture: dense   # 27B active, all params every token
+      qwen3.5-9b:
+        weight_memory_gb: 9
+        tokens_per_sec: 36
+        architecture: dense
+
+  claude:
+    kind: cli
+    command: claude
+    # Models/capabilities come from the CLI itself.
+    # We read the source (pinned submodule) to understand what's available.
+
+  codex:
+    kind: cli
+    command: codex
+
+defaults:
+  scratchpad_dir: .orome/scratchpad
+  trace_dir: .orome/traces
+  plan_dir: .orome
+  review:
+    reviewers_per_task: 1
+    max_retries: 2

@@ -1,9 +1,11 @@
 # Build artifacts
 orome
 packed_experts
-inference/src/*.o
-inference/src/*.air
-inference/src/*.metallib
+inference/core/*.o
+inference/server/*.o
+inference/cli/*.o
+inference/shaders/*.air
+inference/shaders/*.metallib
 *.dSYM/
 
 # Experiment state (not committed — each session appends)
@@ -38,6 +40,16 @@ tracing_plan.md
 *.trace.json
 profile_out.txt
 profile_stderr.txt
+
+# Rust
+target/
+harness/target/
+
+# Orome runtime
+.orome/
+
+# Plan (private working document)
+PLAN.md
 
 # macOS
 .DS_Store
