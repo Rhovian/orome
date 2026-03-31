@@ -1,5 +1,6 @@
 pub mod bus;
 pub mod config;
+pub mod plan;
 pub mod providers;
 pub mod roles;
 pub mod scheduler;

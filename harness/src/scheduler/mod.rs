@@ -23,16 +23,7 @@ impl LocalCapacity {
     }
 }
 
-/// Cloud rate/cost limits for a provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CloudCapacity {
-    pub provider_id: ProviderId,
-    pub max_concurrent_requests: u32,
-    pub tokens_per_minute: u64,
-    pub cost_budget_remaining: f64,
-}
-
-/// A model currently loaded and available for work.
+/// A local model currently loaded and available for work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadedModel {
     pub provider_id: ProviderId,
@@ -52,19 +43,24 @@ pub struct ModelAssignment {
 /// Scheduler decision for a pending task.
 #[derive(Debug, Clone)]
 pub enum SchedulerDecision {
-    /// Dispatch to this model immediately.
-    Dispatch {
-        provider_id: ProviderId,
+    /// Dispatch to a local model immediately.
+    DispatchLocal {
         model_id: ModelId,
+    },
+    /// Dispatch to a CLI provider.
+    DispatchCli {
+        provider_id: ProviderId,
+        model: Option<String>,
     },
     /// Wait — insufficient capacity, will retry.
     Wait,
-    /// Preempt this assignment to free capacity.
+    /// Preempt this assignment to free capacity for a higher-priority task.
     Preempt {
         evict: ModelAssignment,
-        then_dispatch: ProviderId,
-        model_id: ModelId,
+        then_dispatch: ModelId,
     },
-    /// Reject — task exceeds maximum possible capacity.
-    Reject { reason: String },
+    /// Reject — task cannot be scheduled.
+    Reject {
+        reason: String,
+    },
 }

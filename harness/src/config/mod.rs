@@ -1,58 +1,57 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
-use crate::providers::{ModelId, ProviderId};
-use crate::roles::Role;
-
-/// Top-level harness configuration.
+/// Top-level harness configuration, deserialized from `orome.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HarnessConfig {
-    pub local: LocalConfig,
-    pub providers: Vec<ProviderConfig>,
-    pub role_bindings: Vec<RoleBinding>,
-    pub scratchpad_dir: String,
+    pub providers: HashMap<String, ProviderConfig>,
+    pub defaults: Defaults,
 }
 
-/// Local inference capacity\ configuration.
+/// Provider configuration. Two kinds:
+/// - `local`: orome inference server, models hardcoded, full telemetry.
+/// - `cli`: wraps an external CLI (claude, codex). Capabilities come from
+///   reading the CLI source (pinned submodule), not from runtime probing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocalConfig {
-    /// Total unified memory in bytes.
-    pub total_memory: u64,
-    /// OS headroom to reserve, in bytes.
-    pub os_headroom: u64,
-    /// Orome inference server base URL.
-    pub server_url: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProviderConfig {
+    Local {
+        server_url: String,
+        models: HashMap<String, LocalModelConfig>,
+    },
+    Cli {
+        command: String,
+    },
 }
 
-/// Configuration for a single provider.
+/// Hardcoded local model config. We built the server — we know these values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProviderConfig {
-    pub provider_id: ProviderId,
-    pub kind: ProviderKind,
-    pub api_key_env: Option<String>,
-    pub base_url: Option<String>,
-    pub max_concurrent: u32,
-    pub tokens_per_minute: u64,
-    pub cost_budget: Option<f64>,
+pub struct LocalModelConfig {
+    pub weight_memory_gb: u64,
+    pub tokens_per_sec: u64,
+    pub architecture: Architecture,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProviderKind {
-    OromeLocal,
-    Anthropic,
-    OpenAi,
+pub enum Architecture {
+    Dense,
+    Moe,
 }
 
-/// Default role → model binding policy.
+/// Default settings, overridable per-plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RoleBinding {
-    pub role: Role,
-    /// Ordered preference list — scheduler tries first, falls back.
-    pub candidates: Vec<BindingCandidate>,
+pub struct Defaults {
+    pub scratchpad_dir: PathBuf,
+    pub trace_dir: PathBuf,
+    pub plan_dir: PathBuf,
+    pub review: ReviewDefaults,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BindingCandidate {
-    pub provider_id: ProviderId,
-    pub model_id: ModelId,
+pub struct ReviewDefaults {
+    pub reviewers_per_task: u32,
+    pub max_retries: u32,
 }
